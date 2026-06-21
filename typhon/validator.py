@@ -11,10 +11,11 @@ UNTYPED_FOR_RE = re.compile(r"^\s*for\s+([A-Za-z_]\w*)\s+in\s+.+:")
 
 
 class MandatoryTypeValidator(ast.NodeVisitor):
-    def __init__(self, type_alias_lines: set[int]) -> None:
+    def __init__(self, type_alias_lines: set[int], predeclared: set[str] | None = None) -> None:
         self.errors: list[TyphonSyntaxError] = []
         self.class_depth = 0
         self.type_alias_lines = type_alias_lines
+        self.scopes: list[set[str]] = [set(predeclared or set())]
 
     def fail(self, node: ast.AST, message: str) -> None:
         self.errors.append(TyphonSyntaxError(message, getattr(node, "lineno", None)))
@@ -35,7 +36,18 @@ class MandatoryTypeValidator(ast.NodeVisitor):
         if node.returns is None:
             self.fail(node, f"function '{node.name}' must declare a return type")
 
+        declared: set[str] = set()
+        for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            if arg.annotation is not None and arg.arg not in {"self", "cls"}:
+                declared.add(arg.arg)
+        if node.args.vararg is not None and node.args.vararg.annotation is not None:
+            declared.add(node.args.vararg.arg)
+        if node.args.kwarg is not None and node.args.kwarg.annotation is not None:
+            declared.add(node.args.kwarg.arg)
+
+        self.scopes.append(declared)
         self.generic_visit(node)
+        self.scopes.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.visit_FunctionDef(node)
@@ -55,12 +67,31 @@ class MandatoryTypeValidator(ast.NodeVisitor):
             return
         if all(isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self" for target in node.targets):
             return
-        self.fail(node, "variable declarations must use an explicit type")
+        # Only require an explicit type for first-time declarations.
+        # If the target name is already declared in any active scope, allow reassignment.
+        def is_declared(name: str) -> bool:
+            return any(name in scope for scope in self.scopes)
+
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                if not is_declared(target.id):
+                    self.fail(node, "variable declarations must use an explicit type")
+                    break
+            elif isinstance(target, ast.Tuple):
+                for elt in target.elts:
+                    if isinstance(elt, ast.Name) and not is_declared(elt.id):
+                        self.fail(node, "variable declarations must use an explicit type")
+                        break
+
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if isinstance(node.annotation, ast.Name) and node.annotation.id in {"list", "dict", "set", "tuple"}:
             self.fail(node, f"collection '{node.annotation.id}' must include element types")
+        # Record annotated assignment as a declaration in the current scope.
+        target = node.target
+        if isinstance(target, ast.Name):
+            self.scopes[-1].add(target.id)
         self.generic_visit(node)
 
 
@@ -80,6 +111,14 @@ def find_type_alias_lines(source: str) -> set[int]:
     }
 
 
+def find_for_annotation_names(source: str) -> set[str]:
+    return {
+        match.group("name")
+        for line in source.splitlines()
+        if (match := FOR_ANNOTATION_RE.match(line))
+    }
+
+
 def validate_source(source: str, filename: str = "<typhon>") -> None:
     normalized = normalize_typhon_source(source)
     try:
@@ -87,7 +126,7 @@ def validate_source(source: str, filename: str = "<typhon>") -> None:
     except SyntaxError as error:
         raise TyphonSyntaxError(error.msg, error.lineno) from error
 
-    validator = MandatoryTypeValidator(find_type_alias_lines(source))
+    validator = MandatoryTypeValidator(find_type_alias_lines(source), find_for_annotation_names(source))
     validator.visit(tree)
     errors = [*validator.errors, *validate_for_annotations(source)]
 
