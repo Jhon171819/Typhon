@@ -3,6 +3,7 @@ name = "typhon"
 version = "0.1.0"
 description = "Python-like language with mandatory types and runtime enforcement."
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = []
 
 [project.optional-dependencies]
