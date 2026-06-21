@@ -1,0 +1,10 @@
+from local_helper import format_message
+
+
+def main() -> void:
+    print(__name__)
+    print(format_message("typhon"))
+
+
+if __name__ == "__main__":
+    main()

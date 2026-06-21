@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
+from typhon import __version__
 from typhon.runner import run_file, transpile_file
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+
+    if argv and argv[0] not in {"run", "transpile", "-h", "--help", "--version"}:
+        if len(argv) > 1:
+            print("usage: typhon [--version] <file> | typhon <command> [args]", file=sys.stderr)
+            return 2
+        run_file(Path(argv[0]))
+        return 0
+
     parser = argparse.ArgumentParser(
         prog="typhon",
         description="Validate and run Python-like .ty files with mandatory types.",
     )
+    parser.add_argument("--version", action="version", version=f"typhon {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     run_parser = subparsers.add_parser("run", help="Validate and run a Typhon file.")
@@ -22,7 +34,7 @@ def main() -> int:
     )
     transpile_parser.add_argument("file", type=Path)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.command == "run":
         run_file(args.file)

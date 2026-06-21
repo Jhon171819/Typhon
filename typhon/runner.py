@@ -15,9 +15,17 @@ def transpile_file(path: Path) -> str:
 
 
 def run_file(path: Path) -> None:
-    code = transpile_file(path)
-    module_name = "__typhon_main__"
-    module = types.ModuleType(module_name)
-    module.__file__ = str(path)
-    sys.modules[module_name] = module
-    exec(compile(code, str(path), "exec"), module.__dict__)
+    script_path = path.resolve()
+    script_dir = str(script_path.parent)
+    code = transpile_file(script_path)
+
+    if not sys.path or sys.path[0] != script_dir:
+        sys.path.insert(0, script_dir)
+
+    module = types.ModuleType("__main__")
+    module.__file__ = str(script_path)
+    module.__package__ = None
+    module.__loader__ = None
+    module.__spec__ = None
+    sys.modules["__main__"] = module
+    exec(compile(code, str(script_path), "exec"), module.__dict__)

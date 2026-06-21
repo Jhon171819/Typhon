@@ -66,6 +66,28 @@ This repository includes a local Python virtual environment and a small Typhon
 wrapper that validates mandatory types, transpiles `.ty` syntax into Python, and
 adds runtime type enforcement.
 
+Install Typhon as a user-level command:
+
+```powershell
+python -m pip install --user -e .
+```
+
+After that, `typhon` can be run from any directory as long as Python's user
+Scripts directory is on `PATH`.
+
+Run a file like Python:
+
+```powershell
+typhon examples\user_service.ty
+```
+
+Typhon executes script files like Python does:
+
+- `__name__` is set to `"__main__"`.
+- `__file__` is set to the script path.
+- The script's directory is inserted at the front of `sys.path`, so local imports
+  beside the `.ty` file work from any current working directory.
+
 Run a valid program:
 
 ```powershell
