@@ -15,7 +15,7 @@ class RuntimeDecoratorTransformer(ast.NodeTransformer):
         if annotation is None:
             return None
 
-        return VoidAnnotationTransformer().visit(annotation)
+        return TyphonAnnotationTransformer().visit(annotation)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
         self.generic_visit(node)
@@ -56,11 +56,43 @@ class RuntimeDecoratorTransformer(ast.NodeTransformer):
         node.returns = self.normalize_annotation(node.returns)
 
 
-class VoidAnnotationTransformer(ast.NodeTransformer):
+class TyphonAnnotationTransformer(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == "void":
             return ast.Constant(value=None)
         return node
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        if isinstance(node.value, str):
+            return ast.Subscript(
+                value=ast.Name(id="Literal", ctx=ast.Load()),
+                slice=ast.Constant(value=node.value),
+                ctx=ast.Load(),
+            )
+        return node
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Or):
+            return build_union_expression(node.values)
+        return node
+
+
+def build_union_expression(values: list[ast.expr]) -> ast.expr:
+    if not values:
+        raise ValueError("union expressions need at least one value")
+
+    expression = values[0]
+    for value in values[1:]:
+        expression = ast.BinOp(left=expression, op=ast.BitOr(), right=value)
+    return expression
+
+
+def normalize_type_expression(type_expression: str) -> str:
+    tree = ast.parse(type_expression, mode="eval")
+    normalized = TyphonAnnotationTransformer().visit(tree)
+    ast.fix_missing_locations(normalized)
+    return ast.unparse(normalized)
 
 
 def normalize_typhon_source(source: str) -> str:
@@ -70,7 +102,7 @@ def normalize_typhon_source(source: str) -> str:
         alias_match = TYPE_ALIAS_RE.match(line)
         if alias_match:
             lines.append(
-                f"{alias_match.group('indent')}{alias_match.group('name')} = {alias_match.group('value')}"
+                f"{alias_match.group('indent')}{alias_match.group('name')} = {normalize_type_expression(alias_match.group('value'))}"
             )
             continue
 
@@ -95,6 +127,7 @@ def transpile_source(source: str, filename: str = "<typhon>") -> str:
     body = ast.unparse(tree)
     return (
         "from __future__ import annotations\n"
+        "from typing import Literal\n"
         "from typhon.runtime import typhon_enforce, typhon_enforce_class\n\n"
         f"{body}\n"
     )

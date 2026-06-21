@@ -1,5 +1,7 @@
-# Runtime for the local Typhon wrapper.
-#
-# The requested transpyle package is intentionally not installed by default here:
-# transpyle==0.8.0 currently depends on typed-ast, which does not build cleanly
-# under the available Python 3.14 runtime without Microsoft C++ Build Tools.
+certifi==2026.6.17
+charset-normalizer==3.4.7
+idna==3.18
+requests==2.34.2
+transpyle==0.8.0
+-e git+https://github.com/Jhon171819/Typhon.git@94bc9ab187ec8950b73c4a4daa45ad6bbc70ebe5#egg=typhon
+urllib3==2.7.0

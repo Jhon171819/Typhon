@@ -1,0 +1,8 @@
+import requests as req
+
+def get(url: str) -> void:
+    response: str = req.get(url)
+    print(f"Resposta da rota{response}")
+
+get('https://google.com')
+# expected responnse: <Response [200]>

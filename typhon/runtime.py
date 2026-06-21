@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import inspect
 import types
-from typing import Any, Callable, get_args, get_origin, get_type_hints
+from typing import Any, Callable, Literal, get_args, get_origin, get_type_hints
 
 from typhon.errors import TyphonTypeError
 
@@ -22,14 +22,14 @@ def typhon_enforce(func: Callable[..., Any]) -> Callable[..., Any]:
                 continue
             if name in hints and not matches_type(value, hints[name]):
                 raise TyphonTypeError(
-                    f"{func.__qualname__} argument '{name}' expected {format_type(hints[name])}, got {type(value).__name__}"
+                    f"{func.__qualname__} argument '{name}' expected {format_type(hints[name])}, got {format_received(value, hints[name])}"
                 )
 
         result = func(*args, **kwargs)
         expected_return = hints.get("return")
         if expected_return is not None and not matches_type(result, expected_return):
             raise TyphonTypeError(
-                f"{func.__qualname__} return expected {format_type(expected_return)}, got {type(result).__name__}"
+                f"{func.__qualname__} return expected {format_type(expected_return)}, got {format_received(result, expected_return)}"
             )
         return result
 
@@ -44,7 +44,7 @@ def typhon_enforce_class(cls: type[Any]) -> type[Any]:
         expected = hints.get(name)
         if expected is not None and not matches_type(value, expected):
             raise TyphonTypeError(
-                f"{cls.__name__}.{name} expected {format_type(expected)}, got {type(value).__name__}"
+                f"{cls.__name__}.{name} expected {format_type(expected)}, got {format_received(value, expected)}"
             )
         original_setattr(self, name, value)
 
@@ -62,10 +62,10 @@ def matches_type(value: Any, expected: Any) -> bool:
     origin = get_origin(expected)
     args = get_args(expected)
 
-    if origin in {types.UnionType, getattr(types, "UnionType", object)}:
-        return any(matches_type(value, item) for item in args)
+    if origin is Literal:
+        return value in args
 
-    if origin is not None and str(origin) == "typing.Union":
+    if is_union_origin(origin):
         return any(matches_type(value, item) for item in args)
 
     if origin is list:
@@ -95,6 +95,40 @@ def matches_type(value: Any, expected: Any) -> bool:
         return True
 
 
+def is_union_origin(origin: Any) -> bool:
+    return origin in {types.UnionType, getattr(types, "UnionType", object)} or (
+        origin is not None and str(origin) == "typing.Union"
+    )
+
+
 def format_type(expected: Any) -> str:
+    origin = get_origin(expected)
+    args = get_args(expected)
+
+    if origin is Literal:
+        return " or ".join(repr(item) for item in args)
+
+    if is_union_origin(origin):
+        return " or ".join(format_type(item) for item in args)
+
     name = getattr(expected, "__name__", None)
     return name if name is not None else str(expected)
+
+
+def format_received(value: Any, expected: Any) -> str:
+    if contains_literal(expected):
+        return repr(value)
+    return type(value).__name__
+
+
+def contains_literal(expected: Any) -> bool:
+    origin = get_origin(expected)
+    args = get_args(expected)
+
+    if origin is Literal:
+        return True
+
+    if is_union_origin(origin):
+        return any(contains_literal(item) for item in args)
+
+    return False
