@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/typhon-logo.png" alt="Typhon logo" width="320">
+</p>
+
 # Typhon
 
 Typhon is a Python-like language where types are mandatory, in the same spirit
