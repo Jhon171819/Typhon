@@ -1,0 +1,79 @@
+type UserId = int
+
+
+class User:
+    id: UserId
+    name: str
+    email: str | None
+    is_active: bool
+
+    def __init__(
+        self,
+        id: UserId,
+        name: str,
+        email: str | None,
+        is_active: bool,
+    ) -> None:
+        self.id = id
+        self.name = name
+        self.email = email
+        self.is_active = is_active
+
+
+class UserSummary:
+    id: UserId
+    display_name: str
+
+    def __init__(self, id: UserId, display_name: str) -> None:
+        self.id = id
+        self.display_name = display_name
+
+
+def normalize_name(name: str) -> str:
+    cleaned: str = name.strip()
+    return cleaned.title()
+
+
+def create_user(id: UserId, name: str, email: str | None) -> User:
+    display_name: str = normalize_name(name)
+    return User(id, display_name, email, True)
+
+
+def summarize_user(user: User) -> UserSummary:
+    return UserSummary(user.id, user.name)
+
+
+def find_user(users: list[User], id: UserId) -> User | None:
+    for user: User in users:
+        if user.id == id:
+            return user
+    return None
+
+
+def active_summaries(users: list[User]) -> list[UserSummary]:
+    summaries: list[UserSummary] = []
+
+    for user: User in users:
+        if user.is_active:
+            summary: UserSummary = summarize_user(user)
+            summaries.append(summary)
+
+    return summaries
+
+
+def main() -> None:
+    users: list[User] = [
+        create_user(1, "ada lovelace", "ada@example.com"),
+        create_user(2, "grace hopper", None),
+    ]
+
+    selected: User | None = find_user(users, 1)
+    if selected is not None:
+        print(selected.name)
+
+    summaries: list[UserSummary] = active_summaries(users)
+    for summary: UserSummary in summaries:
+        print(f"{summary.id}: {summary.display_name}")
+
+
+main()

@@ -1,0 +1,4 @@
+def LogMessage(msg: str) -> void:
+    print(msg)
+
+LogMessage("hakuna matata")

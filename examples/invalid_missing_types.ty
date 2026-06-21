@@ -1,0 +1,27 @@
+# This file shows examples that should be rejected by a Typhon checker.
+
+
+def missing_parameter_types(name, age) -> str:
+    return f"{name}: {age}"
+
+
+def missing_return_type(name: str):
+    return name.upper()
+
+
+def missing_variable_type() -> int:
+    count = 0
+    return count
+
+
+def missing_collection_element_type() -> list:
+    names: list = []
+    names.append("Ada")
+    return names
+
+
+class MissingFieldType:
+    name
+
+    def __init__(self, name: str) -> None:
+        self.name = name

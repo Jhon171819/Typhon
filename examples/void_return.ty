@@ -1,0 +1,9 @@
+def log_message(message: str) -> void:
+    print(message)
+
+
+def main() -> void:
+    log_message("void works")
+
+
+main()

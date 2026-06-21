@@ -1,0 +1,14 @@
+[project]
+name = "typhon"
+version = "0.1.0"
+description = "Python-like language with mandatory types and runtime enforcement."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+transpyle = [
+    "transpyle==0.8.0",
+]
+
+[project.scripts]
+typhon = "typhon.cli:main"

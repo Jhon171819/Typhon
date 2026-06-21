@@ -1,0 +1,10 @@
+def double(value: int) -> int:
+    return value * 2
+
+
+def main() -> None:
+    result: int = double("not an int")
+    print(result)
+
+
+main()
