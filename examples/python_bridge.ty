@@ -1,0 +1,11 @@
+import py.json as json
+from py.math import gcd
+
+
+def main() -> void:
+    values: list[int] = [gcd(12, 8), 2]
+    encoded: str = json.dumps(values)
+    print(encoded)
+
+
+main()
