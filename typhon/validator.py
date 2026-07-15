@@ -16,6 +16,7 @@ class MandatoryTypeValidator(ast.NodeVisitor):
         self.class_depth = 0
         self.type_alias_lines = type_alias_lines
         self.scopes: list[set[str]] = [set(predeclared or set())]
+        self.void_return_stack: list[bool] = []
 
     def fail(self, node: ast.AST, message: str) -> None:
         self.errors.append(TyphonSyntaxError(message, getattr(node, "lineno", None)))
@@ -46,7 +47,9 @@ class MandatoryTypeValidator(ast.NodeVisitor):
             declared.add(node.args.kwarg.arg)
 
         self.scopes.append(declared)
+        self.void_return_stack.append(is_void_annotation(node.returns))
         self.generic_visit(node)
+        self.void_return_stack.pop()
         self.scopes.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
@@ -93,6 +96,21 @@ class MandatoryTypeValidator(ast.NodeVisitor):
         if isinstance(target, ast.Name):
             self.scopes[-1].add(target.id)
         self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        if self.void_return_stack and self.void_return_stack[-1] and not is_none_expression(node.value):
+            self.fail(node, "void functions cannot return a value")
+        self.generic_visit(node)
+
+
+def is_void_annotation(annotation: ast.expr | None) -> bool:
+    return (isinstance(annotation, ast.Name) and annotation.id == "void") or (
+        isinstance(annotation, ast.Constant) and annotation.value is None
+    )
+
+
+def is_none_expression(expression: ast.expr | None) -> bool:
+    return expression is None or (isinstance(expression, ast.Constant) and expression.value is None)
 
 
 def validate_for_annotations(source: str) -> list[TyphonSyntaxError]:
