@@ -25,13 +25,13 @@ class RuntimeDecoratorTransformer(ast.NodeTransformer):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         self.generic_visit(node)
         self.normalize_function_annotations(node)
-        node.decorator_list.insert(0, ast.Name(id="typhon_enforce", ctx=ast.Load()))
+        node.decorator_list.append(ast.Name(id="typhon_enforce", ctx=ast.Load()))
         return node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
         self.generic_visit(node)
         self.normalize_function_annotations(node)
-        node.decorator_list.insert(0, ast.Name(id="typhon_enforce", ctx=ast.Load()))
+        node.decorator_list.append(ast.Name(id="typhon_enforce", ctx=ast.Load()))
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:

@@ -3,8 +3,9 @@ from __future__ import annotations
 import unittest
 import types
 
-from typhon.errors import TyphonTypeError
+from typhon.errors import TyphonSyntaxError, TyphonTypeError
 from typhon.transpiler import normalize_typhon_source, transpile_source
+from typhon.validator import validate_source
 
 
 def run_source(source: str) -> None:
@@ -66,6 +67,41 @@ class LiteralTypeTests(unittest.TestCase):
 
         self.assertIn("Flow = Literal['THIS'] | Literal['THAT']", normalized)
         run_source(source)
+
+    def test_outer_decorator_receives_runtime_checked_function(self) -> None:
+        source = (
+            "captured: list[object] = []\n"
+            "\n"
+            "def route(func: object) -> object:\n"
+            "    captured.append(func)\n"
+            "    return func\n"
+            "\n"
+            "@route\n"
+            "def handler() -> void:\n"
+            "    return 'not void'\n"
+            "\n"
+            "captured[0]()\n"
+        )
+
+        transpiled = transpile_source(source)
+
+        self.assertIn("@route\n@typhon_enforce\ndef handler() -> None:", transpiled)
+        with self.assertRaises(TyphonTypeError) as error:
+            run_source(source)
+
+        self.assertIn("handler return expected NoneType, got str", str(error.exception))
+
+    def test_void_function_cannot_return_value(self) -> None:
+        source = "def handler() -> void:\n    return 'not void'\n"
+
+        with self.assertRaises(TyphonSyntaxError) as error:
+            validate_source(source)
+
+        self.assertIn("void functions cannot return a value", str(error.exception))
+
+    def test_void_function_can_return_without_value(self) -> None:
+        validate_source("def log() -> void:\n    return\n")
+        validate_source("def log() -> void:\n    return None\n")
 
 
 if __name__ == "__main__":
