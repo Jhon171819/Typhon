@@ -1,0 +1,9 @@
+import py.json as json
+
+
+def main() -> void:
+    encoded: str = json.dumps([1, 2, 3])
+    print(encoded)
+
+
+main()

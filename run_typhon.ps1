@@ -4,4 +4,10 @@ param(
 )
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-& "$Root\.venv\Scripts\python.exe" -m typhon run $File
+Push-Location $Root
+try {
+    go run ./cmd/typhon run $File
+}
+finally {
+    Pop-Location
+}
