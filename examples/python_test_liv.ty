@@ -5,10 +5,10 @@ start_function: float = time.perf_counter()
 
 def get(url: str) -> None:
 
-    for i in range(5):
+    for i: int in range(5):
         start_time: float = time.perf_counter()
 
-        response = req.get(
+        response: PyObject = req.get(
             url,
             timeout=10
         )

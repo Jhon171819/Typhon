@@ -9,14 +9,15 @@ import (
 )
 
 type Engine struct {
-	modules    map[string]*LoadedModule
-	infos      map[string]*ModuleInfo
-	root       string
-	bridge     *PythonBridge
-	bridgeErr  error
-	bridgeDone chan struct{}
-	bridgeMu   sync.Mutex
-	warmPython bool
+	modules      map[string]*LoadedModule
+	infos        map[string]*ModuleInfo
+	root         string
+	bridge       *PythonBridge
+	bridgeErr    error
+	bridgeDone   chan struct{}
+	bridgeMu     sync.Mutex
+	warmPython   bool
+	sharedPython bool
 }
 
 type LoadedModule struct {
@@ -37,12 +38,16 @@ func NewEngine() *Engine {
 }
 
 func RunFile(path string) error {
-	return RunFileWithOptions(path, RunOptions{WarmPython: envEnabled("TYPHON_WARM_PYTHON")})
+	return RunFileWithOptions(path, RunOptions{
+		WarmPython:   envEnabled("TYPHON_WARM_PYTHON"),
+		SharedPython: envEnabled("TYPHON_SHARED_PYTHON"),
+	})
 }
 
 func RunFileWithOptions(path string, options RunOptions) error {
 	engine := NewEngine()
 	engine.warmPython = options.WarmPython
+	engine.sharedPython = options.SharedPython
 	defer engine.Close()
 	module, err := engine.LoadModule(path)
 	if err != nil {
@@ -112,7 +117,8 @@ func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
 }
 
 type RunOptions struct {
-	WarmPython bool
+	WarmPython   bool
+	SharedPython bool
 }
 
 func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, error) {
@@ -196,7 +202,7 @@ func (e *Engine) PythonBridge() (*PythonBridge, error) {
 			root = projectRoot(cwd)
 		}
 	}
-	bridge, err := newPythonBridge(root)
+	bridge, err := newPythonBridge(root, e.sharedPython)
 	if err != nil {
 		return nil, err
 	}
@@ -221,9 +227,13 @@ func (e *Engine) StartPythonBridgeWarmup() {
 	e.bridgeMu.Unlock()
 
 	go func() {
-		bridge, err := newPythonBridge(root)
+		bridge, err := newPythonBridge(root, e.sharedPython)
 		if err == nil {
 			err = bridge.Ping()
+			if err != nil {
+				_ = bridge.Close()
+				bridge = nil
+			}
 		}
 		e.bridgeMu.Lock()
 		if err != nil {

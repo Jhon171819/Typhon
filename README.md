@@ -206,6 +206,40 @@ objects come back as `PyObject` handles and print using Python's `repr`.
 Set `TYPHON_PYTHON` to choose the Python interpreter for the bridge. By default,
 Typhon tries the repo `.venv` first, then `python`, then `python3`.
 
+### Python bridge performance
+
+Typhon's Python integration performs best when Python calls are coarse-grained.
+Each Typhon ↔ Python boundary crossing incurs serialization and subprocess IPC
+overhead, so every crossing should perform enough work to justify that cost.
+
+Keep one Typhon process alive when possible so it can reuse its existing Python
+worker and amortize startup costs. To reuse an interpreter across separate Typhon
+executions, opt in to the shared Python daemon:
+
+```powershell
+go run ./cmd/typhon --shared-python run examples\python_bridge.ty
+```
+
+`TYPHON_SHARED_PYTHON=1` enables the same mode. The daemon uses an authenticated
+loopback connection, gives each client its own object-handle table, and exits after
+five idle minutes by default. Set `TYPHON_PYBRIDGE_IDLE_SECONDS` to change that
+timeout. A later Typhon execution detects stale daemon state and starts a new
+worker. If the daemon fails during an active execution, that execution fails
+because its Python object handles cannot be reconstructed safely.
+
+The shared daemon retains Python's import cache and therefore module-level state.
+Use the default private worker when separate executions require fresh Python module
+state.
+
+Avoid making thousands of small Python calls inside a Typhon loop. Prefer one
+Python call that processes the complete dataset, which can perform close to direct
+Python after startup costs are amortized. Workloads dominated by Python libraries
+will generally remain faster in direct Python with the current subprocess
+architecture. Typhon is most advantageous when execution stays primarily in its
+Go VM and Python is used for a few large operations.
+
+**Batch across the boundary; iterate on one side of it.**
+
 ## Benchmarks
 
 Generate a simple visual Python vs Typhon benchmark:

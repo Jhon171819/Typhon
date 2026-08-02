@@ -2,15 +2,21 @@ package typhon
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 //go:embed pybridge_worker.py
@@ -21,6 +27,7 @@ type PythonBridge struct {
 	stdin   io.WriteCloser
 	reader  *bufio.Reader
 	encoder *json.Encoder
+	close   func() error
 	mu      sync.Mutex
 }
 
@@ -31,6 +38,7 @@ type pyRequest struct {
 	Name   string                 `json:"name,omitempty"`
 	Args   []pyWireValue          `json:"args,omitempty"`
 	Kwargs map[string]pyWireValue `json:"kwargs,omitempty"`
+	Token  string                 `json:"token,omitempty"`
 }
 
 type pyResponse struct {
@@ -38,7 +46,17 @@ type pyResponse struct {
 	Value     pyWireValue `json:"value"`
 	Error     string      `json:"error"`
 	Traceback string      `json:"traceback"`
+	Protocol  int         `json:"protocol,omitempty"`
 }
+
+type pyDaemonState struct {
+	Address  string `json:"address"`
+	PID      int    `json:"pid"`
+	Protocol int    `json:"protocol"`
+	Token    string `json:"token"`
+}
+
+const pyBridgeProtocolVersion = 1
 
 type pyWireValue struct {
 	Kind  string        `json:"kind"`
@@ -54,7 +72,7 @@ type PyObject struct {
 	Repr   string
 }
 
-func newPythonBridge(root string) (*PythonBridge, error) {
+func newPythonBridge(root string, shared bool) (*PythonBridge, error) {
 	worker, err := findPythonWorker(root)
 	if err != nil {
 		return nil, err
@@ -63,7 +81,13 @@ func newPythonBridge(root string) (*PythonBridge, error) {
 	if err != nil {
 		return nil, err
 	}
+	if shared {
+		return newSharedPythonBridge(python, worker)
+	}
+	return newPrivatePythonBridge(python, worker)
+}
 
+func newPrivatePythonBridge(python string, worker string) (*PythonBridge, error) {
 	cmd := exec.Command(python, worker)
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
@@ -78,20 +102,31 @@ func newPythonBridge(root string) (*PythonBridge, error) {
 		return nil, err
 	}
 
-	return &PythonBridge{
+	bridge := &PythonBridge{
 		cmd:     cmd,
 		stdin:   stdin,
 		reader:  bufio.NewReader(stdout),
 		encoder: json.NewEncoder(stdin),
-	}, nil
+	}
+	bridge.close = func() error {
+		_ = stdin.Close()
+		return cmd.Wait()
+	}
+	return bridge, nil
 }
 
 func (b *PythonBridge) Close() error {
-	if b == nil || b.cmd == nil {
+	if b == nil {
 		return nil
 	}
-	_ = b.stdin.Close()
-	return b.cmd.Wait()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.close == nil {
+		return nil
+	}
+	closeBridge := b.close
+	b.close = nil
+	return closeBridge()
 }
 
 func (b *PythonBridge) ImportModule(name string) (Value, error) {
@@ -122,22 +157,183 @@ func (b *PythonBridge) Call(object *PyObject, args []Value, kwargs map[string]Va
 func (b *PythonBridge) roundTrip(request pyRequest) (Value, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.roundTripLocked(request)
+}
 
-	if err := b.encoder.Encode(request); err != nil {
-		return NoneValue(), err
-	}
-	line, err := b.reader.ReadBytes('\n')
+func (b *PythonBridge) roundTripLocked(request pyRequest) (Value, error) {
+	response, err := b.exchangeLocked(request)
 	if err != nil {
 		return NoneValue(), err
 	}
+	return pythonWireToValue(b, response.Value), nil
+}
+
+func (b *PythonBridge) exchangeLocked(request pyRequest) (pyResponse, error) {
+	if err := b.encoder.Encode(request); err != nil {
+		return pyResponse{}, err
+	}
+	line, err := b.reader.ReadBytes('\n')
+	if err != nil {
+		return pyResponse{}, err
+	}
 	var response pyResponse
 	if err := json.Unmarshal(line, &response); err != nil {
-		return NoneValue(), err
+		return pyResponse{}, err
 	}
 	if !response.OK {
-		return NoneValue(), fmt.Errorf("python bridge error: %s", response.Error)
+		return pyResponse{}, fmt.Errorf("python bridge error: %s", response.Error)
 	}
-	return pythonWireToValue(b, response.Value), nil
+	return response, nil
+}
+
+func newSharedPythonBridge(python string, worker string) (*PythonBridge, error) {
+	statePath := pythonDaemonStatePath(python, worker)
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		return nil, fmt.Errorf("create python bridge state directory: %w", err)
+	}
+	if bridge, err := connectPythonDaemon(statePath); err == nil {
+		return bridge, nil
+	}
+
+	lockPath := statePath + ".lock"
+	release, err := acquireDaemonLock(lockPath, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("python bridge daemon startup lock: %w", err)
+	}
+	defer release()
+
+	if bridge, err := connectPythonDaemon(statePath); err == nil {
+		return bridge, nil
+	}
+	_ = os.Remove(statePath)
+
+	token, err := randomToken()
+	if err != nil {
+		return nil, fmt.Errorf("python bridge daemon token: %w", err)
+	}
+	idleSeconds := pythonDaemonIdleSeconds()
+	cmd := exec.Command(
+		python,
+		worker,
+		"--daemon",
+		"--state-file", statePath,
+		"--token", token,
+		"--idle-seconds", strconv.FormatFloat(idleSeconds.Seconds(), 'f', -1, 64),
+	)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start python bridge daemon: %w", err)
+	}
+	_ = cmd.Process.Release()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		bridge, connectErr := connectPythonDaemon(statePath)
+		if connectErr == nil {
+			return bridge, nil
+		}
+		lastErr = connectErr
+		time.Sleep(25 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("python bridge daemon did not become ready: %w", lastErr)
+}
+
+func connectPythonDaemon(statePath string) (*PythonBridge, error) {
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		return nil, err
+	}
+	var state pyDaemonState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	if state.Protocol != pyBridgeProtocolVersion || state.Address == "" || state.Token == "" {
+		return nil, fmt.Errorf("incompatible python bridge daemon state")
+	}
+	connection, err := net.DialTimeout("tcp", state.Address, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	bridge := &PythonBridge{
+		stdin:   connection,
+		reader:  bufio.NewReader(connection),
+		encoder: json.NewEncoder(connection),
+		close:   connection.Close,
+	}
+	bridge.mu.Lock()
+	response, err := bridge.exchangeLocked(pyRequest{Op: "hello", Token: state.Token})
+	bridge.mu.Unlock()
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	if response.Protocol != pyBridgeProtocolVersion {
+		_ = connection.Close()
+		return nil, fmt.Errorf("python bridge daemon protocol %d, expected %d", response.Protocol, pyBridgeProtocolVersion)
+	}
+	return bridge, nil
+}
+
+func pythonDaemonStatePath(python string, worker string) string {
+	stateDir := os.Getenv("TYPHON_PYBRIDGE_STATE_DIR")
+	if stateDir == "" {
+		stateDir = os.TempDir()
+	}
+	workerIdentity := worker
+	if contents, err := os.ReadFile(worker); err == nil {
+		workerDigest := sha256.Sum256(contents)
+		workerIdentity += "\x00" + hex.EncodeToString(workerDigest[:])
+	}
+	identity := python + "\x00" + workerIdentity + "\x00" + strconv.Itoa(pyBridgeProtocolVersion)
+	digest := sha256.Sum256([]byte(identity))
+	name := "typhon-pybridge-" + hex.EncodeToString(digest[:8]) + ".json"
+	return filepath.Join(stateDir, name)
+}
+
+func pythonDaemonIdleSeconds() time.Duration {
+	value := strings.TrimSpace(os.Getenv("TYPHON_PYBRIDGE_IDLE_SECONDS"))
+	if value == "" {
+		return 5 * time.Minute
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func randomToken() (string, error) {
+	buffer := make([]byte, 32)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+func acquireDaemonLock(path string, staleAfter time.Duration) (func(), error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+			_ = file.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > staleAfter {
+			_ = os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for %s", path)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 func valueToPythonWire(value Value) pyWireValue {
