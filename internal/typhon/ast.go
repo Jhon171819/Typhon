@@ -3,9 +3,10 @@ package typhon
 import "fmt"
 
 type Module struct {
-	Path  string
-	Dir   string
-	Stmts []Stmt
+	Contracts map[Expr]Type
+	Path      string
+	Dir       string
+	Stmts     []Stmt
 }
 
 type Stmt interface {
@@ -79,17 +80,19 @@ func (*ImportStmt) stmtNode()     {}
 func (s *ImportStmt) LineNo() int { return s.Line }
 
 type FuncDefStmt struct {
-	Line       int
-	Name       string
-	Params     []Param
-	ReturnType TypeRef
-	Body       []Stmt
+	CheckedType Type
+	Line        int
+	Name        string
+	Params      []Param
+	ReturnType  TypeRef
+	Body        []Stmt
 }
 
 func (*FuncDefStmt) stmtNode()     {}
 func (s *FuncDefStmt) LineNo() int { return s.Line }
 
 type ClassDefStmt struct {
+	Info    *ClassInfo
 	Line    int
 	Name    string
 	Fields  []FieldDef
@@ -134,21 +137,51 @@ func (*ReturnStmt) stmtNode()     {}
 func (s *ReturnStmt) LineNo() int { return s.Line }
 
 type IfStmt struct {
+	Else []Stmt
 	Line int
 	Cond Expr
 	Body []Stmt
 }
 
+type WhileStmt struct {
+	Line int
+	Cond Expr
+	Body []Stmt
+}
+
+func (*WhileStmt) stmtNode()     {}
+func (s *WhileStmt) LineNo() int { return s.Line }
+
+type BreakStmt struct{ Line int }
+
+func (*BreakStmt) stmtNode()     {}
+func (s *BreakStmt) LineNo() int { return s.Line }
+
+type ContinueStmt struct{ Line int }
+
+func (*ContinueStmt) stmtNode()     {}
+func (s *ContinueStmt) LineNo() int { return s.Line }
+
+type UnaryExpr struct {
+	Line    int
+	Op      string
+	Operand Expr
+}
+
+func (*UnaryExpr) exprNode()     {}
+func (e *UnaryExpr) LineNo() int { return e.Line }
+
 func (*IfStmt) stmtNode()     {}
 func (s *IfStmt) LineNo() int { return s.Line }
 
 type ForStmt struct {
-	Line     int
-	Name     string
-	ItemType TypeRef
-	Targets  []ForTarget
-	Iterable Expr
-	Body     []Stmt
+	CheckedTypes []Type
+	Line         int
+	Name         string
+	ItemType     TypeRef
+	Targets      []ForTarget
+	Iterable     Expr
+	Body         []Stmt
 }
 
 func (*ForStmt) stmtNode()     {}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import socket
 import sys
@@ -13,7 +14,9 @@ from pathlib import Path
 from typing import Any, TextIO
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+MAX_HANDLES = 10000
 
 
 class Session:
@@ -21,20 +24,28 @@ class Session:
         self.objects: dict[int, Any] = {}
         self.next_id = 1
 
-    def store(self, value: Any) -> dict[str, Any]:
+    def store(self, value: Any, depth: int = 0) -> dict[str, Any]:
+        if depth > 64:
+            raise ValueError("Python bridge value depth limit exceeded")
         if value is None:
             return {"kind": "none"}
         if isinstance(value, bool):
             return {"kind": "bool", "value": value}
         if isinstance(value, int) and not isinstance(value, bool):
+            if not -(2**63) <= value < 2**63:
+                raise OverflowError("Python integer outside int64")
             return {"kind": "int", "value": value}
         if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("non-finite Python float")
             return {"kind": "float", "value": value}
         if isinstance(value, str):
             return {"kind": "str", "value": value}
         if isinstance(value, (list, tuple)):
-            return {"kind": "list", "items": [self.store(item) for item in value]}
+            return {"kind": "list", "items": [self.store(item, depth + 1) for item in value]}
 
+        if len(self.objects) >= MAX_HANDLES:
+            raise RuntimeError("Python handle limit exceeded; release unused handles")
         object_id = self.next_id
         self.next_id += 1
         self.objects[object_id] = value
@@ -58,6 +69,15 @@ class Session:
         op = request.get("op")
         if op == "ping":
             return {"ok": True, "value": {"kind": "none"}}
+        if op == "release":
+            self.objects.pop(request["id"], None)
+            return {"ok": True, "value": {"kind": "none"}}
+        if op == "release_many":
+            for object_id in request.get("ids", []):
+                self.objects.pop(object_id, None)
+            return {"ok": True, "value": {"kind": "none"}}
+        if op == "handle_count":
+            return {"ok": True, "value": self.store(len(self.objects))}
         if op == "import":
             module = importlib.import_module(request["module"])
             return {"ok": True, "value": self.store(module)}
@@ -82,6 +102,7 @@ def error_response(error: Exception) -> dict[str, Any]:
     return {
         "ok": False,
         "error": str(error),
+        "error_type": type(error).__name__,
         "traceback": traceback.format_exc(),
     }
 
@@ -95,7 +116,14 @@ def serve_stream(
     session = Session()
     authenticated = token is None
 
-    for line in reader:
+    while True:
+        line = reader.readline(MAX_MESSAGE_BYTES + 1)
+        if not line:
+            return
+        if len(line.encode("utf-8")) > MAX_MESSAGE_BYTES or not line.endswith("\n"):
+            return
+        request = {}
+        checkpoint = session.next_id
         try:
             request = json.loads(line)
             if not authenticated:
@@ -116,9 +144,18 @@ def serve_stream(
                     with request_lock:
                         response = session.handle(request)
         except Exception as error:
+            # A failed conversion must not retain partially exported handles.
+            for object_id in range(checkpoint, session.next_id):
+                session.objects.pop(object_id, None)
             response = error_response(error)
 
-        print(json.dumps(response), file=writer, flush=True)
+        response["sequence"] = request.get("sequence", 0)
+        encoded = json.dumps(response, allow_nan=False)
+        if len(encoded.encode("utf-8")) > MAX_MESSAGE_BYTES:
+            for object_id in range(checkpoint, session.next_id):
+                session.objects.pop(object_id, None)
+            encoded = json.dumps({"ok": False, "error": "Python bridge response size limit exceeded", "sequence": request.get("sequence", 0)})
+        print(encoded, file=writer, flush=True)
 
 
 class Daemon:
@@ -224,7 +261,13 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.daemon:
-        serve_stream(sys.stdin, sys.stdout)
+        # Preserve a private protocol descriptor, then redirect fd 1 itself so
+        # print(), sys.__stdout__, native extensions and os.write cannot corrupt it.
+        protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", newline="\n")
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        sys.stdout = sys.stderr
+        with protocol:
+            serve_stream(sys.stdin, protocol)
         return 0
     if not args.state_file or not args.token:
         parser.error("--daemon requires --state-file and --token")

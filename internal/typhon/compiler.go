@@ -7,9 +7,16 @@ type compiler struct {
 }
 
 type functionCompiler struct {
+	loops    []*loopCompiler
+	line     int
 	module   *Module
 	fn       *Function
 	isModule bool
+}
+
+type loopCompiler struct {
+	start  int
+	breaks []int
 }
 
 func CompileModule(module *Module) (*Program, error) {
@@ -33,6 +40,7 @@ func CompileModule(module *Module) (*Program, error) {
 
 func compileFunction(module *Module, fnDef *FuncDefStmt) (*Function, error) {
 	fn := &Function{
+		Signature:  fnDef.CheckedType,
 		Name:       fnDef.Name,
 		LocalIndex: map[string]int{},
 		ModulePath: module.Path,
@@ -71,6 +79,9 @@ func (fc *functionCompiler) collectLocals(stmts []Stmt) {
 			fc.collectLocals(s.Body)
 		case *IfStmt:
 			fc.collectLocals(s.Body)
+			fc.collectLocals(s.Else)
+		case *WhileStmt:
+			fc.collectLocals(s.Body)
 		}
 	}
 }
@@ -86,6 +97,9 @@ func (fc *functionCompiler) ensureLocal(name string) int {
 }
 
 func (fc *functionCompiler) emit(instr Instr) int {
+	if instr.Line == 0 {
+		instr.Line = fc.line
+	}
 	fc.fn.Code = append(fc.fn.Code, instr)
 	return len(fc.fn.Code) - 1
 }
@@ -95,6 +109,9 @@ func (fc *functionCompiler) patch(pos int, target int) {
 }
 
 func (fc *functionCompiler) compileStmt(stmt Stmt) error {
+	previousLine := fc.line
+	fc.line = stmt.LineNo()
+	defer func() { fc.line = previousLine }()
 	switch s := stmt.(type) {
 	case *TypeAliasStmt:
 		return nil
@@ -113,7 +130,7 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 		}
 		fc.emit(Instr{Op: OpDefineFunc, S: s.Name, Fn: fn})
 	case *ClassDefStmt:
-		spec := &ClassSpec{Name: s.Name, Methods: map[string]*Function{}}
+		spec := &ClassSpec{Name: s.Name, Info: s.Info, Methods: map[string]*Function{}}
 		for _, field := range s.Fields {
 			spec.Fields = append(spec.Fields, field.Name)
 		}
@@ -175,13 +192,51 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 				return err
 			}
 		}
+		end := fc.emit(Instr{Op: OpJump})
 		fc.patch(jumpFalse, len(fc.fn.Code))
+		for _, child := range s.Else {
+			if err := fc.compileStmt(child); err != nil {
+				return err
+			}
+		}
+		fc.patch(end, len(fc.fn.Code))
+	case *WhileStmt:
+		loop := &loopCompiler{start: len(fc.fn.Code)}
+		fc.loops = append(fc.loops, loop)
+		if err := fc.compileExpr(s.Cond); err != nil {
+			return err
+		}
+		end := fc.emit(Instr{Op: OpJumpIfFalse})
+		for _, child := range s.Body {
+			if err := fc.compileStmt(child); err != nil {
+				return err
+			}
+		}
+		fc.emit(Instr{Op: OpJump, A: loop.start})
+		fc.patch(end, len(fc.fn.Code))
+		for _, pos := range loop.breaks {
+			fc.patch(pos, len(fc.fn.Code))
+		}
+		fc.loops = fc.loops[:len(fc.loops)-1]
+	case *BreakStmt:
+		if len(fc.loops) == 0 {
+			return fmt.Errorf("break requires a loop")
+		}
+		loop := fc.loops[len(fc.loops)-1]
+		loop.breaks = append(loop.breaks, fc.emit(Instr{Op: OpJump}))
+	case *ContinueStmt:
+		if len(fc.loops) == 0 {
+			return fmt.Errorf("continue requires a loop")
+		}
+		fc.emit(Instr{Op: OpJump, A: fc.loops[len(fc.loops)-1].start})
 	case *ForStmt:
 		if err := fc.compileExpr(s.Iterable); err != nil {
 			return err
 		}
 		fc.emit(Instr{Op: OpIter})
 		start := len(fc.fn.Code)
+		loop := &loopCompiler{start: start}
+		fc.loops = append(fc.loops, loop)
 		iterNext := fc.emit(Instr{Op: OpIterNext})
 		targets := s.Targets
 		if len(targets) == 0 {
@@ -192,10 +247,16 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 			for _, target := range targets {
 				names = append(names, target.Name)
 			}
-			fc.emit(Instr{Op: OpUnpackStore, Names: names})
+			fc.emit(Instr{Op: OpUnpackStore, Names: names, Types: s.CheckedTypes})
 		} else if idx, ok := fc.fn.LocalIndex[targets[0].Name]; ok && !fc.isModule {
+			if len(s.CheckedTypes) > 0 {
+				fc.emit(Instr{Op: OpCheckType, Type: s.CheckedTypes[0]})
+			}
 			fc.emit(Instr{Op: OpStoreLocal, A: idx})
 		} else {
+			if len(s.CheckedTypes) > 0 {
+				fc.emit(Instr{Op: OpCheckType, Type: s.CheckedTypes[0]})
+			}
 			fc.emit(Instr{Op: OpStoreGlobal, S: targets[0].Name})
 		}
 		for _, child := range s.Body {
@@ -205,6 +266,10 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 		}
 		fc.emit(Instr{Op: OpJump, A: start})
 		fc.patch(iterNext, len(fc.fn.Code))
+		for _, pos := range loop.breaks {
+			fc.patch(pos, len(fc.fn.Code))
+		}
+		fc.loops = fc.loops[:len(fc.loops)-1]
 		fc.emit(Instr{Op: OpPop})
 	case *ExprStmt:
 		if err := fc.compileExpr(s.Expr); err != nil {
@@ -216,6 +281,9 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 }
 
 func (fc *functionCompiler) compileStore(target Expr) error {
+	if typ, ok := fc.module.Contracts[target]; ok {
+		fc.emit(Instr{Op: OpCheckType, Type: typ})
+	}
 	switch t := target.(type) {
 	case *NameExpr:
 		if idx, ok := fc.fn.LocalIndex[t.Name]; ok && !fc.isModule {
@@ -263,10 +331,32 @@ func (fc *functionCompiler) compileExpr(expr Expr) error {
 		if err := fc.compileExpr(e.Left); err != nil {
 			return err
 		}
+		if e.Op == "and" || e.Op == "or" {
+			fc.emit(Instr{Op: OpDup})
+			op := OpJumpIfFalse
+			if e.Op == "or" {
+				op = OpJumpIfTrue
+			}
+			end := fc.emit(Instr{Op: op})
+			fc.emit(Instr{Op: OpPop})
+			if err := fc.compileExpr(e.Right); err != nil {
+				return err
+			}
+			fc.patch(end, len(fc.fn.Code))
+			return nil
+		}
 		if err := fc.compileExpr(e.Right); err != nil {
 			return err
 		}
 		switch e.Op {
+		case "/":
+			fc.emit(Instr{Op: OpDiv})
+		case "//":
+			fc.emit(Instr{Op: OpFloorDiv})
+		case "%":
+			fc.emit(Instr{Op: OpMod})
+		case "<", "<=", ">", ">=":
+			fc.emit(Instr{Op: OpCompare, S: e.Op})
 		case "+":
 			fc.emit(Instr{Op: OpAdd})
 		case "-":
@@ -289,6 +379,11 @@ func (fc *functionCompiler) compileExpr(expr Expr) error {
 			return err
 		}
 		fc.emit(Instr{Op: OpGetAttr, S: e.Name})
+	case *UnaryExpr:
+		if err := fc.compileExpr(e.Operand); err != nil {
+			return err
+		}
+		fc.emit(Instr{Op: OpUnary, S: e.Op})
 	case *CallExpr:
 		if err := fc.compileExpr(e.Callee); err != nil {
 			return err

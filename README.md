@@ -39,18 +39,23 @@ The Go runtime currently supports:
   declarations, class fields, and `for` targets.
 - `int`, `float`, `str`, `bool`, `None`/`void`, `list[T]`, user classes,
   unions such as `User | None`, type aliases, `PyObject`, and `TyphonTask`.
-- Functions, classes, annotated declarations, reassignment, `return`, `if`,
-  typed `for` loops, imports, calls, attribute access, and f-strings.
-- Integer and floating-point arithmetic for the implemented `+`, `-`, and `*`
-  operators, plus `==`, `!=`, `is`, and `is not`.
+- Functions, classes, annotated declarations, reassignment, `return`,
+  `if`/`elif`/`else`, `while`, typed `for`, `break`, `continue`, imports,
+  calls, attribute access, and f-strings.
+- Checked int64 and finite floating-point arithmetic: `+`, `-`, `*`, `/`,
+  `//`, `%`, unary signs, numeric/string comparisons, equality, identity,
+  and short-circuit `and`, `or`, `not`.
 - `print`, `range`, `enumerate`, `list.append`, and the string methods
   `strip`, `title`, and `upper`.
 - Local `.ty` modules through `from module import name`.
 
 Syntax outside that subset may be valid Python but is not necessarily valid
 Typhon. In particular, the native AST currently has no general implementation
-for `while`, `else`, exceptions, comprehensions, dictionaries, sets, indexing,
-or arbitrary Python operators.
+for exceptions, comprehensions, dictionaries, sets, indexing, closures,
+decorators, or arbitrary Python operators.
+
+The audit changes, precise contracts, limits, and remaining roadmap are recorded
+in [VM contracts and audit status](docs/vm_contract.md).
 
 ### Type rules
 
@@ -100,6 +105,15 @@ Methods may leave the first `self` or `cls` parameter unannotated. All other
 parameters and every function return must be annotated. `void` and `None` are
 equivalent return annotations in the native checker.
 
+Functions whose return type excludes `None` must return on every analyzed path.
+Locals must be initialized before reading, and constructors must initialize all
+declared fields. Literal aliases preserve their permitted values. Mutable
+`list[T]` is invariant; list literals are checked element by element against
+their expected type. `Any` and `PyObject` remain deliberate dynamic escapes,
+with runtime checks at concrete assignments, arguments, returns, fields, and
+typed loop targets. Integer-to-float promotion may round to float64 precision;
+integer transport itself never uses float64.
+
 See `examples/user_service.ty` for a complete program and
 `examples/invalid_missing_types.ty` for rejected declarations.
 
@@ -117,6 +131,7 @@ Building once avoids the extra Go tool invocation incurred by `go run`:
 
 ```powershell
 go build -o typhon.exe ./cmd/typhon
+.\typhon.exe version
 ```
 
 Run a program:
@@ -215,16 +230,17 @@ must be importable by the selected interpreter through its normal import path.
 ### Native `json` shim
 
 Both `json` and `py.json` currently resolve to a Go implementation rather than
-starting CPython. The shim only implements `json.dumps` with one positional
-argument and currently supports `None`, booleans, integers, strings, and nested
-lists of those values. It is not a complete replacement for Python's `json`
+starting CPython. The shim implements `json.dumps` with one positional argument
+and supports `None`, booleans, integers, finite floats, strings, and nested lists,
+with a depth limit of 64. Cycles and non-finite numbers raise errors.
+It is not a complete replacement for Python's `json`
 module.
 
 ## Python bridge
 
 For a non-native Python import, Typhon starts or connects to a CPython worker.
-The Go VM and worker exchange newline-delimited JSON messages for four operations:
-module import, attribute lookup, function call, and health checking.
+The Go VM and worker exchange versioned, sequence-numbered JSON messages for
+module import, attribute lookup, function call, health checking, and handle release.
 
 ```text
 Typhon Go VM
@@ -252,12 +268,34 @@ Python tuples are returned as Typhon lists. Modules, dictionaries, sets, class
 instances, functions, and other non-primitive Python values remain in CPython;
 Typhon stores a session-local object ID and Python `repr`. Attribute access and
 calls on that handle are sent back to the worker. Typhon values outside the
-explicit primitive/list/`PyObject` conversions currently cross into Python as
-their printed string representation.
+explicit primitive/list/`PyObject` conversions fail with a conversion error;
+functions are not silently converted into strings.
 
 Python imports and their attributes have the static type `PyObject`. The current
 checker therefore does not validate Python function signatures or result types;
 those errors are detected only when Python executes the operation.
+
+Protocol 2 preserves the full signed int64 range. Out-of-range Python integers
+and non-finite floats are rejected. Library stdout, including writes to file
+descriptor 1, is redirected to stderr in the private worker, separate from RPC.
+Requests and responses are limited to 16 MiB; conversion depth is limited to 64.
+`TYPHON_PYTHON_TIMEOUT` accepts a Go duration, such as `5s` (default `30s`). A
+timeout closes that session; a private worker is forcibly terminated if needed.
+Shared-daemon session closure does not interrupt Python code already running in
+the shared interpreter. Python errors retain their type and traceback.
+
+Unreachable handles are queued by Go finalizers and released on the next bridge
+operation. For deterministic cleanup:
+
+```typhon
+from typhon.python import release
+import py.math as math
+release(math)
+```
+
+Reusing a released or foreign-session handle raises an error. Sessions cap live
+handles at 10,000; closing a session releases its handle table after any active
+Python operation finishes.
 
 Select the bridge interpreter with `TYPHON_PYTHON`. Without it, Typhon tries the
 repository `.venv`, then `python`, then `python3`.
@@ -319,7 +357,7 @@ while Typhon performs best when most execution remains in the Go VM.
 
 ## Parallel tasks
 
-`typhon.parallel` exposes `spawn`, `join`, and `TyphonTask`:
+`typhon.parallel` exposes `spawn`, `join`, `cancel`, and `TyphonTask`:
 
 ```typhon
 from typhon.parallel import TyphonTask, join, spawn
@@ -334,9 +372,14 @@ result: int = join(task)
 print(result)
 ```
 
-`spawn` executes the callable in a Go goroutine and `join` waits for its result.
-Calls through a single Python bridge are mutex-protected, so this feature should
-not be treated as a way to make fine-grained Python bridge calls parallel.
+`spawn` schedules the callable in a Go goroutine. One Engine serializes VM
+execution, including mutations of lists, objects, globals, and module state.
+`join` yields execution to pending children and returns a cached completion;
+repeated joins return the same result or error. `join(task, seconds)` sets its
+wait timeout (default 30 seconds); expiration cancels the Engine execution.
+`cancel(task)` requests cooperative cancellation. Main-module completion waits
+for children and propagates unobserved child failures. CPU work within one
+Engine is serialized under this scheduling contract.
 
 ## Benchmarks
 

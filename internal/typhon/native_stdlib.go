@@ -3,12 +3,15 @@ package typhon
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
 
 func isNativePythonModule(name string) bool {
 	switch trimPythonNamespace(name) {
+	case "typhon.python":
+		return true
 	case "json":
 		return true
 	default:
@@ -18,6 +21,10 @@ func isNativePythonModule(name string) bool {
 
 func nativePythonModule(name string) (Value, bool) {
 	switch trimPythonNamespace(name) {
+	case "typhon.python":
+		return Value{Kind: ValueNativeModule, Module: &NativeModule{Name: name, Exports: map[string]Value{
+			"release": nativeValue("python.release", nativePythonRelease),
+		}}}, true
 	case "json":
 		return Value{
 			Kind: ValueNativeModule,
@@ -33,6 +40,13 @@ func nativePythonModule(name string) (Value, bool) {
 	}
 }
 
+func nativePythonRelease(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 || args[0].Kind != ValuePyObject || args[0].PyObject == nil {
+		return NoneValue(), fmt.Errorf("python.release expected a Python handle")
+	}
+	return NoneValue(), args[0].PyObject.Bridge.Release(args[0].PyObject)
+}
+
 func nativeJSONDumps(vm *VM, args []Value) (Value, error) {
 	if len(args) != 1 {
 		return NoneValue(), fmt.Errorf("json.dumps expected 1 argument, got %d", len(args))
@@ -45,7 +59,19 @@ func nativeJSONDumps(vm *VM, args []Value) (Value, error) {
 }
 
 func renderPythonJSON(value Value) (string, error) {
+	return renderJSONDepth(value, 0)
+}
+
+func renderJSONDepth(value Value, depth int) (string, error) {
+	if depth > 64 {
+		return "", fmt.Errorf("JSON depth limit exceeded (possibly circular collection)")
+	}
 	switch value.Kind {
+	case ValueFloat:
+		if math.IsInf(value.Float, 0) || math.IsNaN(value.Float) {
+			return "", fmt.Errorf("JSON does not support non-finite numbers")
+		}
+		return strconv.FormatFloat(value.Float, 'f', -1, 64), nil
 	case ValueNone:
 		return "null", nil
 	case ValueBool:
@@ -67,7 +93,7 @@ func renderPythonJSON(value Value) (string, error) {
 		}
 		parts := make([]string, 0, len(*value.List))
 		for _, item := range *value.List {
-			rendered, err := renderPythonJSON(item)
+			rendered, err := renderJSONDepth(item, depth+1)
 			if err != nil {
 				return "", err
 			}

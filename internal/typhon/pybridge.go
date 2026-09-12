@@ -2,20 +2,25 @@ package typhon
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,25 +28,36 @@ import (
 var embeddedPyBridgeWorker string
 
 type PythonBridge struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	reader  *bufio.Reader
-	encoder *json.Encoder
-	close   func() error
-	mu      sync.Mutex
+	releaseMu      sync.Mutex
+	pendingRelease []int64
+	closeOnce      sync.Once
+	closed         atomic.Bool
+	closeErr       error
+	timeout        time.Duration
+	sequence       int64
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	reader         *bufio.Reader
+	encoder        *json.Encoder
+	close          func() error
+	mu             sync.Mutex
 }
 
 type pyRequest struct {
-	Op     string                 `json:"op"`
-	Module string                 `json:"module,omitempty"`
-	ID     int64                  `json:"id,omitempty"`
-	Name   string                 `json:"name,omitempty"`
-	Args   []pyWireValue          `json:"args,omitempty"`
-	Kwargs map[string]pyWireValue `json:"kwargs,omitempty"`
-	Token  string                 `json:"token,omitempty"`
+	IDs      []int64                `json:"ids,omitempty"`
+	Sequence int64                  `json:"sequence"`
+	Op       string                 `json:"op"`
+	Module   string                 `json:"module,omitempty"`
+	ID       int64                  `json:"id,omitempty"`
+	Name     string                 `json:"name,omitempty"`
+	Args     []pyWireValue          `json:"args,omitempty"`
+	Kwargs   map[string]pyWireValue `json:"kwargs,omitempty"`
+	Token    string                 `json:"token,omitempty"`
 }
 
 type pyResponse struct {
+	Sequence  int64       `json:"sequence"`
+	ErrorType string      `json:"error_type"`
 	OK        bool        `json:"ok"`
 	Value     pyWireValue `json:"value"`
 	Error     string      `json:"error"`
@@ -56,7 +72,8 @@ type pyDaemonState struct {
 	Token    string `json:"token"`
 }
 
-const pyBridgeProtocolVersion = 1
+const pyBridgeProtocolVersion = 2
+const maxBridgeMessageBytes = 16 * 1024 * 1024
 
 type pyWireValue struct {
 	Kind  string        `json:"kind"`
@@ -67,9 +84,10 @@ type pyWireValue struct {
 }
 
 type PyObject struct {
-	Bridge *PythonBridge
-	ID     int64
-	Repr   string
+	released atomic.Bool
+	Bridge   *PythonBridge
+	ID       int64
+	Repr     string
 }
 
 func newPythonBridge(root string, shared bool) (*PythonBridge, error) {
@@ -110,7 +128,17 @@ func newPrivatePythonBridge(python string, worker string) (*PythonBridge, error)
 	}
 	bridge.close = func() error {
 		_ = stdin.Close()
-		return cmd.Wait()
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(time.Second):
+			_ = cmd.Process.Kill()
+			_ = stdout.Close()
+			<-done
+			return nil
+		}
 	}
 	return bridge, nil
 }
@@ -119,14 +147,13 @@ func (b *PythonBridge) Close() error {
 	if b == nil {
 		return nil
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.close == nil {
-		return nil
-	}
-	closeBridge := b.close
-	b.close = nil
-	return closeBridge()
+	b.closeOnce.Do(func() {
+		b.closed.Store(true)
+		if b.close != nil {
+			b.closeErr = b.close()
+		}
+	})
+	return b.closeErr
 }
 
 func (b *PythonBridge) ImportModule(name string) (Value, error) {
@@ -139,24 +166,53 @@ func (b *PythonBridge) Ping() error {
 }
 
 func (b *PythonBridge) GetAttr(object *PyObject, name string) (Value, error) {
-	return b.roundTrip(pyRequest{Op: "getattr", ID: object.ID, Name: name})
+	if err := b.checkObject(object); err != nil {
+		return NoneValue(), err
+	}
+	value, err := b.roundTrip(pyRequest{Op: "getattr", ID: object.ID, Name: name})
+	runtime.KeepAlive(object)
+	return value, err
 }
 
 func (b *PythonBridge) Call(object *PyObject, args []Value, kwargs map[string]Value) (Value, error) {
+	if err := b.checkObject(object); err != nil {
+		return NoneValue(), err
+	}
 	wireArgs := make([]pyWireValue, 0, len(args))
 	for _, arg := range args {
-		wireArgs = append(wireArgs, valueToPythonWire(arg))
+		wire, err := b.valueToWire(arg, 0)
+		if err != nil {
+			return NoneValue(), err
+		}
+		wireArgs = append(wireArgs, wire)
 	}
 	wireKwargs := map[string]pyWireValue{}
 	for name, value := range kwargs {
-		wireKwargs[name] = valueToPythonWire(value)
+		wire, err := b.valueToWire(value, 0)
+		if err != nil {
+			return NoneValue(), err
+		}
+		wireKwargs[name] = wire
 	}
-	return b.roundTrip(pyRequest{Op: "call", ID: object.ID, Args: wireArgs, Kwargs: wireKwargs})
+	value, err := b.roundTrip(pyRequest{Op: "call", ID: object.ID, Args: wireArgs, Kwargs: wireKwargs})
+	runtime.KeepAlive(object)
+	runtime.KeepAlive(args)
+	runtime.KeepAlive(kwargs)
+	return value, err
 }
 
 func (b *PythonBridge) roundTrip(request pyRequest) (Value, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.releaseMu.Lock()
+	ids := b.pendingRelease
+	b.pendingRelease = nil
+	b.releaseMu.Unlock()
+	if len(ids) > 0 {
+		if _, err := b.exchangeLocked(pyRequest{Op: "release_many", IDs: ids}); err != nil {
+			return NoneValue(), err
+		}
+	}
 	return b.roundTripLocked(request)
 }
 
@@ -165,23 +221,66 @@ func (b *PythonBridge) roundTripLocked(request pyRequest) (Value, error) {
 	if err != nil {
 		return NoneValue(), err
 	}
-	return pythonWireToValue(b, response.Value), nil
+	return pythonWireToValue(b, response.Value)
 }
 
 func (b *PythonBridge) exchangeLocked(request pyRequest) (pyResponse, error) {
+	if b.closed.Load() {
+		return pyResponse{}, fmt.Errorf("python bridge is closed")
+	}
+	b.sequence++
+	request.Sequence = b.sequence
+	type result struct {
+		response pyResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() { response, err := b.exchangeIO(request); done <- result{response, err} }()
+	timeout := b.timeout
+	if timeout <= 0 {
+		timeout = pythonCallTimeout()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-done:
+		var pythonErr *PythonError
+		if result.err != nil && !errors.As(result.err, &pythonErr) {
+			_ = b.Close()
+		}
+		return result.response, result.err
+	case <-timer.C:
+		_ = b.Close()
+		return pyResponse{}, fmt.Errorf("python bridge call %s timed out after %s; session closed", request.Op, timeout)
+	}
+}
+
+func (b *PythonBridge) exchangeIO(request pyRequest) (pyResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return pyResponse{}, err
+	}
+	if len(data) > maxBridgeMessageBytes {
+		return pyResponse{}, fmt.Errorf("python bridge request size limit exceeded")
+	}
 	if err := b.encoder.Encode(request); err != nil {
 		return pyResponse{}, err
 	}
-	line, err := b.reader.ReadBytes('\n')
+	line, err := readBridgeLine(b.reader)
 	if err != nil {
 		return pyResponse{}, err
 	}
 	var response pyResponse
-	if err := json.Unmarshal(line, &response); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	if err := decoder.Decode(&response); err != nil {
 		return pyResponse{}, err
 	}
+	if response.Sequence != request.Sequence {
+		return pyResponse{}, fmt.Errorf("python bridge response sequence mismatch")
+	}
 	if !response.OK {
-		return pyResponse{}, fmt.Errorf("python bridge error: %s", response.Error)
+		return pyResponse{}, &PythonError{Type: response.ErrorType, Message: response.Error, Traceback: response.Traceback}
 	}
 	return response, nil
 }
@@ -336,66 +435,160 @@ func acquireDaemonLock(path string, staleAfter time.Duration) (func(), error) {
 	}
 }
 
-func valueToPythonWire(value Value) pyWireValue {
+func (b *PythonBridge) valueToWire(value Value, depth int) (pyWireValue, error) {
+	if depth > 64 {
+		return pyWireValue{}, fmt.Errorf("python bridge value depth limit exceeded")
+	}
 	switch value.Kind {
 	case ValueNone:
-		return pyWireValue{Kind: "none"}
+		return pyWireValue{Kind: "none"}, nil
 	case ValueBool:
-		return pyWireValue{Kind: "bool", Value: value.Bool}
+		return pyWireValue{Kind: "bool", Value: value.Bool}, nil
 	case ValueInt:
-		return pyWireValue{Kind: "int", Value: value.Int}
+		return pyWireValue{Kind: "int", Value: value.Int}, nil
 	case ValueFloat:
-		return pyWireValue{Kind: "float", Value: value.Float}
+		if math.IsInf(value.Float, 0) || math.IsNaN(value.Float) {
+			return pyWireValue{}, fmt.Errorf("non-finite Python bridge float")
+		}
+		return pyWireValue{Kind: "float", Value: value.Float}, nil
 	case ValueString:
-		return pyWireValue{Kind: "str", Value: value.Str}
+		return pyWireValue{Kind: "str", Value: value.Str}, nil
 	case ValueList:
 		items := []pyWireValue{}
 		if value.List != nil {
 			for _, item := range *value.List {
-				items = append(items, valueToPythonWire(item))
+				wire, err := b.valueToWire(item, depth+1)
+				if err != nil {
+					return pyWireValue{}, err
+				}
+				items = append(items, wire)
 			}
 		}
-		return pyWireValue{Kind: "list", Items: items}
+		return pyWireValue{Kind: "list", Items: items}, nil
 	case ValuePyObject:
-		return pyWireValue{Kind: "object", ID: value.PyObject.ID}
+		if err := b.checkObject(value.PyObject); err != nil {
+			return pyWireValue{}, err
+		}
+		return pyWireValue{Kind: "object", ID: value.PyObject.ID}, nil
 	default:
-		return pyWireValue{Kind: "str", Value: value.String()}
+		return pyWireValue{}, fmt.Errorf("unsupported Python bridge value: %s", value.Kind)
 	}
 }
 
-func pythonWireToValue(bridge *PythonBridge, value pyWireValue) Value {
+func pythonWireToValue(bridge *PythonBridge, value pyWireValue) (Value, error) {
+	return pythonWireDepth(bridge, value, 0)
+}
+
+func pythonWireDepth(bridge *PythonBridge, value pyWireValue, depth int) (Value, error) {
+	if depth > 64 {
+		return NoneValue(), fmt.Errorf("Python bridge response depth limit exceeded")
+	}
 	switch value.Kind {
 	case "none":
-		return NoneValue()
+		return NoneValue(), nil
 	case "bool":
 		if typed, ok := value.Value.(bool); ok {
-			return BoolValue(typed)
+			return BoolValue(typed), nil
 		}
 	case "int":
 		switch typed := value.Value.(type) {
-		case float64:
-			return IntValue(int64(typed))
+		case json.Number:
+			integer, err := typed.Int64()
+			if err != nil {
+				return NoneValue(), fmt.Errorf("Python integer outside int64 or invalid: %s", typed)
+			}
+			return IntValue(integer), nil
 		case int64:
-			return IntValue(typed)
+			return IntValue(typed), nil
 		}
 	case "float":
-		if typed, ok := value.Value.(float64); ok {
-			return FloatValue(typed)
+		if typed, ok := value.Value.(json.Number); ok {
+			floating, err := typed.Float64()
+			if err != nil || math.IsNaN(floating) || math.IsInf(floating, 0) {
+				return NoneValue(), fmt.Errorf("invalid or non-finite Python float: %s", typed)
+			}
+			return FloatValue(floating), nil
 		}
 	case "str":
 		if typed, ok := value.Value.(string); ok {
-			return StringValue(typed)
+			return StringValue(typed), nil
 		}
 	case "list":
 		items := make([]Value, 0, len(value.Items))
 		for _, item := range value.Items {
-			items = append(items, pythonWireToValue(bridge, item))
+			converted, err := pythonWireDepth(bridge, item, depth+1)
+			if err != nil {
+				return NoneValue(), err
+			}
+			items = append(items, converted)
 		}
-		return ListValue(items)
+		return ListValue(items), nil
 	case "object":
-		return Value{Kind: ValuePyObject, PyObject: &PyObject{Bridge: bridge, ID: value.ID, Repr: value.Repr}}
+		if value.ID <= 0 {
+			return NoneValue(), fmt.Errorf("invalid Python handle")
+		}
+		object := &PyObject{Bridge: bridge, ID: value.ID, Repr: value.Repr}
+		runtime.SetFinalizer(object, finalizePythonObject)
+		return Value{Kind: ValuePyObject, PyObject: object}, nil
 	}
-	return NoneValue()
+	return NoneValue(), fmt.Errorf("invalid Python wire value of kind %q", value.Kind)
+}
+
+type PythonError struct{ Type, Message, Traceback string }
+
+func (e *PythonError) Error() string {
+	return fmt.Sprintf("python bridge error: %s: %s\n%s", e.Type, e.Message, e.Traceback)
+}
+
+func (b *PythonBridge) checkObject(object *PyObject) error {
+	if object == nil || object.Bridge != b || object.released.Load() {
+		return fmt.Errorf("invalid, released, or foreign Python handle")
+	}
+	return nil
+}
+
+func (b *PythonBridge) Release(object *PyObject) error {
+	if err := b.checkObject(object); err != nil {
+		return err
+	}
+	_, err := b.roundTrip(pyRequest{Op: "release", ID: object.ID})
+	if err == nil {
+		object.released.Store(true)
+		runtime.SetFinalizer(object, nil)
+	}
+	return err
+}
+
+func finalizePythonObject(object *PyObject) {
+	if object.Bridge == nil || object.released.Swap(true) || object.Bridge.closed.Load() {
+		return
+	}
+	bridge := object.Bridge
+	bridge.releaseMu.Lock()
+	bridge.pendingRelease = append(bridge.pendingRelease, object.ID)
+	bridge.releaseMu.Unlock()
+}
+
+func pythonCallTimeout() time.Duration {
+	if value, err := time.ParseDuration(os.Getenv("TYPHON_PYTHON_TIMEOUT")); err == nil && value > 0 {
+		return value
+	}
+	return 30 * time.Second
+}
+
+func readBridgeLine(reader *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(line)+len(part) > maxBridgeMessageBytes {
+			return nil, fmt.Errorf("python bridge response size limit exceeded")
+		}
+		line = append(line, part...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return line, err
+	}
 }
 
 func findPythonExecutable(root string) (string, error) {
@@ -403,12 +596,11 @@ func findPythonExecutable(root string) (string, error) {
 		return configured, nil
 	}
 
-	candidates := []string{
-		filepath.Join(root, ".venv", "Scripts", "python.exe"),
-		filepath.Join(root, ".venv", "bin", "python"),
-		"python",
-		"python3",
+	var candidates []string
+	for _, base := range candidateRoots(root) {
+		candidates = append(candidates, filepath.Join(base, ".venv", "Scripts", "python.exe"), filepath.Join(base, ".venv", "bin", "python"))
 	}
+	candidates = append(candidates, "python", "python3")
 	for _, candidate := range candidates {
 		if strings.Contains(candidate, string(filepath.Separator)) {
 			if _, err := os.Stat(candidate); err == nil {

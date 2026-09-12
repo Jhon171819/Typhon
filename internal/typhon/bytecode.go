@@ -36,10 +36,34 @@ const (
 	OpImportFrom
 	OpString
 	OpUnpackStore
+	OpCheckType
+	OpDup
+	OpJumpIfTrue
+	OpUnary
+	OpCompare
+	OpDiv
+	OpFloorDiv
+	OpMod
 )
 
 func (op Op) String() string {
 	switch op {
+	case OpDup:
+		return "DUP"
+	case OpJumpIfTrue:
+		return "JUMP_IF_TRUE"
+	case OpUnary:
+		return "UNARY"
+	case OpCompare:
+		return "COMPARE"
+	case OpDiv:
+		return "DIV"
+	case OpFloorDiv:
+		return "FLOOR_DIV"
+	case OpMod:
+		return "MOD"
+	case OpCheckType:
+		return "CHECK_TYPE"
 	case OpConst:
 		return "CONST"
 	case OpLoadGlobal:
@@ -102,6 +126,9 @@ func (op Op) String() string {
 }
 
 type Instr struct {
+	Types    []Type
+	Line     int
+	Type     Type
 	Op       Op
 	A        int
 	S        string
@@ -113,6 +140,7 @@ type Instr struct {
 }
 
 type Function struct {
+	Signature  Type
 	Name       string
 	Params     []string
 	LocalNames []string
@@ -123,6 +151,7 @@ type Function struct {
 }
 
 type ClassSpec struct {
+	Info    *ClassInfo
 	Name    string
 	Fields  []string
 	Methods map[string]*Function

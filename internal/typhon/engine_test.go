@@ -72,6 +72,14 @@ func TestRunParallelTaskExample(t *testing.T) {
 	}
 }
 
+func TestRunVMSafetyExample(t *testing.T) {
+	output, err := captureRun(t, examplePath(t, "vm_safety.ty"))
+	want := "open 3799 3799\nnegative zero positive\nTrue True\n-3 2\n"
+	if err != nil || output != want {
+		t.Fatalf("got %q (%v), want %q", output, err, want)
+	}
+}
+
 func TestRunPythonBridgeExample(t *testing.T) {
 	output, err := captureRun(t, examplePath(t, "python_bridge.ty"))
 	if err != nil {

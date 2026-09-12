@@ -15,12 +15,16 @@ type sourceLine struct {
 }
 
 type parser struct {
-	path  string
-	lines []sourceLine
-	pos   int
+	blockDepth int
+	path       string
+	lines      []sourceLine
+	pos        int
 }
 
 func ParseFile(path string, source string) (*Module, error) {
+	if len(source) > maxStringBytes {
+		return nil, syntaxError(path, 1, "source size limit exceeded")
+	}
 	lines, err := logicalLines(source)
 	if err != nil {
 		return nil, err
@@ -152,6 +156,11 @@ func bracketDelta(line string) int {
 }
 
 func (p *parser) parseBlock(indent int) ([]Stmt, error) {
+	p.blockDepth++
+	defer func() { p.blockDepth-- }()
+	if p.blockDepth > 256 {
+		return nil, syntaxError(p.path, p.lines[p.pos].line, "block nesting limit exceeded")
+	}
 	var stmts []Stmt
 	for p.pos < len(p.lines) {
 		line := p.lines[p.pos]
@@ -188,9 +197,25 @@ func (p *parser) parseStmt(indent int) (Stmt, error) {
 		return p.parseFunc(line, indent)
 	case strings.HasPrefix(text, "if ") && strings.HasSuffix(text, ":"):
 		return p.parseIf(line, indent)
+	case strings.HasPrefix(text, "while ") && strings.HasSuffix(text, ":"):
+		cond, err := parseExpr(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "while "), ":")), line.line)
+		if err != nil {
+			return nil, syntaxError(p.path, line.line, err.Error())
+		}
+		if p.pos >= len(p.lines) || p.lines[p.pos].indent <= indent {
+			return nil, syntaxError(p.path, line.line, "while body cannot be empty")
+		}
+		body, err := p.parseBlock(p.lines[p.pos].indent)
+		return &WhileStmt{Line: line.line, Cond: cond, Body: body}, err
+	case text == "break":
+		return &BreakStmt{Line: line.line}, nil
+	case text == "continue":
+		return &ContinueStmt{Line: line.line}, nil
+	case text == "else:" || strings.HasPrefix(text, "elif "):
+		return nil, syntaxError(p.path, line.line, "else/elif requires a preceding if at the same indentation")
 	case strings.HasPrefix(text, "for ") && strings.HasSuffix(text, ":"):
 		return p.parseFor(line, indent)
-	case strings.HasPrefix(text, "return"):
+	case text == "return" || strings.HasPrefix(text, "return "):
 		return p.parseReturn(line)
 	default:
 		return p.parseSimpleStmt(line)
@@ -349,7 +374,29 @@ func (p *parser) parseIf(line sourceLine, indent int) (Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &IfStmt{Line: line.line, Cond: cond, Body: body}, nil
+	stmt := &IfStmt{Line: line.line, Cond: cond, Body: body}
+	if p.pos < len(p.lines) && p.lines[p.pos].indent == indent {
+		next := p.lines[p.pos]
+		if strings.HasPrefix(next.text, "elif ") {
+			p.pos++
+			next.text = "if " + strings.TrimPrefix(next.text, "elif ")
+			branch, err := p.parseIf(next, indent)
+			if err != nil {
+				return nil, err
+			}
+			stmt.Else = []Stmt{branch}
+		} else if next.text == "else:" {
+			p.pos++
+			if p.pos >= len(p.lines) || p.lines[p.pos].indent <= indent {
+				return nil, syntaxError(p.path, next.line, "else body cannot be empty")
+			}
+			stmt.Else, err = p.parseBlock(p.lines[p.pos].indent)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return stmt, nil
 }
 
 func (p *parser) parseFor(line sourceLine, indent int) (Stmt, error) {
@@ -549,7 +596,7 @@ func topLevelAssign(text string) int {
 				if i+1 < len(text) {
 					next = text[i+1]
 				}
-				if prev != '=' && prev != '!' && next != '=' {
+				if prev != '=' && prev != '!' && prev != '<' && prev != '>' && next != '=' {
 					return i
 				}
 			}
@@ -760,14 +807,14 @@ func lexExpr(text string, line int) ([]exprToken, error) {
 		}
 		if i+1 < len(text) {
 			two := text[i : i+2]
-			if two == "==" || two == "!=" {
+			if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "//" {
 				tokens = append(tokens, exprToken{kind: two, text: two, line: line})
 				i += 2
 				continue
 			}
 		}
 		switch ch {
-		case '(', ')', '[', ']', ',', '.', '+', '-', '*', '=', ':':
+		case '(', ')', '[', ']', ',', '.', '+', '-', '*', '=', ':', '<', '>', '/', '%':
 			tokens = append(tokens, exprToken{kind: string(ch), text: string(ch), line: line})
 			i++
 		default:
@@ -798,6 +845,7 @@ func readQuoted(text string, start int) (string, int, error) {
 }
 
 type exprParser struct {
+	depth  int
 	tokens []exprToken
 	pos    int
 	line   int
@@ -825,14 +873,26 @@ func (p *exprParser) match(kind string) bool {
 }
 
 func (p *exprParser) parseExpression(minPrec int) (Expr, error) {
-	left, err := p.parsePostfix()
+	p.depth++
+	defer func() { p.depth-- }()
+	if p.depth > 256 {
+		return nil, fmt.Errorf("expression nesting limit exceeded")
+	}
+	left, err := p.parseUnary()
 	if err != nil {
 		return nil, err
 	}
+	compared := false
 	for {
 		op, prec := p.currentBinary()
 		if prec < minPrec {
 			break
+		}
+		if prec == 3 {
+			if compared {
+				return nil, fmt.Errorf("chained comparisons are not supported; use and")
+			}
+			compared = true
 		}
 		line := p.peek().line
 		if op == "is not" {
@@ -854,22 +914,49 @@ func (p *exprParser) currentBinary() (string, int) {
 	tok := p.peek()
 	switch tok.kind {
 	case "ident":
+		if tok.text == "or" {
+			return "or", 1
+		}
+		if tok.text == "and" {
+			return "and", 2
+		}
 		if tok.text == "is" {
 			if p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].kind == "ident" && p.tokens[p.pos+1].text == "not" {
 				return "is not", 3
 			}
 			return "is", 3
 		}
-	case "==", "!=":
+	case "==", "!=", "<", "<=", ">", ">=":
 		return tok.kind, 3
 	case "+":
 		return "+", 5
 	case "-":
 		return "-", 5
-	case "*":
-		return "*", 6
+	case "*", "/", "//", "%":
+		return tok.kind, 6
 	}
 	return "", -1
+}
+
+func (p *exprParser) parseUnary() (Expr, error) {
+	tok := p.peek()
+	if tok.kind == "+" || tok.kind == "-" || tok.kind == "ident" && tok.text == "not" {
+		p.advance()
+		if tok.kind == "-" && p.peek().kind == "int" && p.peek().text == "9223372036854775808" {
+			p.advance()
+			return &IntExpr{Line: tok.line, Value: -9223372036854775808}, nil
+		}
+		precedence := 7
+		if tok.text == "not" {
+			precedence = 3
+		}
+		operand, err := p.parseExpression(precedence)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryExpr{Line: tok.line, Op: tok.text, Operand: operand}, nil
+	}
+	return p.parsePostfix()
 }
 
 func (p *exprParser) parsePostfix() (Expr, error) {

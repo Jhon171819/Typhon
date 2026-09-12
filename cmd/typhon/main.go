@@ -41,6 +41,10 @@ func run(args []string) error {
 	}
 
 	command := args[0]
+	if (command == "version" || command == "--version") && len(args) == 1 {
+		fmt.Printf("Typhon %s (Go VM, Python bridge protocol %d)\n", typhon.Version, typhon.PythonProtocolVersion)
+		return nil
+	}
 	if command != "run" && command != "check" && command != "bytecode" {
 		if len(args) == 1 {
 			return typhon.RunFileWithOptions(args[0], typhon.RunOptions{WarmPython: warmPython, SharedPython: sharedPython})

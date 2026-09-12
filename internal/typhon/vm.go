@@ -1,13 +1,20 @@
 package typhon
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 )
 
 type VM struct {
-	engine *Engine
-	module *LoadedModule
+	ctx          context.Context
+	depth        int
+	instructions int
+	engine       *Engine
+	module       *LoadedModule
 }
 
 type frame struct {
@@ -23,6 +30,7 @@ func runtimeGlobals() map[string]Value {
 	globals["print"] = nativeValue("print", nativePrint)
 	globals["spawn"] = nativeValue("spawn", nativeSpawn)
 	globals["join"] = nativeValue("join", nativeJoin)
+	globals["cancel"] = nativeValue("cancel", nativeCancel)
 	globals["enumerate"] = nativeValue("enumerate", nativeEnumerate)
 	globals["range"] = nativeValue("range", nativeRange)
 	globals["TyphonTask"] = Value{Kind: ValueClass, Class: &RuntimeClass{Spec: &ClassSpec{Name: "TyphonTask"}, FieldIndex: map[string]int{}}}
@@ -38,7 +46,24 @@ func nativeValue(name string, fn func(*VM, []Value) (Value, error)) Value {
 	return Value{Kind: ValueNative, Native: &NativeFunc{Name: name, Fn: fn}}
 }
 
-func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
+func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr error) {
+	if vm.depth == 0 {
+		vm.engine.execMu.Lock()
+		defer vm.engine.execMu.Unlock()
+	}
+	vm.depth++
+	defer func() { vm.depth-- }()
+	if vm.depth > 256 {
+		return NoneValue(), fmt.Errorf("Typhon call depth limit exceeded")
+	}
+	previousModule := vm.module
+	line := 0
+	defer func() {
+		vm.module = previousModule
+		if runErr != nil {
+			runErr = fmt.Errorf("%s:%d in %s: %w", fn.ModulePath, line, fn.Name, runErr)
+		}
+	}()
 	if fn.Module != nil {
 		vm.module = fn.Module
 	}
@@ -49,18 +74,80 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 		return NoneValue(), fmt.Errorf("%s expected %d arguments, got %d", fn.Name, len(fn.Params), len(args))
 	}
 	locals := make([]Value, len(fn.LocalNames))
-	for i := range locals {
-		locals[i] = NoneValue()
-	}
 	for i, arg := range args {
+		if i < len(fn.Signature.Params) {
+			var err error
+			arg, err = validateValue(arg, fn.Signature.Params[i])
+			if err != nil {
+				return NoneValue(), fmt.Errorf("argument %s: %w", fn.Params[i], err)
+			}
+		}
 		locals[i] = arg
 	}
 	f := &frame{fn: fn, locals: locals, module: vm.module}
 
 	for f.pc < len(fn.Code) {
+		if err := vm.context().Err(); err != nil {
+			return NoneValue(), err
+		}
+		vm.instructions++
+		if vm.instructions > 10_000_000 {
+			return NoneValue(), fmt.Errorf("instruction budget exceeded")
+		}
 		instr := fn.Code[f.pc]
+		line = instr.Line
 		f.pc++
 		switch instr.Op {
+		case OpDup:
+			f.push(f.peek())
+		case OpJumpIfTrue:
+			if truthy(f.pop()) {
+				f.pc = instr.A
+			}
+		case OpUnary:
+			value := f.pop()
+			if instr.S == "not" {
+				f.push(BoolValue(!truthy(value)))
+				continue
+			}
+			if value.Kind != ValueInt && value.Kind != ValueFloat {
+				return NoneValue(), fmt.Errorf("unary sign requires a number")
+			}
+			if instr.S == "-" {
+				if value.Kind == ValueInt {
+					if value.Int == math.MinInt64 {
+						return NoneValue(), fmt.Errorf("int64 overflow in unary -")
+					}
+					value.Int = -value.Int
+				} else {
+					value.Float = -value.Float
+				}
+			}
+			f.push(value)
+		case OpCompare:
+			right, left := f.pop(), f.pop()
+			cmp, err := compareValues(left, right)
+			if err != nil {
+				return NoneValue(), err
+			}
+			result := false
+			switch instr.S {
+			case "<":
+				result = cmp < 0
+			case "<=":
+				result = cmp <= 0
+			case ">":
+				result = cmp > 0
+			case ">=":
+				result = cmp >= 0
+			}
+			f.push(BoolValue(result))
+		case OpCheckType:
+			value, err := validateValue(f.pop(), instr.Type)
+			if err != nil {
+				return NoneValue(), err
+			}
+			f.push(value)
 		case OpConst:
 			f.push(instr.Val)
 		case OpLoadGlobal:
@@ -72,41 +159,22 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 		case OpStoreGlobal:
 			f.module.Globals[instr.S] = f.pop()
 		case OpLoadLocal:
+			if f.locals[instr.A].Kind == "" {
+				return NoneValue(), fmt.Errorf("variable %q is not initialized", fn.LocalNames[instr.A])
+			}
 			f.push(f.locals[instr.A])
 		case OpStoreLocal:
 			f.locals[instr.A] = f.pop()
 		case OpPop:
 			_ = f.pop()
-		case OpAdd:
+		case OpAdd, OpSub, OpMul, OpDiv, OpFloorDiv, OpMod:
 			right := f.pop()
 			left := f.pop()
-			if left.Kind == ValueString || right.Kind == ValueString {
-				f.push(StringValue(left.String() + right.String()))
-			} else if left.Kind == ValueFloat || right.Kind == ValueFloat {
-				f.push(FloatValue(numberValue(left) + numberValue(right)))
-			} else {
-				f.push(IntValue(left.Int + right.Int))
+			value, err := arithmetic(instr.Op, left, right)
+			if err != nil {
+				return NoneValue(), err
 			}
-		case OpSub:
-			right := f.pop()
-			left := f.pop()
-			if left.Kind == ValueFloat || right.Kind == ValueFloat {
-				f.push(FloatValue(numberValue(left) - numberValue(right)))
-			} else {
-				f.push(IntValue(left.Int - right.Int))
-			}
-		case OpMul:
-			right := f.pop()
-			left := f.pop()
-			if left.Kind == ValueString && right.Kind == ValueInt {
-				f.push(StringValue(strings.Repeat(left.Str, int(right.Int))))
-			} else if left.Kind == ValueInt && right.Kind == ValueString {
-				f.push(StringValue(strings.Repeat(right.Str, int(left.Int))))
-			} else if left.Kind == ValueFloat || right.Kind == ValueFloat {
-				f.push(FloatValue(numberValue(left) * numberValue(right)))
-			} else {
-				f.push(IntValue(left.Int * right.Int))
-			}
+			f.push(value)
 		case OpEqual:
 			right := f.pop()
 			left := f.pop()
@@ -118,11 +186,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 		case OpIs:
 			right := f.pop()
 			left := f.pop()
-			f.push(BoolValue(valuesEqual(left, right)))
+			f.push(BoolValue(valuesIdentical(left, right)))
 		case OpIsNot:
 			right := f.pop()
 			left := f.pop()
-			f.push(BoolValue(!valuesEqual(left, right)))
+			f.push(BoolValue(!valuesIdentical(left, right)))
 		case OpJumpIfFalse:
 			if !truthy(f.pop()) {
 				f.pc = instr.A
@@ -148,7 +216,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 			}
 			f.push(result)
 		case OpReturn:
-			return f.pop(), nil
+			value := f.pop()
+			if fn.Signature.Return != nil {
+				return validateValue(value, *fn.Signature.Return)
+			}
+			return value, nil
 		case OpMakeList:
 			items := make([]Value, instr.A)
 			for i := instr.A - 1; i >= 0; i-- {
@@ -192,6 +264,12 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 				return NoneValue(), err
 			}
 			for i, name := range instr.Names {
+				if i < len(instr.Types) {
+					items[i], err = validateValue(items[i], instr.Types[i])
+					if err != nil {
+						return NoneValue(), err
+					}
+				}
 				if idx, ok := f.fn.LocalIndex[name]; ok && f.fn.Name != "<module>" {
 					f.locals[idx] = items[i]
 				} else {
@@ -249,8 +327,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 				}
 				continue
 			}
-			imported, err := vm.engine.LoadModuleByName(instr.S, filepathDir(f.module.Path))
+			imported, err := vm.engine.loadModuleByNameLocked(instr.S, filepathDir(f.module.Path))
 			if err != nil {
+				if !errors.Is(err, ErrModuleNotFound) {
+					return NoneValue(), err
+				}
 				bridge, bridgeErr := vm.engine.PythonBridge()
 				if bridgeErr != nil {
 					return NoneValue(), err
@@ -277,7 +358,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 				f.module.Globals[name] = value
 			}
 		case OpString:
-			f.push(StringValue(formatValue(f.pop(), instr.S)))
+			value := f.pop()
+			if instr.S == ".2f" && value.Kind != ValueInt && value.Kind != ValueFloat {
+				return NoneValue(), fmt.Errorf(".2f format requires a number")
+			}
+			f.push(StringValue(formatValue(value, instr.S)))
 		}
 	}
 	return NoneValue(), nil
@@ -303,6 +388,9 @@ func runtimeClass(spec *ClassSpec, module *LoadedModule) *RuntimeClass {
 }
 
 func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Value, error) {
+	if err := vm.context().Err(); err != nil {
+		return NoneValue(), err
+	}
 	switch callee.Kind {
 	case ValueFunction:
 		if len(kwargs) > 0 {
@@ -320,8 +408,8 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 		}
 		return vm.callClass(callee.Class, args)
 	case ValueBoundMethod:
-		if len(kwargs) > 0 && callee.Bound.Native == nil {
-			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Bound.Function.Name)
+		if len(kwargs) > 0 {
+			return NoneValue(), fmt.Errorf("Typhon methods do not accept keyword arguments")
 		}
 		if callee.Bound.Native != nil {
 			nativeArgs := append([]Value{callee.Bound.Receiver}, args...)
@@ -338,9 +426,6 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 
 func (vm *VM) callClass(class *RuntimeClass, args []Value) (Value, error) {
 	fields := make([]Value, len(class.Spec.Fields))
-	for i := range fields {
-		fields[i] = NoneValue()
-	}
 	object := Value{Kind: ValueObject, Object: &Object{Class: class, Fields: fields}}
 	if initFn, ok := class.Spec.Methods["__init__"]; ok {
 		_, err := vm.runFunction(initFn, append([]Value{object}, args...))
@@ -355,6 +440,9 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 	switch value.Kind {
 	case ValueObject:
 		if idx, ok := value.Object.Class.FieldIndex[name]; ok {
+			if value.Object.Fields[idx].Kind == "" {
+				return NoneValue(), fmt.Errorf("field %s.%s is not initialized", value.Object.Class.Spec.Name, name)
+			}
 			return value.Object.Fields[idx], nil
 		}
 		if method, ok := value.Object.Class.Spec.Methods[name]; ok {
@@ -393,6 +481,13 @@ func (vm *VM) setAttr(value Value, name string, newValue Value) error {
 	if !ok {
 		return fmt.Errorf("%s has no field %q", value.Object.Class.Spec.Name, name)
 	}
+	if info := value.Object.Class.Spec.Info; info != nil {
+		var err error
+		newValue, err = validateValue(newValue, info.Fields[name])
+		if err != nil {
+			return fmt.Errorf("field %s: %w", name, err)
+		}
+	}
 	value.Object.Fields[idx] = newValue
 	return nil
 }
@@ -415,23 +510,85 @@ func nativeSpawn(vm *VM, args []Value) (Value, error) {
 	if len(args) == 0 {
 		return NoneValue(), fmt.Errorf("spawn expected a function")
 	}
+	if len(vm.engine.tasks) >= 256 {
+		return NoneValue(), fmt.Errorf("task quota exceeded")
+	}
 	callee := args[0]
+	module := vm.module
 	callArgs := append([]Value(nil), args[1:]...)
-	task := &Task{done: make(chan taskResult, 1)}
+	ctx, cancel := context.WithCancel(vm.context())
+	task := &Task{done: make(chan struct{}), cancel: cancel}
+	vm.engine.tasks = append(vm.engine.tasks, task)
 	go func() {
-		child := &VM{engine: vm.engine, module: vm.module}
+		defer cancel()
+		vm.engine.execMu.Lock()
+		defer vm.engine.execMu.Unlock()
+		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx}
 		value, err := child.callValue(callee, callArgs, nil)
-		task.done <- taskResult{value: value, err: err}
+		task.result = taskResult{value: value, err: err}
+		close(task.done)
 	}()
 	return Value{Kind: ValueTask, Task: task}, nil
 }
 
 func nativeJoin(vm *VM, args []Value) (Value, error) {
-	if len(args) != 1 || args[0].Kind != ValueTask || args[0].Task == nil {
+	if len(args) < 1 || len(args) > 2 || args[0].Kind != ValueTask || args[0].Task == nil {
 		return NoneValue(), fmt.Errorf("join expected a task")
 	}
-	result := <-args[0].Task.done
+	timeout := 30 * time.Second
+	if len(args) == 2 {
+		if args[1].Kind != ValueInt && args[1].Kind != ValueFloat {
+			return NoneValue(), fmt.Errorf("join timeout must be a positive number of seconds")
+		}
+		seconds := numberValue(args[1])
+		if seconds <= 0 || math.IsInf(seconds, 0) || math.IsNaN(seconds) || seconds > 86400 {
+			return NoneValue(), fmt.Errorf("join timeout must be between 0 and 86400 seconds")
+		}
+		timeout = time.Duration(seconds * float64(time.Second))
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	vm.engine.execMu.Unlock()
+	var waitErr error
+	select {
+	case <-args[0].Task.done:
+	case <-vm.context().Done():
+		waitErr = vm.context().Err()
+	case <-timer.C:
+		waitErr = fmt.Errorf("join timed out after %s; execution cancelled", timeout)
+		vm.engine.cancel()
+		vm.engine.bridgeMu.Lock()
+		bridge := vm.engine.bridge
+		vm.engine.bridgeMu.Unlock()
+		if bridge != nil {
+			_ = bridge.Close()
+		}
+	}
+	vm.engine.execMu.Lock()
+	if waitErr != nil {
+		return NoneValue(), waitErr
+	}
+	result := args[0].Task.result
 	return result.value, result.err
+}
+
+func (vm *VM) context() context.Context {
+	if vm.ctx != nil {
+		return vm.ctx
+	}
+	return vm.engine.ctx
+}
+
+func nativeCancel(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 || args[0].Kind != ValueTask || args[0].Task == nil {
+		return NoneValue(), fmt.Errorf("cancel expected a task")
+	}
+	task := args[0].Task
+	task.cancelled = true
+	if task.cancel != nil {
+		task.cancel()
+	}
+	return NoneValue(), nil
 }
 
 func nativeEnumerate(vm *VM, args []Value) (Value, error) {
@@ -472,27 +629,48 @@ func nativeRange(vm *VM, args []Value) (Value, error) {
 	items := []Value{}
 	if step > 0 {
 		for value := start; value < stop; value += step {
+			if len(items) >= maxCollectionItems {
+				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
 			items = append(items, IntValue(value))
+			if value > math.MaxInt64-step {
+				break
+			}
 		}
 	} else {
 		for value := start; value > stop; value += step {
+			if len(items) >= maxCollectionItems {
+				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
 			items = append(items, IntValue(value))
+			if value < math.MinInt64-step {
+				break
+			}
 		}
 	}
 	return ListValue(items), nil
 }
 
 func nativeStringStrip(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.strip expected no arguments")
+	}
 	receiver := vmReceiver(args)
 	return StringValue(strings.TrimSpace(receiver.Str)), nil
 }
 
 func nativeStringTitle(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.title expected no arguments")
+	}
 	receiver := vmReceiver(args)
 	return StringValue(titleString(receiver.Str)), nil
 }
 
 func nativeStringUpper(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.upper expected no arguments")
+	}
 	receiver := vmReceiver(args)
 	return StringValue(strings.ToUpper(receiver.Str)), nil
 }
@@ -505,7 +683,18 @@ func nativeListAppend(vm *VM, args []Value) (Value, error) {
 	if receiver.List == nil {
 		return NoneValue(), fmt.Errorf("list.append receiver is nil")
 	}
-	*receiver.List = append(*receiver.List, args[1])
+	if len(*receiver.List) >= maxCollectionItems {
+		return NoneValue(), fmt.Errorf("list size limit exceeded")
+	}
+	item := args[1]
+	if receiver.ListGuard != nil && receiver.ListGuard.elem != nil {
+		var err error
+		item, err = validateValue(item, *receiver.ListGuard.elem)
+		if err != nil {
+			return NoneValue(), err
+		}
+	}
+	*receiver.List = append(*receiver.List, item)
 	return NoneValue(), nil
 }
 

@@ -1,6 +1,8 @@
 package typhon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +11,13 @@ import (
 )
 
 type Engine struct {
+	// VM execution is serialized. join yields this lock while its child runs.
+	execMu       sync.Mutex
+	moduleMu     sync.Mutex
+	loading      map[string]bool
+	tasks        []*Task
+	ctx          context.Context
+	cancel       context.CancelFunc
 	modules      map[string]*LoadedModule
 	infos        map[string]*ModuleInfo
 	root         string
@@ -21,17 +30,21 @@ type Engine struct {
 }
 
 type LoadedModule struct {
-	Path     string
-	Name     string
-	Program  *Program
-	Info     *ModuleInfo
-	Globals  map[string]Value
-	Executed bool
-	Engine   *Engine
+	Executing  bool
+	ExecuteErr error
+	Path       string
+	Name       string
+	Program    *Program
+	Info       *ModuleInfo
+	Globals    map[string]Value
+	Executed   bool
+	Engine     *Engine
 }
 
 func NewEngine() *Engine {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
+		ctx: ctx, cancel: cancel, loading: map[string]bool{},
 		modules: map[string]*LoadedModule{},
 		infos:   map[string]*ModuleInfo{},
 	}
@@ -74,6 +87,12 @@ func BytecodeFile(path string) (string, error) {
 }
 
 func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
+	e.moduleMu.Lock()
+	defer e.moduleMu.Unlock()
+	return e.loadModule(path)
+}
+
+func (e *Engine) loadModule(path string) (*LoadedModule, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -81,8 +100,15 @@ func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
 	if module, ok := e.modules[abs]; ok {
 		return module, nil
 	}
+	if e.loading[abs] {
+		return nil, fmt.Errorf("cyclic Typhon import: %s", abs)
+	}
+	e.loading[abs] = true
+	defer delete(e.loading, abs)
 	if e.root == "" {
+		e.bridgeMu.Lock()
 		e.root = projectRoot(filepath.Dir(abs))
+		e.bridgeMu.Unlock()
 	}
 	if e.warmPython {
 		e.StartPythonBridgeWarmup()
@@ -95,7 +121,7 @@ func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, err := CheckModule(ast, e)
+	info, err := CheckModule(ast, lockedImportResolver{e})
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +140,20 @@ func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
 	e.modules[abs] = module
 	e.infos[abs] = info
 	return module, nil
+}
+
+type lockedImportResolver struct{ engine *Engine }
+
+func (r lockedImportResolver) ResolveImport(module, fromDir string) (*ModuleInfo, error) {
+	path, err := resolveModulePath(module, fromDir)
+	if err != nil {
+		return nil, err
+	}
+	loaded, err := r.engine.loadModule(path)
+	if err != nil {
+		return nil, err
+	}
+	return loaded.Info, nil
 }
 
 type RunOptions struct {
@@ -140,6 +180,12 @@ func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, erro
 }
 
 func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule, error) {
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	return e.loadModuleByNameLocked(module, fromDir)
+}
+
+func (e *Engine) loadModuleByNameLocked(module string, fromDir string) (*LoadedModule, error) {
 	if module == "typhon.parallel" {
 		return &LoadedModule{
 			Path:     "<typhon.parallel>",
@@ -162,7 +208,7 @@ func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule,
 		return nil, err
 	}
 	if !loaded.Executed {
-		if err := e.ExecuteModule(loaded, false); err != nil {
+		if err := e.executeModuleLocked(loaded, false); err != nil {
 			return nil, err
 		}
 	}
@@ -170,6 +216,9 @@ func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule,
 }
 
 func (e *Engine) PythonBridge() (*PythonBridge, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
 	e.bridgeMu.Lock()
 	if e.bridge != nil {
 		bridge := e.bridge
@@ -181,18 +230,24 @@ func (e *Engine) PythonBridge() (*PythonBridge, error) {
 		e.bridgeMu.Unlock()
 		<-done
 		e.bridgeMu.Lock()
-		defer e.bridgeMu.Unlock()
 		if e.bridge != nil {
-			return e.bridge, nil
+			bridge := e.bridge
+			e.bridgeMu.Unlock()
+			return bridge, nil
 		}
 		if e.bridgeErr != nil {
-			return nil, e.bridgeErr
+			err := e.bridgeErr
+			e.bridgeMu.Unlock()
+			return nil, err
 		}
 	}
 	e.bridgeMu.Unlock()
 
 	e.bridgeMu.Lock()
 	defer e.bridgeMu.Unlock()
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
 	if e.bridge != nil {
 		return e.bridge, nil
 	}
@@ -212,6 +267,10 @@ func (e *Engine) PythonBridge() (*PythonBridge, error) {
 
 func (e *Engine) StartPythonBridgeWarmup() {
 	e.bridgeMu.Lock()
+	if e.ctx.Err() != nil {
+		e.bridgeMu.Unlock()
+		return
+	}
 	if e.bridge != nil || e.bridgeDone != nil {
 		e.bridgeMu.Unlock()
 		return
@@ -255,6 +314,7 @@ func (e *Engine) WarmPythonBridge() error {
 }
 
 func (e *Engine) Close() error {
+	e.cancel()
 	e.bridgeMu.Lock()
 	done := e.bridgeDone
 	e.bridgeMu.Unlock()
@@ -271,6 +331,34 @@ func (e *Engine) Close() error {
 }
 
 func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	err := e.executeModuleLocked(module, main)
+	if main {
+		if err != nil {
+			e.cancel()
+		}
+		for i := 0; i < len(e.tasks); i++ {
+			task := e.tasks[i]
+			e.execMu.Unlock()
+			<-task.done
+			e.execMu.Lock()
+			if err == nil && task.result.err != nil && !(task.cancelled && errors.Is(task.result.err, context.Canceled)) {
+				err = fmt.Errorf("child task: %w", task.result.err)
+				e.cancel()
+			}
+		}
+	}
+	return err
+}
+
+func (e *Engine) executeModuleLocked(module *LoadedModule, main bool) error {
+	if module.Executing {
+		return fmt.Errorf("cyclic module execution: %s", module.Path)
+	}
+	if module.ExecuteErr != nil {
+		return module.ExecuteErr
+	}
 	if module.Executed {
 		return nil
 	}
@@ -280,9 +368,12 @@ func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
 	} else {
 		module.Globals["__name__"] = StringValue(module.Name)
 	}
-	vm := &VM{engine: e, module: module}
+	module.Executing = true
+	defer func() { module.Executing = false }()
+	vm := &VM{engine: e, module: module, depth: 1}
 	_, err := vm.runFunction(module.Program.Module, nil)
 	if err != nil {
+		module.ExecuteErr = err
 		return err
 	}
 	module.Executed = true
@@ -295,13 +386,19 @@ func resolveModulePath(module string, fromDir string) (string, error) {
 	filePath := base + ".ty"
 	if _, err := os.Stat(filePath); err == nil {
 		return filePath, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
 	initPath := filepath.Join(base, "__init__.ty")
 	if _, err := os.Stat(initPath); err == nil {
 		return initPath, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
-	return "", fmt.Errorf("cannot import module %q from %s", module, fromDir)
+	return "", fmt.Errorf("%w: cannot import module %q from %s", ErrModuleNotFound, module, fromDir)
 }
+
+var ErrModuleNotFound = errors.New("Typhon module not found")
 
 func moduleNameFromPath(path string) string {
 	base := filepath.Base(path)
@@ -339,8 +436,9 @@ func parallelModuleInfo() *ModuleInfo {
 		Path: "<typhon.parallel>",
 		Exports: map[string]Type{
 			"TyphonTask": TaskType(),
-			"spawn":      {Kind: TypeFunc, Name: "spawn", Params: []Type{AnyType()}, Return: typePtr(TaskType())},
+			"spawn":      {Kind: TypeFunc, Name: "spawn", Variadic: true, Params: []Type{AnyType()}, Return: typePtr(TaskType())},
 			"join":       {Kind: TypeFunc, Name: "join", Params: []Type{TaskType()}, Return: typePtr(AnyType())},
+			"cancel":     {Kind: TypeFunc, Name: "cancel", Params: []Type{TaskType()}, Return: typePtr(NoneType())},
 		},
 		Classes: map[string]*ClassInfo{},
 	}

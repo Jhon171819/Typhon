@@ -1,6 +1,7 @@
 package typhon
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -26,21 +27,22 @@ const (
 )
 
 type Value struct {
-	Kind     ValueKind
-	Int      int64
-	Float    float64
-	Str      string
-	Bool     bool
-	List     *[]Value
-	Function *Function
-	Native   *NativeFunc
-	Module   *NativeModule
-	Class    *RuntimeClass
-	Object   *Object
-	Bound    *BoundMethod
-	Task     *Task
-	Iterator *Iterator
-	PyObject *PyObject
+	ListGuard *listGuard
+	Kind      ValueKind
+	Int       int64
+	Float     float64
+	Str       string
+	Bool      bool
+	List      *[]Value
+	Function  *Function
+	Native    *NativeFunc
+	Module    *NativeModule
+	Class     *RuntimeClass
+	Object    *Object
+	Bound     *BoundMethod
+	Task      *Task
+	Iterator  *Iterator
+	PyObject  *PyObject
 }
 
 type NativeFunc struct {
@@ -71,8 +73,13 @@ type BoundMethod struct {
 }
 
 type Task struct {
-	done chan taskResult
+	cancel    context.CancelFunc
+	cancelled bool
+	done      chan struct{}
+	result    taskResult
 }
+
+type listGuard struct{ elem *Type }
 
 type taskResult struct {
 	value Value
@@ -106,10 +113,17 @@ func BoolValue(value bool) Value {
 
 func ListValue(values []Value) Value {
 	items := append([]Value(nil), values...)
-	return Value{Kind: ValueList, List: &items}
+	return Value{Kind: ValueList, List: &items, ListGuard: &listGuard{}}
 }
 
 func (v Value) String() string {
+	return v.stringValue(0, map[*[]Value]bool{})
+}
+
+func (v Value) stringValue(depth int, seen map[*[]Value]bool) string {
+	if depth > 64 {
+		return "<depth limit>"
+	}
 	switch v.Kind {
 	case ValueNone:
 		return "None"
@@ -128,9 +142,14 @@ func (v Value) String() string {
 		if v.List == nil {
 			return "[]"
 		}
+		if seen[v.List] {
+			return "[...]"
+		}
+		seen[v.List] = true
+		defer delete(seen, v.List)
 		parts := make([]string, 0, len(*v.List))
 		for _, item := range *v.List {
-			parts = append(parts, item.String())
+			parts = append(parts, item.stringValue(depth+1, seen))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case ValueFunction:
@@ -182,10 +201,39 @@ func truthy(value Value) bool {
 }
 
 func valuesEqual(left Value, right Value) bool {
+	return equalValues(left, right, map[[2]*[]Value]bool{})
+}
+
+func equalValues(left Value, right Value, seen map[[2]*[]Value]bool) bool {
+	if left.Kind == ValueInt && right.Kind == ValueFloat || left.Kind == ValueFloat && right.Kind == ValueInt {
+		cmp, err := compareValues(left, right)
+		return err == nil && cmp == 0
+	}
 	if left.Kind != right.Kind {
 		return false
 	}
 	switch left.Kind {
+	case ValueList:
+		if left.List == right.List {
+			return true
+		}
+		if left.List == nil || right.List == nil {
+			return false
+		}
+		pair := [2]*[]Value{left.List, right.List}
+		if seen[pair] {
+			return true
+		}
+		seen[pair] = true
+		if len(*left.List) != len(*right.List) {
+			return false
+		}
+		for i, item := range *left.List {
+			if !equalValues(item, (*right.List)[i], seen) {
+				return false
+			}
+		}
+		return true
 	case ValueNone:
 		return true
 	case ValueInt:
@@ -202,5 +250,27 @@ func valuesEqual(left Value, right Value) bool {
 		return left.Class == right.Class
 	default:
 		return false
+	}
+}
+
+func valuesIdentical(left, right Value) bool {
+	if left.Kind != right.Kind {
+		return false
+	}
+	switch left.Kind {
+	case ValueList:
+		return left.List == right.List
+	case ValueTask:
+		return left.Task == right.Task
+	case ValueFunction:
+		return left.Function == right.Function
+	case ValueNative:
+		return left.Native == right.Native
+	case ValueNativeModule:
+		return left.Module == right.Module
+	case ValuePyObject:
+		return left.PyObject != nil && right.PyObject != nil && left.PyObject.Bridge == right.PyObject.Bridge && left.PyObject.ID == right.PyObject.ID
+	default:
+		return valuesEqual(left, right)
 	}
 }

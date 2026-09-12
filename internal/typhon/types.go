@@ -5,32 +5,36 @@ import "strings"
 type TypeKind string
 
 const (
-	TypeAny    TypeKind = "any"
-	TypeNone   TypeKind = "none"
-	TypeInt    TypeKind = "int"
-	TypeFloat  TypeKind = "float"
-	TypeStr    TypeKind = "str"
-	TypeBool   TypeKind = "bool"
-	TypeList   TypeKind = "list"
-	TypeClass  TypeKind = "class"
-	TypeFunc   TypeKind = "func"
-	TypeTask   TypeKind = "task"
-	TypeUnion  TypeKind = "union"
-	TypeModule TypeKind = "module"
-	TypePy     TypeKind = "pyobject"
+	TypeAny     TypeKind = "any"
+	TypeNone    TypeKind = "none"
+	TypeInt     TypeKind = "int"
+	TypeFloat   TypeKind = "float"
+	TypeStr     TypeKind = "str"
+	TypeBool    TypeKind = "bool"
+	TypeList    TypeKind = "list"
+	TypeClass   TypeKind = "class"
+	TypeFunc    TypeKind = "func"
+	TypeTask    TypeKind = "task"
+	TypeUnion   TypeKind = "union"
+	TypeModule  TypeKind = "module"
+	TypePy      TypeKind = "pyobject"
+	TypeLiteral TypeKind = "literal"
+	TypeNever   TypeKind = "never"
 )
 
 type Type struct {
-	Kind    TypeKind
-	Name    string
-	Elem    *Type
-	Options []Type
-	Params  []Type
-	Return  *Type
-	Class   *ClassInfo
+	Variadic bool
+	Kind     TypeKind
+	Name     string
+	Elem     *Type
+	Options  []Type
+	Params   []Type
+	Return   *Type
+	Class    *ClassInfo
 }
 
 type ClassInfo struct {
+	Module  string
 	Name    string
 	Fields  map[string]Type
 	Order   []string
@@ -54,6 +58,8 @@ func PyType() Type    { return Type{Kind: TypePy, Name: "PyObject"} }
 
 func (t Type) String() string {
 	switch t.Kind {
+	case TypeLiteral:
+		return "\"" + t.Name + "\""
 	case TypeAny:
 		return "Any"
 	case TypeNone:
@@ -92,13 +98,35 @@ func (t Type) Equal(other Type) bool {
 		}
 		return t.Elem.Equal(*other.Elem)
 	case TypeClass:
+		return t.Class == other.Class && t.Name == other.Name
+	case TypeLiteral:
 		return t.Name == other.Name
+	case TypeFunc:
+		if t.Variadic != other.Variadic {
+			return false
+		}
+		if len(t.Params) != len(other.Params) || (t.Return == nil) != (other.Return == nil) {
+			return false
+		}
+		for i := range t.Params {
+			if !t.Params[i].Equal(other.Params[i]) {
+				return false
+			}
+		}
+		return t.Return == nil || t.Return.Equal(*other.Return)
 	case TypeUnion:
 		if len(t.Options) != len(other.Options) {
 			return false
 		}
-		for i := range t.Options {
-			if !t.Options[i].Equal(other.Options[i]) {
+		for _, option := range t.Options {
+			found := false
+			for _, candidate := range other.Options {
+				if option.Equal(candidate) {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 		}
@@ -109,6 +137,12 @@ func (t Type) Equal(other Type) bool {
 }
 
 func assignable(from Type, to Type) bool {
+	if from.Kind == TypeNever {
+		return true
+	}
+	if from.Kind == TypeLiteral && to.Kind == TypeStr {
+		return true
+	}
 	if from.Equal(to) {
 		return true
 	}
@@ -121,14 +155,6 @@ func assignable(from Type, to Type) bool {
 	if from.Kind == TypePy || to.Kind == TypePy {
 		return true
 	}
-	if to.Kind == TypeUnion {
-		for _, option := range to.Options {
-			if assignable(from, option) {
-				return true
-			}
-		}
-		return false
-	}
 	if from.Kind == TypeUnion {
 		for _, option := range from.Options {
 			if !assignable(option, to) {
@@ -137,11 +163,45 @@ func assignable(from Type, to Type) bool {
 		}
 		return true
 	}
+	if to.Kind == TypeUnion {
+		for _, option := range to.Options {
+			if assignable(from, option) {
+				return true
+			}
+		}
+		return false
+	}
 	if to.Kind == TypeList && from.Kind == TypeList {
 		if to.Elem == nil || from.Elem == nil {
 			return true
 		}
-		return assignable(*from.Elem, *to.Elem)
+		return from.Elem.Kind == TypeNever || from.Elem.Equal(*to.Elem)
 	}
 	return from.Equal(to)
+}
+
+func unionType(types ...Type) Type {
+	var options []Type
+	var add func(Type)
+	add = func(t Type) {
+		if t.Kind == TypeUnion {
+			for _, option := range t.Options {
+				add(option)
+			}
+			return
+		}
+		for _, option := range options {
+			if t.Equal(option) {
+				return
+			}
+		}
+		options = append(options, t)
+	}
+	for _, t := range types {
+		add(t)
+	}
+	if len(options) == 1 {
+		return options[0]
+	}
+	return Type{Kind: TypeUnion, Options: options}
 }
