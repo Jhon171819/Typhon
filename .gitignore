@@ -6,3 +6,6 @@ __pycache__/
 typhon.exe
 .cache/
 dist/
+*.vsix
+editors/typhon/node_modules/
+editors/zed/grammar/node_modules/

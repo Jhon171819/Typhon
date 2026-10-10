@@ -1,0 +1,11 @@
+{
+  "file_types": {
+    "Typhon": ["ty"]
+  },
+  "languages": {
+    "Typhon": {
+      "enable_language_server": false,
+      "format_on_save": "off"
+    }
+  }
+}

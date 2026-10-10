@@ -419,6 +419,16 @@ interpreter startup, import execution, bridge IPC, or value conversion. The
 checked-in experiment did not show an improvement for the tested `requests`
 dependency set.
 
+## Editor support
+
+Install the local [Typhon language extension](editors/typhon/README.md) to
+recognize `.ty` files as Typhon in VS Code and compatible editors. The same
+grammar can be imported through TextMate Bundles in PyCharm / IntelliJ IDEA.
+It provides syntax highlighting, comments, brackets, indentation and folding;
+semantic diagnostics and completion are not implemented yet.
+For Zed, install the dedicated [Typhon Tree-sitter extension](editors/zed/README.md),
+which provides recognition, highlighting, comments, brackets and indentation.
+
 ## Tests
 
 Run the native Go tests:
