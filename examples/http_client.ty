@@ -1,0 +1,10 @@
+import typhon.http as http
+
+url: str = http.env('HTTP_URL')
+if url == '':
+    url = 'http://127.0.0.1:8080/health'
+
+client: http.Client = http.client(5)
+result: http.Response = client.get(url)
+print(result.status, result.body)
+client.close()

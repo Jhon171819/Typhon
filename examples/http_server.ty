@@ -1,0 +1,13 @@
+import typhon.http as http
+
+
+def handle(req: http.Request) -> http.Response:
+    if req.path == '/health':
+        return http.response(200, 'ok', [['Content-Type', 'text/plain; charset=utf-8']])
+    if req.path == '/echo':
+        return http.json(200, [req.method, req.query('name'), req.body])
+    return http.response(404, 'not found')
+
+
+print('HTTP em http://127.0.0.1:8080; Ctrl+C para encerrar')
+http.serve('127.0.0.1:8080', handle)

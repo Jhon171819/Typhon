@@ -3,6 +3,37 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  native-drivers:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: typhon
+          POSTGRES_PASSWORD: typhon_test
+          POSTGRES_DB: typhon_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U typhon -d typhon_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TYPHON_TEST_POSTGRES_URL: postgres://typhon:typhon_test@localhost:5432/typhon_test?sslmode=disable
+      TYPHON_TEST_REDIS_URL: redis://localhost:6379/0
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./internal/typhon -run TestNative -v
   test:
     strategy:
       matrix:

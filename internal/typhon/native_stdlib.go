@@ -9,6 +9,9 @@ import (
 )
 
 func isNativePythonModule(name string) bool {
+	if _, ok := nativeDriverInfo(name); ok {
+		return true
+	}
 	switch trimPythonNamespace(name) {
 	case "typhon.python":
 		return true
@@ -20,6 +23,9 @@ func isNativePythonModule(name string) bool {
 }
 
 func nativePythonModule(name string) (Value, bool) {
+	if module, ok := nativeDriverModule(name); ok {
+		return module, true
+	}
 	switch trimPythonNamespace(name) {
 	case "typhon.python":
 		return Value{Kind: ValueNativeModule, Module: &NativeModule{Name: name, Exports: map[string]Value{

@@ -10,6 +10,7 @@ import (
 )
 
 type VM struct {
+	resources    *resourceScope
 	ctx          context.Context
 	depth        int
 	instructions int
@@ -401,6 +402,9 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 		if len(kwargs) > 0 {
 			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Native.Name)
 		}
+		if callee.Native.Signature.Kind == TypeFunc {
+			return callNativeDriver(vm, callee.Native, args)
+		}
 		return callee.Native.Fn(vm, args)
 	case ValueClass:
 		if len(kwargs) > 0 {
@@ -438,6 +442,14 @@ func (vm *VM) callClass(class *RuntimeClass, args []Value) (Value, error) {
 
 func (vm *VM) getAttr(value Value, name string) (Value, error) {
 	switch value.Kind {
+	case ValueNativeObject:
+		if value.NativeObject.Owner != nil && value.NativeObject.Owner != vm.engine {
+			return NoneValue(), fmt.Errorf("native object belongs to another Engine")
+		}
+		if attr, ok := value.NativeObject.Attrs[name]; ok {
+			return attr, nil
+		}
+		return NoneValue(), fmt.Errorf("%s has no attribute %q", value.NativeObject.Type.Name, name)
 	case ValueObject:
 		if idx, ok := value.Object.Class.FieldIndex[name]; ok {
 			if value.Object.Fields[idx].Kind == "" {
@@ -523,7 +535,7 @@ func nativeSpawn(vm *VM, args []Value) (Value, error) {
 		defer cancel()
 		vm.engine.execMu.Lock()
 		defer vm.engine.execMu.Unlock()
-		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx}
+		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, resources: vm.resources}
 		value, err := child.callValue(callee, callArgs, nil)
 		task.result = taskResult{value: value, err: err}
 		close(task.done)

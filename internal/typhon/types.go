@@ -20,9 +20,12 @@ const (
 	TypePy      TypeKind = "pyobject"
 	TypeLiteral TypeKind = "literal"
 	TypeNever   TypeKind = "never"
+	TypeNative  TypeKind = "native"
 )
 
 type Type struct {
+	Members  map[string]Type
+	Optional int
 	Variadic bool
 	Kind     TypeKind
 	Name     string
@@ -64,7 +67,7 @@ func (t Type) String() string {
 		return "Any"
 	case TypeNone:
 		return "None"
-	case TypeInt, TypeFloat, TypeStr, TypeBool, TypeClass, TypeTask, TypeModule, TypePy:
+	case TypeInt, TypeFloat, TypeStr, TypeBool, TypeClass, TypeTask, TypeModule, TypePy, TypeNative:
 		return t.Name
 	case TypeList:
 		if t.Elem == nil {
@@ -92,6 +95,8 @@ func (t Type) Equal(other Type) bool {
 		return false
 	}
 	switch t.Kind {
+	case TypeNative, TypeModule:
+		return t.Name == other.Name
 	case TypeList:
 		if t.Elem == nil || other.Elem == nil {
 			return t.Elem == nil && other.Elem == nil
@@ -102,7 +107,7 @@ func (t Type) Equal(other Type) bool {
 	case TypeLiteral:
 		return t.Name == other.Name
 	case TypeFunc:
-		if t.Variadic != other.Variadic {
+		if t.Variadic != other.Variadic || t.Optional != other.Optional {
 			return false
 		}
 		if len(t.Params) != len(other.Params) || (t.Return == nil) != (other.Return == nil) {

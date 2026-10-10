@@ -95,7 +95,11 @@ func (c *checker) collect(stmts []Stmt) {
 			if alias == "" {
 				alias = importBindingName(s.Name)
 			}
-			c.globals[alias] = PyType()
+			if info, ok := nativeDriverInfo(s.Name); ok {
+				c.globals[alias] = Type{Kind: TypeModule, Name: s.Name, Members: info.Exports}
+			} else {
+				c.globals[alias] = PyType()
+			}
 		case *FuncDefStmt:
 			c.globals[s.Name] = c.functionType(s, nil)
 		case *ClassDefStmt:
@@ -121,6 +125,16 @@ func (c *checker) collect(stmts []Stmt) {
 }
 
 func (c *checker) collectImport(stmt *ImportFromStmt) {
+	if info, ok := nativeDriverInfo(stmt.Module); ok {
+		for _, name := range stmt.Names {
+			if typ, exists := info.Exports[name]; exists {
+				c.globals[name] = typ
+			} else {
+				c.fail(stmt.Line, fmt.Sprintf("module %q has no export %q", stmt.Module, name))
+			}
+		}
+		return
+	}
 	if stmt.Module == "typhon.parallel" {
 		for _, name := range stmt.Names {
 			if typ, ok := c.globals[name]; ok {
@@ -541,6 +555,13 @@ func (c *checker) inferExpr(expr Expr, scope *scope, classInfo *ClassInfo) Type 
 
 func (c *checker) inferAttr(expr *AttrExpr, scope *scope, classInfo *ClassInfo) Type {
 	objType := c.inferExpr(expr.Object, scope, classInfo)
+	if objType.Kind == TypeNative || objType.Kind == TypeModule {
+		if typ, ok := objType.Members[expr.Name]; ok {
+			return typ
+		}
+		c.fail(expr.Line, fmt.Sprintf("%s has no attribute %q", objType, expr.Name))
+		return AnyType()
+	}
 	if objType.Kind == TypeClass && objType.Class != nil {
 		if field, ok := objType.Class.Fields[expr.Name]; ok {
 			if name, ok := expr.Object.(*NameExpr); ok && name.Name == "self" {
@@ -638,6 +659,13 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 		}
 	} else {
 		params := calleeType.Params
+		if calleeType.Optional > 0 {
+			if len(expr.Args) < len(params)-calleeType.Optional || len(expr.Args) > len(params) {
+				c.fail(expr.Line, fmt.Sprintf("call expected %d to %d arguments, got %d", len(params)-calleeType.Optional, len(params), len(expr.Args)))
+				return AnyType()
+			}
+			params = params[:len(expr.Args)]
+		}
 		if calleeType.Name == "join" && len(expr.Args) == 2 {
 			params = []Type{TaskType(), FloatType()}
 		}
@@ -752,6 +780,13 @@ func (c *checker) resolveTypeRef(ref TypeRef) (Type, error) {
 		}
 		if typ, ok := c.globals[name]; ok {
 			return typ, nil
+		}
+		if module, member, ok := strings.Cut(name, "."); ok {
+			if typ, exists := c.globals[module]; exists && typ.Kind == TypeModule {
+				if exported, exists := typ.Members[member]; exists && exported.Kind == TypeNative {
+					return exported, nil
+				}
+			}
 		}
 		return Type{}, fmt.Errorf("unknown type %q", name)
 	}

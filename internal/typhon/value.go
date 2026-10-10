@@ -24,31 +24,41 @@ const (
 	ValueTask         ValueKind = "task"
 	ValueIterator     ValueKind = "iterator"
 	ValuePyObject     ValueKind = "pyobject"
+	ValueNativeObject ValueKind = "native_object"
 )
 
 type Value struct {
-	ListGuard *listGuard
-	Kind      ValueKind
-	Int       int64
-	Float     float64
-	Str       string
-	Bool      bool
-	List      *[]Value
-	Function  *Function
-	Native    *NativeFunc
-	Module    *NativeModule
-	Class     *RuntimeClass
-	Object    *Object
-	Bound     *BoundMethod
-	Task      *Task
-	Iterator  *Iterator
-	PyObject  *PyObject
+	NativeObject *NativeObject
+	ListGuard    *listGuard
+	Kind         ValueKind
+	Int          int64
+	Float        float64
+	Str          string
+	Bool         bool
+	List         *[]Value
+	Function     *Function
+	Native       *NativeFunc
+	Module       *NativeModule
+	Class        *RuntimeClass
+	Object       *Object
+	Bound        *BoundMethod
+	Task         *Task
+	Iterator     *Iterator
+	PyObject     *PyObject
 }
 
 type NativeFunc struct {
-	Name     string
-	Receiver *Value
-	Fn       func(*VM, []Value) (Value, error)
+	Signature Type
+	Name      string
+	Receiver  *Value
+	Fn        func(*VM, []Value) (Value, error)
+}
+
+type NativeObject struct {
+	data  any
+	Type  Type
+	Owner *Engine
+	Attrs map[string]Value
 }
 
 type NativeModule struct {
@@ -125,6 +135,8 @@ func (v Value) stringValue(depth int, seen map[*[]Value]bool) string {
 		return "<depth limit>"
 	}
 	switch v.Kind {
+	case ValueNativeObject:
+		return "<" + v.NativeObject.Type.Name + ">"
 	case ValueNone:
 		return "None"
 	case ValueInt:
@@ -246,6 +258,8 @@ func equalValues(left Value, right Value, seen map[[2]*[]Value]bool) bool {
 		return left.Bool == right.Bool
 	case ValueObject:
 		return left.Object == right.Object
+	case ValueNativeObject:
+		return left.NativeObject == right.NativeObject
 	case ValueClass:
 		return left.Class == right.Class
 	default:

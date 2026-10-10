@@ -11,6 +11,7 @@ import (
 )
 
 type Engine struct {
+	resources resourceScope
 	// VM execution is serialized. join yields this lock while its child runs.
 	execMu       sync.Mutex
 	moduleMu     sync.Mutex
@@ -42,7 +43,11 @@ type LoadedModule struct {
 }
 
 func NewEngine() *Engine {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewEngineWithContext(context.Background())
+}
+
+func NewEngineWithContext(parent context.Context) *Engine {
+	ctx, cancel := context.WithCancel(parent)
 	return &Engine{
 		ctx: ctx, cancel: cancel, loading: map[string]bool{},
 		modules: map[string]*LoadedModule{},
@@ -58,7 +63,11 @@ func RunFile(path string) error {
 }
 
 func RunFileWithOptions(path string, options RunOptions) error {
-	engine := NewEngine()
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	engine := NewEngineWithContext(ctx)
 	engine.warmPython = options.WarmPython
 	engine.sharedPython = options.SharedPython
 	defer engine.Close()
@@ -157,11 +166,15 @@ func (r lockedImportResolver) ResolveImport(module, fromDir string) (*ModuleInfo
 }
 
 type RunOptions struct {
+	Context      context.Context
 	WarmPython   bool
 	SharedPython bool
 }
 
 func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, error) {
+	if info, ok := nativeDriverInfo(module); ok {
+		return info, nil
+	}
 	if module == "typhon.parallel" {
 		return parallelModuleInfo(), nil
 	}
@@ -315,6 +328,7 @@ func (e *Engine) WarmPythonBridge() error {
 
 func (e *Engine) Close() error {
 	e.cancel()
+	resourceErr := e.resources.close()
 	e.bridgeMu.Lock()
 	done := e.bridgeDone
 	e.bridgeMu.Unlock()
@@ -325,9 +339,12 @@ func (e *Engine) Close() error {
 	bridge := e.bridge
 	e.bridgeMu.Unlock()
 	if bridge == nil {
-		return nil
+		return resourceErr
 	}
-	return bridge.Close()
+	if err := bridge.Close(); err != nil {
+		return err
+	}
+	return resourceErr
 }
 
 func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {

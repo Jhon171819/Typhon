@@ -55,6 +55,8 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 	}
 	ok := false
 	switch typ.Kind {
+	case TypeNative:
+		ok = value.Kind == ValueNativeObject && value.NativeObject != nil && value.NativeObject.Type.Equal(typ)
 	case TypeNone:
 		ok = value.Kind == ValueNone
 	case TypeInt:

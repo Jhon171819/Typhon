@@ -119,13 +119,16 @@ See `examples/user_service.ty` for a complete program and
 
 ## Requirements
 
-- Go 1.23 or newer for the native CLI and VM.
+- Go 1.26 or newer for the native CLI and VM.
 - Python 3.11 or newer only for Python-library bridging, the Python launcher,
   and the legacy transpiler.
 - Any third-party Python package used through the bridge must be installed in
   the selected Python interpreter.
 
 ## Build and run
+
+For packaged Windows/Linux executables, included examples, integrity checks,
+and source-build commands, see [distribution instructions](docs/distribution.md).
 
 Building once avoids the extra Go tool invocation incurred by `go run`:
 
@@ -198,11 +201,18 @@ the native execution path.
 
 ## Imports
 
-Typhon currently has three import paths:
+Typhon currently has four import paths:
 
 1. Local Typhon modules are loaded from `.ty` files by `from ... import ...`.
 2. `json` is intercepted by the Go VM and served by a small native shim.
-3. Other Python modules are loaded through the Python bridge.
+3. `typhon.http`, `typhon.postgres`, and `typhon.redis` are typed native Go modules.
+4. Other Python modules are loaded through the Python bridge.
+
+The native drivers provide an HTTP client/server, PostgreSQL parameterized
+queries and transactions, and Redis commands with TTL. They run without Python.
+See [native driver APIs and examples](docs/native_drivers.md) and
+`examples/http_server.ty`, `examples/http_client.ty`, `examples/postgres.ty`,
+and `examples/redis.ty`.
 
 Use the `py.` prefix to make Python intent explicit:
 

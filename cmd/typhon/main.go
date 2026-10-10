@@ -1,21 +1,30 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 
 	"typhon/internal/typhon"
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := runWithContext(ctx, os.Args[1:]); err != nil && !(ctx.Err() != nil && errors.Is(err, context.Canceled)) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string) error {
+	return runWithContext(context.Background(), args)
+}
+
+func runWithContext(ctx context.Context, args []string) error {
 	warmPython := cliEnvEnabled("TYPHON_WARM_PYTHON")
 	sharedPython := cliEnvEnabled("TYPHON_SHARED_PYTHON")
 	warmPythonFlag := false
@@ -47,7 +56,7 @@ func run(args []string) error {
 	}
 	if command != "run" && command != "check" && command != "bytecode" {
 		if len(args) == 1 {
-			return typhon.RunFileWithOptions(args[0], typhon.RunOptions{WarmPython: warmPython, SharedPython: sharedPython})
+			return typhon.RunFileWithOptions(args[0], typhon.RunOptions{Context: ctx, WarmPython: warmPython, SharedPython: sharedPython})
 		}
 		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|bytecode> <file.ty>")
 	}
@@ -62,7 +71,7 @@ func run(args []string) error {
 
 	switch command {
 	case "run":
-		return typhon.RunFileWithOptions(args[1], typhon.RunOptions{WarmPython: warmPython, SharedPython: sharedPython})
+		return typhon.RunFileWithOptions(args[1], typhon.RunOptions{Context: ctx, WarmPython: warmPython, SharedPython: sharedPython})
 	case "check":
 		return typhon.CheckFile(args[1])
 	case "bytecode":

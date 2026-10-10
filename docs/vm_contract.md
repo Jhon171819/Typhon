@@ -124,8 +124,10 @@ fora do contrato implementado.
    `finally`, `raise`, limpeza determinística e JSON completo.
 2. Funções e módulos: defaults/kwargs Typhon, closures, aliases de import,
    `import` local unificado, `Task[T]` e assinaturas completas.
-3. Integração recomendada A: API pública de embedding, host HTTP/SQL, contextos
-   por requisição e uma prova de cadastro/venda/rollback/idempotência do UMarket.
+3. Integração recomendada A: os drivers Go HTTP/PostgreSQL/Redis e contextos
+   por requisição já estão implementados ([contratos](native_drivers.md)).
+   Permanecem a API pública de embedding e uma prova de
+   cadastro/venda/rollback/idempotência do UMarket.
    A alternativa B ainda exige callbacks, introspecção e interoperabilidade
    com classes Python antes de prometer FastAPI/Pydantic.
 4. Operação: detector de race executado em ambiente com CGO, testes prolongados,
