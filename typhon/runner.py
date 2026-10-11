@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 
+from typhon.importer import install_typhon_importer
 from typhon.transpiler import transpile_source
 from typhon.validator import validate_source
 
@@ -18,6 +19,7 @@ def run_file(path: Path) -> None:
     script_path = path.resolve()
     script_dir = str(script_path.parent)
     code = transpile_file(script_path)
+    install_typhon_importer()
 
     if not sys.path or sys.path[0] != script_dir:
         sys.path.insert(0, script_dir)

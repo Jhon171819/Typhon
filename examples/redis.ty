@@ -1,0 +1,15 @@
+import typhon.redis as redis
+
+url: str = redis.env('REDIS_URL')
+if url == '':
+    print('Defina REDIS_URL para executar este exemplo')
+else:
+    cache: redis.Connection = redis.connect(url, 5)
+    cache.set('typhon:example:greeting', 'Ola do Typhon', 30)
+    greeting: str | None = cache.get('typhon:example:greeting')
+    if greeting is not None:
+        print(greeting)
+    print(cache.ping(), cache.ttl('typhon:example:greeting'))
+    print(cache.command(['MGET', 'typhon:example:greeting', 'typhon:example:missing']))
+    cache.delete('typhon:example:greeting')
+    cache.close()

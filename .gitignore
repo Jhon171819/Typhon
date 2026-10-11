@@ -3,3 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+typhon.exe
+.cache/
+dist/
+*.vsix
+editors/typhon/node_modules/
+editors/zed/grammar/node_modules/

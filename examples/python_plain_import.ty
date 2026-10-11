@@ -1,0 +1,9 @@
+import json as js
+
+
+def main() -> void:
+    encoded: str = js.dumps([1, 2])
+    print(encoded)
+
+
+main()

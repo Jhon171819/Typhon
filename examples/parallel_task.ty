@@ -1,0 +1,10 @@
+from typhon.parallel import TyphonTask, join, spawn
+
+
+def double(value: int) -> int:
+    return value * 2
+
+
+task: TyphonTask = spawn(double, 21)
+result: int = join(task)
+print(result)

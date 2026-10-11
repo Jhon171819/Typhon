@@ -1,0 +1,9 @@
+id = "typhon"
+name = "Typhon"
+version = "0.1.0"
+schema_version = 1
+authors = ["Typhon contributors"]
+description = "Typhon (.ty) language recognition and syntax highlighting."
+repository = "https://github.com/Jhon171819/Typhon"
+languages = ["languages/typhon"]
+# install.ps1 adds grammar metadata for the local source snapshot.

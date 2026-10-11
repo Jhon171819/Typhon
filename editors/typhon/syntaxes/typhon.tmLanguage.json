@@ -1,0 +1,122 @@
+{
+  "name": "Typhon",
+  "scopeName": "source.typhon",
+  "fileTypes": ["ty"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#numbers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.number-sign.typhon",
+      "begin": "#",
+      "end": "$"
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.typhon",
+          "begin": "\\b[fF](\")",
+          "end": "\"|$",
+          "patterns": [
+            { "include": "#escapes" },
+            { "match": "\\{\\{|\\}\\}", "name": "constant.character.escape.typhon" },
+            { "include": "#interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.typhon",
+          "begin": "\\b[fF](')",
+          "end": "'|$",
+          "patterns": [
+            { "include": "#escapes" },
+            { "match": "\\{\\{|\\}\\}", "name": "constant.character.escape.typhon" },
+            { "include": "#interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.typhon",
+          "begin": "\"",
+          "end": "\"|$",
+          "patterns": [{ "include": "#escapes" }]
+        },
+        {
+          "name": "string.quoted.single.typhon",
+          "begin": "'",
+          "end": "'|$",
+          "patterns": [{ "include": "#escapes" }]
+        }
+      ]
+    },
+    "escapes": {
+      "match": "\\\\.",
+      "name": "constant.character.escape.typhon"
+    },
+    "interpolation": {
+      "name": "meta.interpolation.typhon",
+      "contentName": "meta.embedded.expression.typhon",
+      "begin": "\\{",
+      "end": "\\}|(?=[\"']?$)",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.typhon" } },
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.typhon" } },
+      "patterns": [
+        { "include": "#strings" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#constants" },
+        { "include": "#numbers" },
+        { "include": "#operators" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(def)\\s+([A-Za-z_][A-Za-z_0-9]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.typhon" },
+            "2": { "name": "entity.name.function.typhon" }
+          }
+        },
+        {
+          "match": "\\b(class|type)\\s+([A-Za-z_][A-Za-z_0-9]*)",
+          "captures": {
+            "1": { "name": "storage.type.typhon" },
+            "2": { "name": "entity.name.type.typhon" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "match": "\\b(if|elif|else|while|for|in|break|continue|return)\\b", "name": "keyword.control.typhon" },
+        { "match": "\\b(from|import|as)\\b", "name": "keyword.control.import.typhon" },
+        { "match": "\\b(and|or|not|is)\\b", "name": "keyword.operator.word.typhon" },
+        { "match": "\\b(print|range|enumerate)\\b", "name": "support.function.builtin.typhon" }
+      ]
+    },
+    "types": {
+      "match": "\\b(int|float|str|bool|void|list|dict|PyObject|TyphonTask)\\b",
+      "name": "support.type.typhon"
+    },
+    "constants": {
+      "patterns": [
+        { "match": "\\b(True|False|None)\\b", "name": "constant.language.typhon" },
+        { "match": "\\bself\\b", "name": "variable.language.typhon" }
+      ]
+    },
+    "numbers": {
+      "match": "\\b[0-9]+(?:\\.[0-9]+)?\\b",
+      "name": "constant.numeric.typhon"
+    },
+    "operators": {
+      "match": "->|==|!=|<=|>=|//|[-+*/%=<>|]",
+      "name": "keyword.operator.typhon"
+    }
+  }
+}
