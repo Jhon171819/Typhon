@@ -72,15 +72,21 @@ type pyDaemonState struct {
 	Token    string `json:"token"`
 }
 
-const pyBridgeProtocolVersion = 2
+const pyBridgeProtocolVersion = 3
 const maxBridgeMessageBytes = 16 * 1024 * 1024
 
 type pyWireValue struct {
-	Kind  string        `json:"kind"`
-	Value any           `json:"value,omitempty"`
-	Items []pyWireValue `json:"items,omitempty"`
-	ID    int64         `json:"id,omitempty"`
-	Repr  string        `json:"repr,omitempty"`
+	Kind    string        `json:"kind"`
+	Value   any           `json:"value,omitempty"`
+	Items   []pyWireValue `json:"items,omitempty"`
+	Entries []pyWireEntry `json:"entries,omitempty"`
+	ID      int64         `json:"id,omitempty"`
+	Repr    string        `json:"repr,omitempty"`
+}
+
+type pyWireEntry struct {
+	Key   pyWireValue `json:"key"`
+	Value pyWireValue `json:"value"`
 }
 
 type PyObject struct {
@@ -465,6 +471,22 @@ func (b *PythonBridge) valueToWire(value Value, depth int) (pyWireValue, error) 
 			}
 		}
 		return pyWireValue{Kind: "list", Items: items}, nil
+	case ValueDict:
+		entries := []pyWireEntry{}
+		if value.Dict != nil {
+			for _, entry := range value.Dict.Entries {
+				key, err := b.valueToWire(entry.Key, depth+1)
+				if err != nil {
+					return pyWireValue{}, err
+				}
+				item, err := b.valueToWire(entry.Value, depth+1)
+				if err != nil {
+					return pyWireValue{}, err
+				}
+				entries = append(entries, pyWireEntry{Key: key, Value: item})
+			}
+		}
+		return pyWireValue{Kind: "dict", Entries: entries}, nil
 	case ValuePyObject:
 		if err := b.checkObject(value.PyObject); err != nil {
 			return pyWireValue{}, err
@@ -523,6 +545,22 @@ func pythonWireDepth(bridge *PythonBridge, value pyWireValue, depth int) (Value,
 			items = append(items, converted)
 		}
 		return ListValue(items), nil
+	case "dict":
+		result := DictValue()
+		for _, entry := range value.Entries {
+			key, err := pythonWireDepth(bridge, entry.Key, depth+1)
+			if err != nil {
+				return NoneValue(), err
+			}
+			item, err := pythonWireDepth(bridge, entry.Value, depth+1)
+			if err != nil {
+				return NoneValue(), err
+			}
+			if err := result.Dict.put(key, item); err != nil {
+				return NoneValue(), err
+			}
+		}
+		return result, nil
 	case "object":
 		if value.ID <= 0 {
 			return NoneValue(), fmt.Errorf("invalid Python handle")

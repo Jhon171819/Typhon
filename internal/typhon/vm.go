@@ -29,6 +29,8 @@ type frame struct {
 func runtimeGlobals() map[string]Value {
 	globals := map[string]Value{}
 	globals["print"] = nativeValue("print", nativePrint)
+	globals["len"] = nativeValue("len", nativeLen)
+	globals["dict"] = nativeValue("dict", nativeDict)
 	globals["spawn"] = nativeValue("spawn", nativeSpawn)
 	globals["join"] = nativeValue("join", nativeJoin)
 	globals["cancel"] = nativeValue("cancel", nativeCancel)
@@ -228,6 +230,61 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 				items[i] = f.pop()
 			}
 			f.push(ListValue(items))
+		case OpMakeDict:
+			if instr.A > maxCollectionItems {
+				return NoneValue(), fmt.Errorf("dictionary size limit exceeded")
+			}
+			entries := make([]DictEntry, instr.A)
+			for i := instr.A - 1; i >= 0; i-- {
+				entries[i].Value = f.pop()
+				entries[i].Key = f.pop()
+			}
+			dict := DictValue()
+			for _, entry := range entries {
+				if err := dict.Dict.put(entry.Key, entry.Value); err != nil {
+					return NoneValue(), err
+				}
+			}
+			f.push(dict)
+		case OpGetIndex:
+			key, obj := f.pop(), f.pop()
+			value, err := getIndex(obj, key)
+			if err != nil {
+				return NoneValue(), err
+			}
+			f.push(value)
+		case OpSetIndex:
+			key, obj, value := f.pop(), f.pop(), f.pop()
+			if err := setIndex(obj, key, value); err != nil {
+				return NoneValue(), err
+			}
+		case OpDelIndex:
+			key, obj := f.pop(), f.pop()
+			if obj.Kind != ValueDict || obj.Dict == nil {
+				return NoneValue(), fmt.Errorf("del requires a dictionary")
+			}
+			key, err := obj.Dict.checkKey(key)
+			if err != nil {
+				return NoneValue(), err
+			}
+			i, ok, err := obj.Dict.lookup(key)
+			if err != nil {
+				return NoneValue(), err
+			}
+			if !ok {
+				return NoneValue(), fmt.Errorf("KeyError: %s", key.String())
+			}
+			obj.Dict.remove(i)
+		case OpContains:
+			obj, key := f.pop(), f.pop()
+			ok, err := containsValue(obj, key)
+			if err != nil {
+				return NoneValue(), err
+			}
+			if instr.S == "not in" {
+				ok = !ok
+			}
+			f.push(BoolValue(ok))
 		case OpGetAttr:
 			value, err := vm.getAttr(f.pop(), instr.S)
 			if err != nil {
@@ -242,10 +299,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			}
 		case OpIter:
 			iterable := f.pop()
-			if iterable.Kind != ValueList || iterable.List == nil {
-				return NoneValue(), fmt.Errorf("for-loop expected list, got %s", iterable.Kind)
+			items, err := collectionValues(iterable)
+			if err != nil {
+				return NoneValue(), err
 			}
-			f.push(Value{Kind: ValueIterator, Iterator: &Iterator{values: *iterable.List}})
+			f.push(Value{Kind: ValueIterator, Iterator: &Iterator{values: items}})
 		case OpIterNext:
 			iter := f.peek()
 			if iter.Kind != ValueIterator || iter.Iterator == nil {
@@ -474,6 +532,10 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 		if name == "append" {
 			return boundNative(value, "list.append", nativeListAppend), nil
 		}
+	case ValueDict:
+		if method, ok := dictMethod(value, name); ok {
+			return method, nil
+		}
 	case ValueNativeModule:
 		if exported, ok := value.Module.Exports[name]; ok {
 			return exported, nil
@@ -604,11 +666,15 @@ func nativeCancel(vm *VM, args []Value) (Value, error) {
 }
 
 func nativeEnumerate(vm *VM, args []Value) (Value, error) {
-	if len(args) != 1 || args[0].Kind != ValueList || args[0].List == nil {
-		return NoneValue(), fmt.Errorf("enumerate expected a list")
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("enumerate expected 1 argument")
 	}
-	items := make([]Value, 0, len(*args[0].List))
-	for index, item := range *args[0].List {
+	values, err := collectionValues(args[0])
+	if err != nil {
+		return NoneValue(), err
+	}
+	items := make([]Value, 0, len(values))
+	for index, item := range values {
 		items = append(items, ListValue([]Value{IntValue(int64(index)), item}))
 	}
 	return ListValue(items), nil

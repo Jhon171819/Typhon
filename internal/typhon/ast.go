@@ -22,6 +22,7 @@ type Expr interface {
 type TypeRef struct {
 	Name    string
 	Elem    *TypeRef
+	Key     *TypeRef
 	Options []TypeRef
 	Literal string
 }
@@ -38,6 +39,9 @@ func (t TypeRef) String() string {
 		return out
 	}
 	if t.Elem != nil {
+		if t.Key != nil {
+			return fmt.Sprintf("%s[%s, %s]", t.Name, t.Key.String(), t.Elem.String())
+		}
 		return fmt.Sprintf("%s[%s]", t.Name, t.Elem.String())
 	}
 	if t.Literal != "" {
@@ -255,6 +259,31 @@ type ListExpr struct {
 
 func (*ListExpr) exprNode()     {}
 func (e *ListExpr) LineNo() int { return e.Line }
+
+type DictExpr struct {
+	Line    int
+	Entries []DictEntryExpr
+}
+type DictEntryExpr struct{ Key, Value Expr }
+
+func (*DictExpr) exprNode()     {}
+func (e *DictExpr) LineNo() int { return e.Line }
+
+type IndexExpr struct {
+	Line          int
+	Object, Index Expr
+}
+
+func (*IndexExpr) exprNode()     {}
+func (e *IndexExpr) LineNo() int { return e.Line }
+
+type DelStmt struct {
+	Line   int
+	Target *IndexExpr
+}
+
+func (*DelStmt) stmtNode()     {}
+func (s *DelStmt) LineNo() int { return s.Line }
 
 type CallExpr struct {
 	Line     int

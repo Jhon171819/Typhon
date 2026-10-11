@@ -44,6 +44,7 @@ async function main() {
   check('def double(value: int) -> int:', 'double', 'entity.name.function.typhon');
   check('for item: int in range(5):', 'for', 'keyword.control.typhon');
   check('for item: int in range(5):', 'int', 'support.type.typhon');
+  check("scores: dict[str, int] = {'Ada': 10}", 'dict', 'support.type.typhon');
   check('task: TyphonTask = spawn(double, 21)', 'TyphonTask', 'support.type.typhon');
   check('value: PyObject = req.get(url)', 'PyObject', 'support.type.typhon');
   check('text: str = "# if 123" # actual comment', '# if', 'string.quoted.double.typhon');

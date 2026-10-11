@@ -48,6 +48,8 @@ func CheckModule(module *Module, resolver ImportResolver) (*ModuleInfo, error) {
 func builtinTypes() map[string]Type {
 	return map[string]Type{
 		"print":       {Kind: TypeFunc, Name: "print", Variadic: true, Params: []Type{AnyType()}, Return: typePtr(NoneType())},
+		"len":         {Kind: TypeFunc, Name: "len", Params: []Type{AnyType()}, Return: typePtr(IntType())},
+		"dict":        {Kind: TypeFunc, Name: "dict", Params: []Type{AnyType()}, Optional: 1, Return: typePtr(dictType(AnyType(), AnyType()))},
 		"spawn":       {Kind: TypeFunc, Name: "spawn", Variadic: true, Params: []Type{AnyType()}, Return: typePtr(TaskType())},
 		"join":        {Kind: TypeFunc, Name: "join", Params: []Type{TaskType()}, Return: typePtr(AnyType())},
 		"cancel":      {Kind: TypeFunc, Name: "cancel", Params: []Type{TaskType()}, Return: typePtr(NoneType())},
@@ -70,7 +72,7 @@ func builtinTypes() map[string]Type {
 
 func isBuiltinName(name string) bool {
 	switch name {
-	case "print", "spawn", "join", "cancel", "enumerate", "range", "TyphonTask", "PyObject", "int", "float", "str", "bool", "None", "void", "list", "__name__", "__file__", "__package__":
+	case "print", "len", "dict", "spawn", "join", "cancel", "enumerate", "range", "TyphonTask", "PyObject", "int", "float", "str", "bool", "None", "void", "list", "__name__", "__file__", "__package__":
 		return true
 	default:
 		return false
@@ -220,6 +222,12 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 		c.checkAnnAssign(s, scope, classInfo)
 	case *AssignStmt:
 		c.checkAssign(s, scope, classInfo)
+	case *DelStmt:
+		obj := c.inferExpr(s.Target.Object, scope, classInfo)
+		c.inferIndex(s.Target, scope, classInfo)
+		if obj.Kind != TypeDict && obj.Kind != TypeAny && obj.Kind != TypePy {
+			c.fail(s.Line, "del requires a dictionary")
+		}
 	case *ReturnStmt:
 		c.checkInitializedFields(s.Line, scope)
 		var actual Type
@@ -282,6 +290,9 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 			}
 			if len(targets) == 1 && iterType.Kind == TypeList && iterType.Elem != nil && !assignable(*iterType.Elem, itemType) {
 				c.fail(s.Line, fmt.Sprintf("for variable expected %s, got %s", itemType.String(), iterType.Elem.String()))
+			}
+			if len(targets) == 1 && iterType.Kind == TypeDict && iterType.Key != nil && !assignable(*iterType.Key, itemType) {
+				c.fail(s.Line, fmt.Sprintf("for variable expected %s, got %s", itemType, iterType.Key))
 			}
 			child.set(target.Name, itemType)
 			s.CheckedTypes = append(s.CheckedTypes, itemType)
@@ -402,7 +413,18 @@ func (c *checker) checkAnnAssign(stmt *AnnAssignStmt, scope *scope, classInfo *C
 }
 
 func (c *checker) checkAssign(stmt *AssignStmt, scope *scope, classInfo *ClassInfo) {
-	actual := c.inferExpr(stmt.Value, scope, classInfo)
+	if target, ok := stmt.Target.(*IndexExpr); ok {
+		expected := c.inferIndex(target, scope, classInfo)
+		obj := c.inferExpr(target.Object, scope, classInfo)
+		if obj.Kind != TypeDict && obj.Kind != TypeList && obj.Kind != TypeAny && obj.Kind != TypePy {
+			c.fail(stmt.Line, "index assignment requires a dictionary or list")
+		}
+		actual := c.inferExpected(stmt.Value, expected, scope, classInfo)
+		if !assignable(actual, expected) {
+			c.fail(stmt.Line, fmt.Sprintf("assignment expected %s, got %s", expected, actual))
+		}
+		return
+	}
 	switch target := stmt.Target.(type) {
 	case *NameExpr:
 		expected, ok := scope.lookup(target.Name)
@@ -410,6 +432,7 @@ func (c *checker) checkAssign(stmt *AssignStmt, scope *scope, classInfo *ClassIn
 			c.fail(stmt.Line, "variable declarations must use an explicit type")
 			return
 		}
+		actual := c.inferExpected(stmt.Value, expected, scope, classInfo)
 		if !assignable(actual, expected) {
 			c.fail(stmt.Line, fmt.Sprintf("assignment expected %s, got %s", expected.String(), actual.String()))
 		}
@@ -424,6 +447,7 @@ func (c *checker) checkAssign(stmt *AssignStmt, scope *scope, classInfo *ClassIn
 				return
 			}
 			c.module.Contracts[target] = expected
+			actual := c.inferExpected(stmt.Value, expected, scope, classInfo)
 			if name, ok := target.Object.(*NameExpr); ok && name.Name == "self" {
 				scope.initialized["self."+target.Name] = true
 			}
@@ -507,6 +531,23 @@ func (c *checker) inferExpr(expr Expr, scope *scope, classInfo *ClassInfo) Type 
 			elem = unionType(elem, itemType)
 		}
 		return Type{Kind: TypeList, Name: "list", Elem: typePtr(elem)}
+	case *DictExpr:
+		key, value := Type{Kind: TypeNever}, Type{Kind: TypeNever}
+		for i, entry := range e.Entries {
+			k := widenLiteral(c.inferExpr(entry.Key, scope, classInfo))
+			v := widenLiteral(c.inferExpr(entry.Value, scope, classInfo))
+			if !hashableType(k) {
+				c.fail(e.Line, fmt.Sprintf("unhashable dictionary key: %s", k))
+			}
+			if i == 0 {
+				key, value = k, v
+			} else {
+				key, value = unionType(key, k), unionType(value, v)
+			}
+		}
+		return dictType(key, value)
+	case *IndexExpr:
+		return c.inferIndex(e, scope, classInfo)
 	case *BinaryExpr:
 		left := c.inferExpr(e.Left, scope, classInfo)
 		rightScope := scope
@@ -516,6 +557,15 @@ func (c *checker) inferExpr(expr Expr, scope *scope, classInfo *ClassInfo) Type 
 		}
 		right := c.inferExpr(e.Right, rightScope, classInfo)
 		switch e.Op {
+		case "in", "not in":
+			if right.Kind == TypeDict && right.Key != nil {
+				if right.Key.Kind != TypeNever && !assignable(left, *right.Key) {
+					c.fail(e.Line, fmt.Sprintf("dictionary key expected %s, got %s", right.Key, left))
+				}
+			} else if right.Kind != TypeList && right.Kind != TypeStr && right.Kind != TypeLiteral && right.Kind != TypeAny && right.Kind != TypePy {
+				c.fail(e.Line, "membership requires a dictionary, list or string")
+			}
+			return BoolType()
 		case "and", "or":
 			return unionType(left, right)
 		case "<", "<=", ">", ">=":
@@ -595,6 +645,38 @@ func (c *checker) inferAttr(expr *AttrExpr, scope *scope, classInfo *ClassInfo) 
 			return Type{Kind: TypeFunc, Name: "append", Params: []Type{param}, Return: typePtr(NoneType())}
 		}
 	}
+	if objType.Kind == TypeDict && objType.Key != nil && objType.Elem != nil {
+		key, elem := *objType.Key, *objType.Elem
+		if key.Kind == TypeNever {
+			key = AnyType()
+		}
+		fn := Type{Kind: TypeFunc, Name: expr.Name}
+		switch expr.Name {
+		case "keys":
+			fn.Return = typePtr(listType(key))
+		case "values":
+			fn.Return = typePtr(listType(elem))
+		case "items":
+			fn.Return = typePtr(listType(listType(AnyType())))
+		case "copy":
+			fn.Return = typePtr(objType)
+		case "clear":
+			fn.Return = typePtr(NoneType())
+		case "update":
+			fn.Params, fn.Return = []Type{objType}, typePtr(NoneType())
+		case "get", "pop":
+			fn.Params, fn.Optional, fn.Return = []Type{key, AnyType()}, 1, typePtr(unionType(elem, NoneType()))
+		case "setdefault":
+			fn.Params, fn.Return = []Type{key, elem}, typePtr(elem)
+			if assignable(NoneType(), elem) {
+				fn.Optional = 1
+			}
+		default:
+			c.fail(expr.Line, fmt.Sprintf("%s has no attribute %q", objType, expr.Name))
+			return AnyType()
+		}
+		return fn
+	}
 	if objType.Kind == TypePy {
 		return PyType()
 	}
@@ -620,6 +702,23 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 		}
 	}
 	if name, ok := expr.Callee.(*NameExpr); ok {
+		if name.Name == "dict" {
+			if len(expr.Args) == 0 {
+				return dictType(Type{Kind: TypeNever}, Type{Kind: TypeNever})
+			}
+			if len(expr.Args) == 1 {
+				typ := c.inferExpr(expr.Args[0], scope, classInfo)
+				if typ.Kind == TypeDict {
+					return typ
+				}
+				if typ.Kind != TypeAny && typ.Kind != TypePy {
+					c.fail(expr.Line, "dict() requires a dictionary")
+				}
+				return AnyType()
+			}
+			c.fail(expr.Line, "dict() expected 0 or 1 arguments")
+			return AnyType()
+		}
 		if class, ok := c.classes[name.Name]; ok {
 			if initType, ok := class.Methods["__init__"]; ok {
 				c.checkCallArgs(expr.Line, initType.Params[1:], expr.Args, scope, classInfo)
@@ -673,6 +772,17 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 	}
 	if calleeType.Return == nil {
 		return NoneType()
+	}
+	if attr, ok := expr.Callee.(*AttrExpr); ok && (attr.Name == "get" || attr.Name == "pop") {
+		obj := c.inferExpr(attr.Object, scope, classInfo)
+		if obj.Kind == TypeDict && obj.Elem != nil {
+			if len(expr.Args) == 2 {
+				return unionType(*obj.Elem, widenLiteral(c.inferExpr(expr.Args[1], scope, classInfo)))
+			}
+			if attr.Name == "pop" {
+				return *obj.Elem
+			}
+		}
 	}
 	return *calleeType.Return
 }
@@ -749,6 +859,22 @@ func (c *checker) resolveTypeRef(ref TypeRef) (Type, error) {
 		return alias, nil
 	}
 	switch name {
+	case "dict":
+		if ref.Key == nil || ref.Elem == nil {
+			return Type{}, fmt.Errorf("collection 'dict' must include key and value types")
+		}
+		key, err := c.resolveTypeRef(*ref.Key)
+		if err != nil {
+			return Type{}, err
+		}
+		if !hashableType(key) {
+			return Type{}, fmt.Errorf("unhashable dictionary key type: %s", key)
+		}
+		elem, err := c.resolveTypeRef(*ref.Elem)
+		if err != nil {
+			return Type{}, err
+		}
+		return dictType(key, elem), nil
 	case "", "Any":
 		return AnyType(), nil
 	case "int":
@@ -860,6 +986,36 @@ func (c *checker) declareLocals(stmts []Stmt, scope *scope) {
 }
 
 func (c *checker) inferExpected(expr Expr, expected Type, scope *scope, classInfo *ClassInfo) Type {
+	// Fresh collection literals may use any compatible collection arm of a union.
+	if expected.Kind == TypeUnion {
+		switch expr.(type) {
+		case *DictExpr, *ListExpr:
+			for _, option := range expected.Options {
+				trial := *c
+				trial.errors = nil
+				actual := trial.inferExpected(expr, option, scope, classInfo)
+				if len(trial.errors) == 0 && assignable(actual, option) {
+					return actual
+				}
+			}
+		}
+	}
+	if dict, ok := expr.(*DictExpr); ok && expected.Kind == TypeDict && expected.Key != nil && expected.Elem != nil {
+		for _, entry := range dict.Entries {
+			key := c.inferExpected(entry.Key, *expected.Key, scope, classInfo)
+			if !hashableType(key) {
+				c.fail(entry.Key.LineNo(), fmt.Sprintf("unhashable dictionary key: %s", key))
+			}
+			if !assignable(key, *expected.Key) {
+				c.fail(entry.Key.LineNo(), fmt.Sprintf("dictionary key expected %s, got %s", expected.Key, key))
+			}
+			value := c.inferExpected(entry.Value, *expected.Elem, scope, classInfo)
+			if !assignable(value, *expected.Elem) {
+				c.fail(entry.Value.LineNo(), fmt.Sprintf("dictionary value expected %s, got %s", expected.Elem, value))
+			}
+		}
+		return expected
+	}
 	if list, ok := expr.(*ListExpr); ok && expected.Kind == TypeList && expected.Elem != nil {
 		for _, item := range list.Elements {
 			actual := c.inferExpected(item, *expected.Elem, scope, classInfo)

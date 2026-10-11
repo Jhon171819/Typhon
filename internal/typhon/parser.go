@@ -211,6 +211,16 @@ func (p *parser) parseStmt(indent int) (Stmt, error) {
 		return &BreakStmt{Line: line.line}, nil
 	case text == "continue":
 		return &ContinueStmt{Line: line.line}, nil
+	case strings.HasPrefix(text, "del "):
+		expr, err := parseExpr(strings.TrimSpace(strings.TrimPrefix(text, "del ")), line.line)
+		if err != nil {
+			return nil, syntaxError(p.path, line.line, err.Error())
+		}
+		target, ok := expr.(*IndexExpr)
+		if !ok {
+			return nil, syntaxError(p.path, line.line, "del requires a dictionary index")
+		}
+		return &DelStmt{Line: line.line, Target: target}, nil
 	case text == "else:" || strings.HasPrefix(text, "elif "):
 		return nil, syntaxError(p.path, line.line, "else/elif requires a preceding if at the same indentation")
 	case strings.HasPrefix(text, "for ") && strings.HasSuffix(text, ":"):
@@ -529,11 +539,28 @@ func parseTypeRef(text string) (TypeRef, error) {
 		return TypeRef{Name: "Literal", Literal: value}, nil
 	}
 	if open := strings.Index(text, "["); open > 0 && strings.HasSuffix(text, "]") {
-		elem, err := parseTypeRef(text[open+1 : len(text)-1])
+		name := strings.TrimSpace(text[:open])
+		args := splitTopLevel(text[open+1:len(text)-1], ',')
+		count := 1
+		if name == "dict" {
+			count = 2
+		}
+		if len(args) != count {
+			return TypeRef{}, fmt.Errorf("%s requires %d type arguments", name, count)
+		}
+		elem, err := parseTypeRef(args[len(args)-1])
 		if err != nil {
 			return TypeRef{}, err
 		}
-		return TypeRef{Name: strings.TrimSpace(text[:open]), Elem: &elem}, nil
+		ref := TypeRef{Name: name, Elem: &elem}
+		if name == "dict" {
+			key, err := parseTypeRef(args[0])
+			if err != nil {
+				return TypeRef{}, err
+			}
+			ref.Key = &key
+		}
+		return ref, nil
 	}
 	if text == "void" {
 		text = "None"
@@ -814,7 +841,7 @@ func lexExpr(text string, line int) ([]exprToken, error) {
 			}
 		}
 		switch ch {
-		case '(', ')', '[', ']', ',', '.', '+', '-', '*', '=', ':', '<', '>', '/', '%':
+		case '(', ')', '[', ']', '{', '}', ',', '.', '+', '-', '*', '=', ':', '<', '>', '/', '%':
 			tokens = append(tokens, exprToken{kind: string(ch), text: string(ch), line: line})
 			i++
 		default:
@@ -895,7 +922,7 @@ func (p *exprParser) parseExpression(minPrec int) (Expr, error) {
 			compared = true
 		}
 		line := p.peek().line
-		if op == "is not" {
+		if op == "is not" || op == "not in" {
 			p.advance()
 			p.advance()
 		} else {
@@ -914,6 +941,12 @@ func (p *exprParser) currentBinary() (string, int) {
 	tok := p.peek()
 	switch tok.kind {
 	case "ident":
+		if tok.text == "in" {
+			return "in", 3
+		}
+		if tok.text == "not" && p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].text == "in" {
+			return "not in", 3
+		}
 		if tok.text == "or" {
 			return "or", 1
 		}
@@ -966,6 +999,15 @@ func (p *exprParser) parsePostfix() (Expr, error) {
 	}
 	for {
 		switch {
+		case p.match("["):
+			index, err := p.parseExpression(0)
+			if err != nil {
+				return nil, err
+			}
+			if !p.match("]") {
+				return nil, fmt.Errorf("expected ']'")
+			}
+			expr = &IndexExpr{Line: expr.LineNo(), Object: expr, Index: index}
 		case p.match("."):
 			name := p.advance()
 			if name.kind != "ident" {
@@ -1101,6 +1143,35 @@ func (p *exprParser) parsePrimary() (Expr, error) {
 			return nil, err
 		}
 		return &ListExpr{Line: tok.line, Elements: elements}, nil
+	case "{":
+		entries := []DictEntryExpr{}
+		if p.match("}") {
+			return &DictExpr{Line: tok.line, Entries: entries}, nil
+		}
+		for {
+			key, err := p.parseExpression(0)
+			if err != nil {
+				return nil, err
+			}
+			if !p.match(":") {
+				return nil, fmt.Errorf("dictionary entry requires ':'")
+			}
+			value, err := p.parseExpression(0)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, DictEntryExpr{Key: key, Value: value})
+			if p.match("}") {
+				break
+			}
+			if !p.match(",") {
+				return nil, fmt.Errorf("expected ',' or '}'")
+			}
+			if p.match("}") {
+				break
+			}
+		}
+		return &DictExpr{Line: tok.line, Entries: entries}, nil
 	default:
 		return nil, fmt.Errorf("unexpected token %q", tok.text)
 	}

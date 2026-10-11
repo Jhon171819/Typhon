@@ -15,6 +15,7 @@ const (
 	ValueString       ValueKind = "str"
 	ValueBool         ValueKind = "bool"
 	ValueList         ValueKind = "list"
+	ValueDict         ValueKind = "dict"
 	ValueFunction     ValueKind = "function"
 	ValueNative       ValueKind = "native"
 	ValueNativeModule ValueKind = "native_module"
@@ -36,6 +37,7 @@ type Value struct {
 	Str          string
 	Bool         bool
 	List         *[]Value
+	Dict         *Dictionary
 	Function     *Function
 	Native       *NativeFunc
 	Module       *NativeModule
@@ -127,10 +129,10 @@ func ListValue(values []Value) Value {
 }
 
 func (v Value) String() string {
-	return v.stringValue(0, map[*[]Value]bool{})
+	return v.stringValue(0, map[any]bool{})
 }
 
-func (v Value) stringValue(depth int, seen map[*[]Value]bool) string {
+func (v Value) stringValue(depth int, seen map[any]bool) string {
 	if depth > 64 {
 		return "<depth limit>"
 	}
@@ -164,6 +166,27 @@ func (v Value) stringValue(depth int, seen map[*[]Value]bool) string {
 			parts = append(parts, item.stringValue(depth+1, seen))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
+	case ValueDict:
+		if v.Dict == nil {
+			return "{}"
+		}
+		if seen[v.Dict] {
+			return "{...}"
+		}
+		seen[v.Dict] = true
+		defer delete(seen, v.Dict)
+		parts := make([]string, len(v.Dict.Entries))
+		for i, entry := range v.Dict.Entries {
+			key, value := entry.Key.stringValue(depth+1, seen), entry.Value.stringValue(depth+1, seen)
+			if entry.Key.Kind == ValueString {
+				key = fmt.Sprintf("%q", entry.Key.Str)
+			}
+			if entry.Value.Kind == ValueString {
+				value = fmt.Sprintf("%q", entry.Value.Str)
+			}
+			parts[i] = key + ": " + value
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
 	case ValueFunction:
 		return "<function " + v.Function.Name + ">"
 	case ValueNative:
@@ -207,16 +230,18 @@ func truthy(value Value) bool {
 		return value.Str != ""
 	case ValueList:
 		return value.List != nil && len(*value.List) > 0
+	case ValueDict:
+		return value.Dict != nil && len(value.Dict.Entries) > 0
 	default:
 		return true
 	}
 }
 
 func valuesEqual(left Value, right Value) bool {
-	return equalValues(left, right, map[[2]*[]Value]bool{})
+	return equalValues(left, right, map[[2]any]bool{})
 }
 
-func equalValues(left Value, right Value, seen map[[2]*[]Value]bool) bool {
+func equalValues(left Value, right Value, seen map[[2]any]bool) bool {
 	if left.Kind == ValueInt && right.Kind == ValueFloat || left.Kind == ValueFloat && right.Kind == ValueInt {
 		cmp, err := compareValues(left, right)
 		return err == nil && cmp == 0
@@ -225,6 +250,25 @@ func equalValues(left Value, right Value, seen map[[2]*[]Value]bool) bool {
 		return false
 	}
 	switch left.Kind {
+	case ValueDict:
+		if left.Dict == right.Dict {
+			return true
+		}
+		if left.Dict == nil || right.Dict == nil || len(left.Dict.Entries) != len(right.Dict.Entries) {
+			return false
+		}
+		pair := [2]any{left.Dict, right.Dict}
+		if seen[pair] {
+			return true
+		}
+		seen[pair] = true
+		for _, entry := range left.Dict.Entries {
+			i, ok, err := right.Dict.lookup(entry.Key)
+			if err != nil || !ok || !equalValues(entry.Value, right.Dict.Entries[i].Value, seen) {
+				return false
+			}
+		}
+		return true
 	case ValueList:
 		if left.List == right.List {
 			return true
@@ -232,7 +276,7 @@ func equalValues(left Value, right Value, seen map[[2]*[]Value]bool) bool {
 		if left.List == nil || right.List == nil {
 			return false
 		}
-		pair := [2]*[]Value{left.List, right.List}
+		pair := [2]any{left.List, right.List}
 		if seen[pair] {
 			return true
 		}
@@ -272,6 +316,8 @@ func valuesIdentical(left, right Value) bool {
 		return false
 	}
 	switch left.Kind {
+	case ValueDict:
+		return left.Dict == right.Dict
 	case ValueList:
 		return left.List == right.List
 	case ValueTask:

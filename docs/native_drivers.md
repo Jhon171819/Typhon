@@ -29,7 +29,7 @@ Implementado com [`net/http`](https://pkg.go.dev/net/http).
 | `client.request(method, url, body, headers=[])` | `http.Response`; corpo `str`, headers `list[list[str]]` |
 | `client.close()` | `None`; fecha conexões ociosas e impede novas chamadas |
 | `http.response(status, body, headers=[])` | `http.Response`; status de 200 a 599 |
-| `http.json(status, value)` | `http.Response`; JSON de escalares e listas com Content-Type apropriado |
+| `http.json(status, value)` | `http.Response`; JSON de escalares, listas e dicionários com Content-Type apropriado |
 | `http.serve(address, handler)` | `None`; bloqueia até cancelamento/encerramento |
 
 O `=` nas tabelas indica o valor padrão; na chamada Typhon, passe valores
@@ -105,8 +105,9 @@ O transporte de inteiros preserva int64; resultados `numeric` tornam-se strings
 para preservar a precisão decimal. Texto, booleanos, inteiros e floats finitos
 tornam-se seus tipos Typhon; datas/timestamps tornam-se strings RFC3339Nano,
 UUID torna-se string e arrays tornam-se listas. `bytea` torna-se `str` com os bytes
-originais. Para JSON composto e outros tipos sem representação, use cast SQL
-para `text`. Arrays como parâmetros ainda não são suportados.
+originais. Objetos JSON retornados pelo PostgreSQL tornam-se dicionários,
+com chaves ordenadas; arrays JSON tornam-se listas. Para outros tipos sem
+representação, use cast SQL para `text`. Arrays como parâmetros ainda não são suportados.
 
 `commit` confirma apenas quando chamado explicitamente. Transações abandonadas
 fazem rollback ao encerrar a Engine; as abertas dentro de handlers HTTP fazem

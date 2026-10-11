@@ -44,10 +44,25 @@ const (
 	OpDiv
 	OpFloorDiv
 	OpMod
+	OpMakeDict
+	OpGetIndex
+	OpSetIndex
+	OpDelIndex
+	OpContains
 )
 
 func (op Op) String() string {
 	switch op {
+	case OpMakeDict:
+		return "MAKE_DICT"
+	case OpGetIndex:
+		return "GET_INDEX"
+	case OpSetIndex:
+		return "SET_INDEX"
+	case OpDelIndex:
+		return "DEL_INDEX"
+	case OpContains:
+		return "CONTAINS"
 	case OpDup:
 		return "DUP"
 	case OpJumpIfTrue:
@@ -187,8 +202,10 @@ func writeFunction(out *strings.Builder, fn *Function) {
 			fmt.Fprintf(out, " %s", instr.Val.String())
 		case OpLoadGlobal, OpStoreGlobal, OpGetAttr, OpSetAttr, OpDefineFunc:
 			fmt.Fprintf(out, " %s", instr.S)
-		case OpLoadLocal, OpStoreLocal, OpJump, OpJumpIfFalse, OpCall, OpMakeList, OpIterNext:
+		case OpLoadLocal, OpStoreLocal, OpJump, OpJumpIfFalse, OpCall, OpMakeList, OpMakeDict, OpIterNext:
 			fmt.Fprintf(out, " %d", instr.A)
+		case OpContains:
+			fmt.Fprintf(out, " %s", instr.S)
 		case OpUnpackStore:
 			fmt.Fprintf(out, " %v", instr.Names)
 		case OpDefineClass:

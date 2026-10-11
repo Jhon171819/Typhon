@@ -11,7 +11,7 @@
 ["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 
 ((identifier) @type.builtin
-  (#match? @type.builtin "^(int|float|str|bool|void|list|PyObject|TyphonTask)$"))
+  (#match? @type.builtin "^(int|float|str|bool|void|list|dict|PyObject|TyphonTask)$"))
 ((identifier) @function.builtin
   (#match? @function.builtin "^(print|range|enumerate)$"))
 ((identifier) @variable.special

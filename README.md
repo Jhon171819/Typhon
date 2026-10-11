@@ -37,7 +37,7 @@ The Go runtime currently supports:
 
 - Mandatory annotations on function parameters, return values, first variable
   declarations, class fields, and `for` targets.
-- `int`, `float`, `str`, `bool`, `None`/`void`, `list[T]`, user classes,
+- `int`, `float`, `str`, `bool`, `None`/`void`, `list[T]`, `dict[K, V]`, user classes,
   unions such as `User | None`, type aliases, `PyObject`, and `TyphonTask`.
 - Functions, classes, annotated declarations, reassignment, `return`,
   `if`/`elif`/`else`, `while`, typed `for`, `break`, `continue`, imports,
@@ -45,13 +45,15 @@ The Go runtime currently supports:
 - Checked int64 and finite floating-point arithmetic: `+`, `-`, `*`, `/`,
   `//`, `%`, unary signs, numeric/string comparisons, equality, identity,
   and short-circuit `and`, `or`, `not`.
-- `print`, `range`, `enumerate`, `list.append`, and the string methods
+- Dictionary literals, indexing, key assignment/deletion, membership with
+  `in`/`not in`, and iteration over keys in insertion order.
+- `print`, `len`, `dict`, `range`, `enumerate`, `list.append`, and the string methods
   `strip`, `title`, and `upper`.
 - Local `.ty` modules through `from module import name`.
 
 Syntax outside that subset may be valid Python but is not necessarily valid
 Typhon. In particular, the native AST currently has no general implementation
-for exceptions, comprehensions, dictionaries, sets, indexing, closures,
+for exceptions, comprehensions, sets, slices, closures,
 decorators, or arbitrary Python operators.
 
 The audit changes, precise contracts, limits, and remaining roadmap are recorded
@@ -116,6 +118,40 @@ integer transport itself never uses float64.
 
 See `examples/user_service.ty` for a complete program and
 `examples/invalid_missing_types.ty` for rejected declarations.
+
+### Dictionaries
+
+```typhon
+scores: dict[str, int] = {'Ada': 10, 'Grace': 20}
+scores['Ada'] = scores['Ada'] + 5
+print(scores['Ada'], scores.get('missing', 0), len(scores))
+
+for name: str, score: int in scores.items():
+    print(name, score)
+
+del scores['Grace']
+```
+
+`dict[K, V]` requires both type arguments and is invariant, like mutable lists.
+Keys support `str`, `int`, finite `float`, `bool`, `None`, and unions or literal
+aliases of those types. Collections and objects cannot be keys. Equal numeric
+keys (`1`, `1.0`, `True`) share an entry; assigning an existing key replaces its
+value without changing its position. Missing indexed keys raise `KeyError`.
+Runtime contracts protect writes through dynamic aliases, including nested values.
+
+Supported methods are `get`, `keys`, `values`, `items`, `pop`, `update`,
+`setdefault`, `clear`, and `copy`. `get(key)` returns `V | None`; a supplied default
+contributes its type to the result. `pop(key)` removes and returns a value, raising
+`KeyError` if absent unless a default is supplied. `setdefault` inserts a missing
+key, checking the default against `V`. `update` checks all entries before changing
+the destination. `dict()` creates an empty dictionary; `dict(existing)` and
+`copy()` make shallow copies.
+
+`keys()`, `values()`, and `items()` return list snapshots, with each item pair
+represented as a two-element list. Direct key iteration also uses a snapshot.
+Lists and strings support integer indexing, including negative indices; list
+element assignments retain their runtime type contract.
+See `examples/dictionaries.ty` for a runnable example.
 
 ## Requirements
 
@@ -241,7 +277,7 @@ must be importable by the selected interpreter through its normal import path.
 
 Both `json` and `py.json` currently resolve to a Go implementation rather than
 starting CPython. The shim implements `json.dumps` with one positional argument
-and supports `None`, booleans, integers, finite floats, strings, and nested lists,
+and supports `None`, booleans, integers, finite floats, strings, nested lists and dictionaries,
 with a depth limit of 64. Cycles and non-finite numbers raise errors.
 It is not a complete replacement for Python's `json`
 module.
@@ -271,21 +307,26 @@ first bridged Python import and closes with that Typhon process.
 | `None`, `bool`, `int`, `float`, `str` | Converted directly in both directions |
 | Typhon `list` | Converted recursively to a Python `list` |
 | Python `list` or tuple | Converted recursively to a Typhon `list` |
+| Typhon `dict` | Converted recursively to a Python `dict` |
+| Python `dict` with scalar keys | Converted recursively to a Typhon `dict` |
 | Typhon `PyObject` | Resolved to the existing object in the same bridge session |
 | Other Python object | Kept in CPython and returned as a `PyObject` handle |
 
-Python tuples are returned as Typhon lists. Modules, dictionaries, sets, class
+Python tuples are returned as Typhon lists. Modules, sets, class
 instances, functions, and other non-primitive Python values remain in CPython;
 Typhon stores a session-local object ID and Python `repr`. Attribute access and
 calls on that handle are sent back to the worker. Typhon values outside the
-explicit primitive/list/`PyObject` conversions fail with a conversion error;
+explicit primitive/list/dictionary/`PyObject` conversions fail with a conversion error;
 functions are not silently converted into strings.
 
 Python imports and their attributes have the static type `PyObject`. The current
 checker therefore does not validate Python function signatures or result types;
 those errors are detected only when Python executes the operation.
 
-Protocol 2 preserves the full signed int64 range. Out-of-range Python integers
+Python dictionaries with non-scalar keys remain `PyObject` handles. Converted
+dictionaries cross the bridge by value, retaining key types and insertion order.
+
+Protocol 3 preserves the full signed int64 range. Out-of-range Python integers
 and non-finite floats are rejected. Library stdout, including writes to file
 descriptor 1, is redirected to stderr in the private worker, separate from RPC.
 Requests and responses are limited to 16 MiB; conversion depth is limited to 64.

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 MAX_HANDLES = 10000
 
@@ -43,6 +43,13 @@ class Session:
             return {"kind": "str", "value": value}
         if isinstance(value, (list, tuple)):
             return {"kind": "list", "items": [self.store(item, depth + 1) for item in value]}
+        if isinstance(value, dict) and all(
+            key is None or isinstance(key, (str, bool, int, float)) for key in value
+        ):
+            return {"kind": "dict", "entries": [
+                {"key": self.store(key, depth + 1), "value": self.store(item, depth + 1)}
+                for key, item in value.items()
+            ]}
 
         if len(self.objects) >= MAX_HANDLES:
             raise RuntimeError("Python handle limit exceeded; release unused handles")
@@ -61,6 +68,9 @@ class Session:
             return float(value.get("value"))
         if kind == "list":
             return [self.load(item) for item in value.get("items", [])]
+        if kind == "dict":
+            return {self.load(entry["key"]): self.load(entry["value"])
+                    for entry in value.get("entries", [])}
         if kind == "object":
             return self.objects[value["id"]]
         raise ValueError(f"unsupported Typhon value for Python bridge: {kind}")

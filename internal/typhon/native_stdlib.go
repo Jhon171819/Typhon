@@ -106,6 +106,34 @@ func renderJSONDepth(value Value, depth int) (string, error) {
 			parts = append(parts, rendered)
 		}
 		return "[" + strings.Join(parts, ", ") + "]", nil
+	case ValueDict:
+		if value.Dict == nil {
+			return "{}", nil
+		}
+		parts := make([]string, 0, len(value.Dict.Entries))
+		for _, entry := range value.Dict.Entries {
+			key := entry.Key.Str
+			if entry.Key.Kind != ValueString {
+				if _, err := dictionaryKey(entry.Key); err != nil {
+					return "", err
+				}
+				var err error
+				key, err = renderJSONDepth(entry.Key, depth+1)
+				if err != nil {
+					return "", err
+				}
+			}
+			encoded, err := json.Marshal(key)
+			if err != nil {
+				return "", err
+			}
+			item, err := renderJSONDepth(entry.Value, depth+1)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, string(encoded)+": "+item)
+		}
+		return "{" + strings.Join(parts, ", ") + "}", nil
 	default:
 		return "", fmt.Errorf("json.dumps does not support %s yet", value.Kind)
 	}

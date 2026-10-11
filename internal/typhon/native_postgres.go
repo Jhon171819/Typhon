@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -319,7 +320,22 @@ func postgresValue(value any, depth int) (Value, error) {
 		}
 		return ListValue(items), nil
 	case map[string]any:
-		return NoneValue(), fmt.Errorf("cast PostgreSQL JSON to text; dictionaries are not yet supported by Typhon")
+		dict := DictValue()
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			item, err := postgresValue(value[key], depth+1)
+			if err != nil {
+				return NoneValue(), err
+			}
+			if err := dict.Dict.put(StringValue(key), item); err != nil {
+				return NoneValue(), err
+			}
+		}
+		return dict, nil
 	case driver.Valuer:
 		encoded, err := value.Value()
 		if err != nil {

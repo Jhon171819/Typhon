@@ -161,6 +161,20 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 		}
 		return fc.compileStore(s.Target)
 	case *AssignStmt:
+		if index, ok := s.Target.(*IndexExpr); ok {
+			// Python evaluates the assigned value before the target.
+			if err := fc.compileExpr(s.Value); err != nil {
+				return err
+			}
+			if err := fc.compileExpr(index.Object); err != nil {
+				return err
+			}
+			if err := fc.compileExpr(index.Index); err != nil {
+				return err
+			}
+			fc.emit(Instr{Op: OpSetIndex})
+			return nil
+		}
 		if attr, ok := s.Target.(*AttrExpr); ok {
 			if err := fc.compileExpr(attr.Object); err != nil {
 				return err
@@ -175,6 +189,14 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 			return err
 		}
 		return fc.compileStore(s.Target)
+	case *DelStmt:
+		if err := fc.compileExpr(s.Target.Object); err != nil {
+			return err
+		}
+		if err := fc.compileExpr(s.Target.Index); err != nil {
+			return err
+		}
+		fc.emit(Instr{Op: OpDelIndex})
 	case *ReturnStmt:
 		if s.Value == nil {
 			fc.emit(Instr{Op: OpConst, Val: NoneValue()})
@@ -327,6 +349,24 @@ func (fc *functionCompiler) compileExpr(expr Expr) error {
 			}
 		}
 		fc.emit(Instr{Op: OpMakeList, A: len(e.Elements)})
+	case *DictExpr:
+		for _, entry := range e.Entries {
+			if err := fc.compileExpr(entry.Key); err != nil {
+				return err
+			}
+			if err := fc.compileExpr(entry.Value); err != nil {
+				return err
+			}
+		}
+		fc.emit(Instr{Op: OpMakeDict, A: len(e.Entries)})
+	case *IndexExpr:
+		if err := fc.compileExpr(e.Object); err != nil {
+			return err
+		}
+		if err := fc.compileExpr(e.Index); err != nil {
+			return err
+		}
+		fc.emit(Instr{Op: OpGetIndex})
 	case *BinaryExpr:
 		if err := fc.compileExpr(e.Left); err != nil {
 			return err
@@ -349,6 +389,8 @@ func (fc *functionCompiler) compileExpr(expr Expr) error {
 			return err
 		}
 		switch e.Op {
+		case "in", "not in":
+			fc.emit(Instr{Op: OpContains, S: e.Op})
 		case "/":
 			fc.emit(Instr{Op: OpDiv})
 		case "//":

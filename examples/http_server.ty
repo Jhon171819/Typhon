@@ -1,11 +1,28 @@
 import typhon.http as http
 
 
+pile: list[list[str]] = [
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+    ['test1', 'test'],
+]
+
+
 def handle(req: http.Request) -> http.Response:
-    if req.path == '/health':
+    path: str  =  req.path
+    if path == '/health':
         return http.response(200, 'ok', [['Content-Type', 'text/plain; charset=utf-8']])
-    if req.path == '/echo':
+    if path == '/echo':
         return http.json(200, [req.method, req.query('name'), req.body])
+
+    if path == '/pile':
+        return http.json(200, pile)
+
     return http.response(404, 'not found')
 
 

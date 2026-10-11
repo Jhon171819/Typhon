@@ -8,20 +8,27 @@ import (
 )
 
 // validateValue enforces contracts at dynamic boundaries and preserves the
-// element contract on mutable list aliases.
+// contracts on mutable collection aliases. Updates commit only after validation.
 func validateValue(value Value, typ Type) (Value, error) {
-	plan := &validationPlan{lists: map[*[]Value]*listContractUpdate{}}
+	plan := newValidationPlan()
 	result, err := plan.validate(value, typ, 0)
 	if err != nil {
 		return NoneValue(), err
 	}
+	plan.commit()
+	return result, nil
+}
+
+func (plan *validationPlan) commit() {
 	for _, update := range plan.lists {
 		*update.value.List = update.items
 		if update.value.ListGuard != nil {
 			update.value.ListGuard.elem = update.elem
 		}
 	}
-	return result, nil
+	for dict, update := range plan.dicts {
+		dict.Entries, dict.Index, dict.Contract = update.value.Dict.Entries, update.value.Dict.Index, update.typ
+	}
 }
 
 type listContractUpdate struct {
@@ -31,6 +38,16 @@ type listContractUpdate struct {
 }
 type validationPlan struct {
 	lists map[*[]Value]*listContractUpdate
+	dicts map[*Dictionary]*dictContractUpdate
+}
+
+type dictContractUpdate struct {
+	value Value
+	typ   *Type
+}
+
+func newValidationPlan() *validationPlan {
+	return &validationPlan{lists: map[*[]Value]*listContractUpdate{}, dicts: map[*Dictionary]*dictContractUpdate{}}
 }
 
 func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, error) {
@@ -42,12 +59,16 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 	}
 	if typ.Kind == TypeUnion {
 		for _, option := range typ.Options {
-			trial := &validationPlan{lists: map[*[]Value]*listContractUpdate{}}
+			trial := newValidationPlan()
 			for key, update := range plan.lists {
 				trial.lists[key] = update
 			}
+			for key, update := range plan.dicts {
+				trial.dicts[key] = update
+			}
 			if result, err := trial.validate(value, option, depth+1); err == nil {
 				plan.lists = trial.lists
+				plan.dicts = trial.dicts
 				return result, nil
 			}
 		}
@@ -78,6 +99,37 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 		ok = value.Kind == ValueObject && value.Object != nil && value.Object.Class.Spec.Info == typ.Class
 	case TypeFunc:
 		ok = value.Kind == ValueFunction && value.Function.Signature.Equal(typ)
+	case TypeDict:
+		if value.Kind == ValueDict && value.Dict != nil && typ.Key != nil && typ.Elem != nil {
+			if update, ok := plan.dicts[value.Dict]; ok {
+				if !update.typ.Equal(typ) {
+					return NoneValue(), fmt.Errorf("incompatible contracts for aliased dictionary")
+				}
+				return value, nil
+			}
+			if value.Dict.Contract != nil {
+				if !value.Dict.Contract.Equal(typ) {
+					return NoneValue(), fmt.Errorf("incompatible mutable dictionary contract: %s and %s", value.Dict.Contract, typ)
+				}
+				return value, nil
+			}
+			converted := DictValue()
+			plan.dicts[value.Dict] = &dictContractUpdate{value: converted, typ: typePtr(typ)}
+			for _, entry := range value.Dict.Entries {
+				key, err := plan.validate(entry.Key, *typ.Key, depth+1)
+				if err != nil {
+					return NoneValue(), fmt.Errorf("dictionary key: %w", err)
+				}
+				item, err := plan.validate(entry.Value, *typ.Elem, depth+1)
+				if err != nil {
+					return NoneValue(), fmt.Errorf("dictionary value for %s: %w", entry.Key.String(), err)
+				}
+				if err := converted.Dict.put(key, item); err != nil {
+					return NoneValue(), err
+				}
+			}
+			return value, nil
+		}
 	case TypeList:
 		if value.Kind == ValueList && value.List != nil && typ.Elem != nil {
 			if update, ok := plan.lists[value.List]; ok {

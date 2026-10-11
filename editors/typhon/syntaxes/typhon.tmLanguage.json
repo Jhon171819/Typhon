@@ -101,7 +101,7 @@
       ]
     },
     "types": {
-      "match": "\\b(int|float|str|bool|void|list|PyObject|TyphonTask)\\b",
+      "match": "\\b(int|float|str|bool|void|list|dict|PyObject|TyphonTask)\\b",
       "name": "support.type.typhon"
     },
     "constants": {

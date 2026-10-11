@@ -12,6 +12,7 @@ const (
 	TypeStr     TypeKind = "str"
 	TypeBool    TypeKind = "bool"
 	TypeList    TypeKind = "list"
+	TypeDict    TypeKind = "dict"
 	TypeClass   TypeKind = "class"
 	TypeFunc    TypeKind = "func"
 	TypeTask    TypeKind = "task"
@@ -30,6 +31,7 @@ type Type struct {
 	Kind     TypeKind
 	Name     string
 	Elem     *Type
+	Key      *Type
 	Options  []Type
 	Params   []Type
 	Return   *Type
@@ -74,6 +76,11 @@ func (t Type) String() string {
 			return "list"
 		}
 		return "list[" + t.Elem.String() + "]"
+	case TypeDict:
+		if t.Key == nil || t.Elem == nil {
+			return "dict"
+		}
+		return "dict[" + t.Key.String() + ", " + t.Elem.String() + "]"
 	case TypeFunc:
 		return "function"
 	case TypeUnion:
@@ -95,6 +102,8 @@ func (t Type) Equal(other Type) bool {
 		return false
 	}
 	switch t.Kind {
+	case TypeDict:
+		return t.Key != nil && other.Key != nil && t.Elem != nil && other.Elem != nil && t.Key.Equal(*other.Key) && t.Elem.Equal(*other.Elem)
 	case TypeNative, TypeModule:
 		return t.Name == other.Name
 	case TypeList:
@@ -181,6 +190,9 @@ func assignable(from Type, to Type) bool {
 			return true
 		}
 		return from.Elem.Kind == TypeNever || from.Elem.Equal(*to.Elem)
+	}
+	if to.Kind == TypeDict && from.Kind == TypeDict && from.Key != nil && from.Elem != nil && to.Key != nil && to.Elem != nil {
+		return (from.Key.Kind == TypeNever || from.Key.Equal(*to.Key)) && (from.Elem.Kind == TypeNever || from.Elem.Equal(*to.Elem))
 	}
 	return from.Equal(to)
 }

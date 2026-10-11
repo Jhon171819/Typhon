@@ -16,7 +16,7 @@ continuam descritos abaixo, separados do que já tem implementação e testes.
 | P0 04 | Combinações inválidas de operadores são rejeitadas no checker e na VM | `TestAuditRuntimeRegressions` |
 | P0 05 / B01 | Inteiros exatos em todo o intervalo int64; overflow e números não finitos são erros | `TestAuditPythonPrecisionAndConversions` |
 | P0 06 / T02 | Validação de valores dinâmicos em atribuições, parâmetros, retornos, campos e alvos de `for` | `TestAuditPythonPrecisionAndConversions`, `TestAuditRuntimeRegressions` |
-| P0 07 / B02 | Descritor privado para respostas; stdout de bibliotecas vai para stderr; protocolo 2 com sequência e limites | `TestAuditPythonOutputIsolation` |
+| P0 07 / B02 | Descritor privado para respostas; stdout de bibliotecas vai para stderr; protocolo 3 com sequência e limites | `TestAuditPythonOutputIsolation` |
 | P0 08 / R02 | Conclusão armazenada; `join` reutilizável; espera de filhos, cancelamento e timeout | `TestAuditRuntimeRegressions`, `TestTaskCancellationAndTimeout` |
 | P0 09 / R01 | Repetição negativa e tamanhos excessivos geram erro Typhon | `TestAuditRuntimeRegressions` |
 | T01 | Construtores inicializam todos os campos; leituras prematuras são rejeitadas; narrowing com `is None`/`is not None` | `TestConstructorInitialization`, exemplo `user_service.ty` |
@@ -98,7 +98,8 @@ faltam quotas configuráveis por requisição, iteradores preguiçosos e métric
 
 ## Ponte Python
 
-O protocolo 2 identifica cada requisição/resposta. `TYPHON_PYTHON_TIMEOUT` usa
+O protocolo 3 identifica cada requisição/resposta e transporta dicionários com
+chaves escalares em ambas as direções. `TYPHON_PYTHON_TIMEOUT` usa
 durações como `250ms` ou `5s`, com padrão de 30 segundos. O prazo começa quando
 a operação adquire o transporte serializado. Um timeout invalida a sessão.
 O worker privado recebe até um segundo para encerrar, depois é terminado.
@@ -120,7 +121,16 @@ fora do contrato implementado.
 
 ## Próximos marcos do documento
 
-1. Dados e recuperação: `dict[K,V]`, indexação/slices, tuplas, `try`/`except`/
+`dict[K, V]`, literais, indexação e atribuição/remoção por chave estão implementados.
+Os contratos de chaves e valores são invariantes e preservados em aliases `Any`;
+falhas de validação e `update` não alteram parcialmente as coleções. Dicionários
+preservam ordem de inserção, com buscas por tabela hash; remoções compactam a
+sequência de entradas. Iteração e `keys`/`values`/`items` usam snapshots, e `copy`
+é superficial. Acesso por chave ausente gera erro `KeyError`. Listas e strings
+aceitam índices inteiros, inclusive negativos. `json.dumps` aceita dicionários.
+Esses contratos são verificados em `dictionary_test.go`.
+
+1. Dados e recuperação: slices, tuplas, `try`/`except`/
    `finally`, `raise`, limpeza determinística e JSON completo.
 2. Funções e módulos: defaults/kwargs Typhon, closures, aliases de import,
    `import` local unificado, `Task[T]` e assinaturas completas.

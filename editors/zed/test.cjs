@@ -18,6 +18,7 @@ async function main() {
     ['class User:\n    id: int', 'User', 'type'],
     ['type UserId = int', 'UserId', 'type'],
     ['value: PyObject = req.get(url)', 'PyObject', 'type.builtin'],
+    ["scores: dict[str, int] = {'Ada': 10}", 'dict', 'type.builtin'],
     ['task: TyphonTask = spawn(double, 21)', 'TyphonTask', 'type.builtin'],
     ['print(f"Request {item + 1}")', 'f"Request {item + 1}"', 'string'],
     ['value: str = "# not a comment" # comment', '# comment', 'comment'],
