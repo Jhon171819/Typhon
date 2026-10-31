@@ -1,0 +1,14 @@
+{
+  "name": "tree-sitter-typhon",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "generate": "tree-sitter generate --abi 14",
+    "test": "node ../test.cjs"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10",
+    "web-tree-sitter": "0.25.10"
+  }
+}

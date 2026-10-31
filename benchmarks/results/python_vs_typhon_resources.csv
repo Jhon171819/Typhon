@@ -1,0 +1,7 @@
+case,label,python_wall_ms,typhon_wall_ms,python_cpu_ms,typhon_cpu_ms,python_peak_working_set_mb,typhon_peak_working_set_mb,python_peak_private_mb,typhon_peak_private_mb,python_max_processes,typhon_max_processes,typhon_warm_wall_ms,typhon_warm_cpu_ms,typhon_warm_peak_working_set_mb,typhon_warm_peak_private_mb,typhon_warm_max_processes
+hello_print,print,441.875,64.509,203.125,31.250,16.551,5.445,8.359,11.828,2,1,,,,,
+function_string,function + string,264.556,44.473,171.875,31.250,16.477,5.281,8.328,11.699,2,1,,,,,
+list_loop,list loop,303.367,61.561,156.250,15.625,16.574,5.477,8.355,11.582,2,1,,,,,
+class_fields,class fields,227.662,37.800,156.250,15.625,16.602,5.527,8.410,11.758,2,1,,,,,
+python_json,json native shim,221.181,52.565,171.875,31.250,16.773,5.883,8.367,11.824,2,1,,,,,
+python_math,Python math bridge,225.880,383.546,156.250,265.625,16.500,26.457,8.250,23.832,2,3,434.525,296.875,27.242,24.934,3

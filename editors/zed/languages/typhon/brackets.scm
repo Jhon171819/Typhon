@@ -1,0 +1,5 @@
+(parenthesized "(" @open ")" @close)
+(list "[" @open "]" @close)
+(braced "{" @open "}" @close)
+(string ["\"" "f\"" "F\""] @open "\"" @close)
+(string ["'" "f'" "F'"] @open "'" @close)

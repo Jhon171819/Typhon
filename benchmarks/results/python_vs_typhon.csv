@@ -1,0 +1,8 @@
+case,label,python_ms_median,typhon_ms_median,typhon_div_python
+hello_print,print,241.582,25.539,0.106
+function_string,function + string,242.961,31.990,0.132
+list_loop,list loop,218.819,27.670,0.126
+class_fields,class fields,254.369,27.477,0.108
+python_json,json native shim,269.533,28.996,0.108
+python_math,Python math bridge,221.115,411.631,1.862
+python_requests,requests bridge,1171.437,1345.975,1.149

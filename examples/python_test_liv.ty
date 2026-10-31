@@ -1,0 +1,33 @@
+import time
+import requests as req
+
+start_function: float = time.perf_counter()
+
+def get(url: str) -> None:
+
+    for i: int in range(5):
+        start_time: float = time.perf_counter()
+
+        response: PyObject = req.get(
+            url,
+            timeout=10
+        )
+
+        end_time: float = time.perf_counter()
+
+        elapsed_seconds: float = end_time - start_time
+        elapsed_ms: float = elapsed_seconds * 1000
+        print(f"Request {i + 1}")
+        print(f"Status: {response.status_code}")
+        print(f"Tempo: {elapsed_ms:.2f} ms")
+        print("-" * 30)
+    
+
+
+
+get('https://google.com')
+
+end_function: float = time.perf_counter()
+
+print(f"Tempo total de execução: {end_function - start_function:.2f} segundos")
+# expected responnse: <Response [200]>

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="640" viewBox="0 0 1080 640">
+<style>
+text{font-family:Segoe UI,Arial,sans-serif;fill:#1f2937}
+.title{font-size:28px;font-weight:700}
+.subtitle{font-size:14px;fill:#64748b}
+.label{font-size:14px}
+.value{font-size:13px;fill:#334155}
+.axis{stroke:#cbd5e1;stroke-width:1}
+.grid{stroke:#e2e8f0;stroke-width:1}
+</style>
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text class="title" x="40" y="44">Python vs Typhon Simple Usage Benchmark</text>
+<text class="subtitle" x="40" y="68">Median cold-process runtime, milliseconds. Lower is better.</text>
+<line class="axis" x1="220" y1="545" x2="1010" y2="545"/>
+<line class="grid" x1="220.0" y1="90" x2="220.0" y2="545"/>
+<text class="subtitle" x="220.0" y="570" text-anchor="middle">0</text>
+<line class="grid" x1="378.0" y1="90" x2="378.0" y2="545"/>
+<text class="subtitle" x="378.0" y="570" text-anchor="middle">280</text>
+<line class="grid" x1="536.0" y1="90" x2="536.0" y2="545"/>
+<text class="subtitle" x="536.0" y="570" text-anchor="middle">560</text>
+<line class="grid" x1="694.0" y1="90" x2="694.0" y2="545"/>
+<text class="subtitle" x="694.0" y="570" text-anchor="middle">840</text>
+<line class="grid" x1="852.0" y1="90" x2="852.0" y2="545"/>
+<text class="subtitle" x="852.0" y="570" text-anchor="middle">1120</text>
+<line class="grid" x1="1010.0" y1="90" x2="1010.0" y2="545"/>
+<text class="subtitle" x="1010.0" y="570" text-anchor="middle">1400</text>
+<text class="label" x="205" y="129.9" text-anchor="end">print</text>
+<rect x="220" y="112.0" width="136.3" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="136.0" width="14.4" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="364.3" y="126.0">241.58 ms</text>
+<text class="value" x="242.4" y="150.0">25.54 ms</text>
+<text class="label" x="205" y="194.9" text-anchor="end">function + string</text>
+<rect x="220" y="177.0" width="137.1" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="201.0" width="18.1" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="365.1" y="191.0">242.96 ms</text>
+<text class="value" x="246.1" y="215.0">31.99 ms</text>
+<text class="label" x="205" y="259.9" text-anchor="end">list loop</text>
+<rect x="220" y="242.0" width="123.5" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="266.0" width="15.6" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="351.5" y="256.0">218.82 ms</text>
+<text class="value" x="243.6" y="280.0">27.67 ms</text>
+<text class="label" x="205" y="324.9" text-anchor="end">class fields</text>
+<rect x="220" y="307.0" width="143.5" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="331.0" width="15.5" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="371.5" y="321.0">254.37 ms</text>
+<text class="value" x="243.5" y="345.0">27.48 ms</text>
+<text class="label" x="205" y="389.9" text-anchor="end">json native shim</text>
+<rect x="220" y="372.0" width="152.1" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="396.0" width="16.4" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="380.1" y="386.0">269.53 ms</text>
+<text class="value" x="244.4" y="410.0">29.00 ms</text>
+<text class="label" x="205" y="454.9" text-anchor="end">Python math bridge</text>
+<rect x="220" y="437.0" width="124.8" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="461.0" width="232.3" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="352.8" y="451.0">221.11 ms</text>
+<text class="value" x="460.3" y="475.0">411.63 ms</text>
+<text class="label" x="205" y="520.0" text-anchor="end">requests bridge</text>
+<rect x="220" y="502.0" width="661.0" height="18" rx="4" fill="#3776ab"/>
+<rect x="220" y="526.0" width="759.5" height="18" rx="4" fill="#00add8"/>
+<text class="value" x="889.0" y="516.0">1171.44 ms</text>
+<text class="value" x="987.5" y="540.0">1345.98 ms</text>
+<rect x="220" y="598" width="16" height="16" rx="3" fill="#3776ab"/>
+<text class="subtitle" x="244" y="612">Python</text>
+<rect x="335" y="598" width="16" height="16" rx="3" fill="#00add8"/>
+<text class="subtitle" x="359" y="612">Typhon Go VM</text>
+<text class="subtitle" x="1010" y="612" text-anchor="end">Scale max: 1400 ms</text>
+</svg>

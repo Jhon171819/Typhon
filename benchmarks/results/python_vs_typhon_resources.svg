@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="760" viewBox="0 0 1160 760">
+<style>
+text{font-family:Segoe UI,Arial,sans-serif;fill:#1f2937}
+.title{font-size:28px;font-weight:700}
+.subtitle{font-size:14px;fill:#64748b}
+.panel{font-size:18px;font-weight:650}
+.label{font-size:14px}
+.value{font-size:13px;fill:#334155}
+.axis{stroke:#cbd5e1;stroke-width:1}
+.grid{stroke:#e2e8f0;stroke-width:1}
+</style>
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text class="title" x="40" y="44">Python vs Typhon Resource Usage</text>
+<text class="subtitle" x="40" y="68">Median cold-process usage. Lower bars are better.</text>
+<text class="panel" x="40" y="76">Peak private memory (MB)</text>
+<line class="axis" x1="220" y1="386" x2="1090" y2="386"/>
+<line class="grid" x1="220.0" y1="91" x2="220.0" y2="386"/>
+<text class="subtitle" x="220.0" y="410" text-anchor="middle">0</text>
+<line class="grid" x1="394.0" y1="91" x2="394.0" y2="386"/>
+<text class="subtitle" x="394.0" y="410" text-anchor="middle">5</text>
+<line class="grid" x1="568.0" y1="91" x2="568.0" y2="386"/>
+<text class="subtitle" x="568.0" y="410" text-anchor="middle">10</text>
+<line class="grid" x1="742.0" y1="91" x2="742.0" y2="386"/>
+<text class="subtitle" x="742.0" y="410" text-anchor="middle">15</text>
+<line class="grid" x1="916.0" y1="91" x2="916.0" y2="386"/>
+<text class="subtitle" x="916.0" y="410" text-anchor="middle">20</text>
+<line class="grid" x1="1090.0" y1="91" x2="1090.0" y2="386"/>
+<text class="subtitle" x="1090.0" y="410" text-anchor="middle">25</text>
+<text class="label" x="205" y="122" text-anchor="end">print</text>
+<rect x="220" y="101" width="290.9" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="121" width="411.6" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="518.9" y="114">8.36 MB</text>
+<text class="value" x="639.6" y="134">11.83 MB</text>
+<text class="label" x="205" y="164" text-anchor="end">function + string</text>
+<rect x="220" y="143" width="289.8" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="163" width="407.1" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="517.8" y="156">8.33 MB</text>
+<text class="value" x="635.1" y="176">11.70 MB</text>
+<text class="label" x="205" y="206" text-anchor="end">list loop</text>
+<rect x="220" y="185" width="290.8" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="205" width="403.1" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="518.8" y="198">8.36 MB</text>
+<text class="value" x="631.1" y="218">11.58 MB</text>
+<text class="label" x="205" y="248" text-anchor="end">class fields</text>
+<rect x="220" y="227" width="292.7" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="247" width="409.2" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="520.7" y="240">8.41 MB</text>
+<text class="value" x="637.2" y="260">11.76 MB</text>
+<text class="label" x="205" y="290" text-anchor="end">json native shim</text>
+<rect x="220" y="269" width="291.2" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="289" width="411.5" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="519.2" y="282">8.37 MB</text>
+<text class="value" x="639.5" y="302">11.82 MB</text>
+<text class="label" x="205" y="332" text-anchor="end">Python math bridge</text>
+<rect x="220" y="311" width="287.1" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="331" width="829.4" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="515.1" y="324">8.25 MB</text>
+<text class="value" x="1057.4" y="344">23.83 MB</text>
+<text class="panel" x="40" y="390">Estimated CPU time (ms)</text>
+<line class="axis" x1="220" y1="700" x2="1090" y2="700"/>
+<line class="grid" x1="220.0" y1="405" x2="220.0" y2="700"/>
+<text class="subtitle" x="220.0" y="724" text-anchor="middle">0</text>
+<line class="grid" x1="394.0" y1="405" x2="394.0" y2="700"/>
+<text class="subtitle" x="394.0" y="724" text-anchor="middle">60</text>
+<line class="grid" x1="568.0" y1="405" x2="568.0" y2="700"/>
+<text class="subtitle" x="568.0" y="724" text-anchor="middle">120</text>
+<line class="grid" x1="742.0" y1="405" x2="742.0" y2="700"/>
+<text class="subtitle" x="742.0" y="724" text-anchor="middle">180</text>
+<line class="grid" x1="916.0" y1="405" x2="916.0" y2="700"/>
+<text class="subtitle" x="916.0" y="724" text-anchor="middle">240</text>
+<line class="grid" x1="1090.0" y1="405" x2="1090.0" y2="700"/>
+<text class="subtitle" x="1090.0" y="724" text-anchor="middle">300</text>
+<text class="label" x="205" y="436" text-anchor="end">print</text>
+<rect x="220" y="415" width="589.1" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="435" width="90.6" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="817.1" y="428">203.12 ms</text>
+<text class="value" x="318.6" y="448">31.25 ms</text>
+<text class="label" x="205" y="478" text-anchor="end">function + string</text>
+<rect x="220" y="457" width="498.4" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="477" width="90.6" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="726.4" y="470">171.88 ms</text>
+<text class="value" x="318.6" y="490">31.25 ms</text>
+<text class="label" x="205" y="520" text-anchor="end">list loop</text>
+<rect x="220" y="499" width="453.1" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="519" width="45.3" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="681.1" y="512">156.25 ms</text>
+<text class="value" x="273.3" y="532">15.62 ms</text>
+<text class="label" x="205" y="562" text-anchor="end">class fields</text>
+<rect x="220" y="541" width="453.1" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="561" width="45.3" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="681.1" y="554">156.25 ms</text>
+<text class="value" x="273.3" y="574">15.62 ms</text>
+<text class="label" x="205" y="604" text-anchor="end">json native shim</text>
+<rect x="220" y="583" width="498.4" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="603" width="90.6" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="726.4" y="596">171.88 ms</text>
+<text class="value" x="318.6" y="616">31.25 ms</text>
+<text class="label" x="205" y="646" text-anchor="end">Python math bridge</text>
+<rect x="220" y="625" width="453.1" height="16" rx="4" fill="#3776ab"/>
+<rect x="220" y="645" width="770.3" height="16" rx="4" fill="#00add8"/>
+<text class="value" x="681.1" y="638">156.25 ms</text>
+<text class="value" x="998.3" y="658">265.62 ms</text>
+<rect x="220" y="712" width="16" height="16" rx="3" fill="#3776ab"/>
+<text class="subtitle" x="244" y="726">Python</text>
+<rect x="335" y="712" width="16" height="16" rx="3" fill="#00add8"/>
+<text class="subtitle" x="359" y="726">Typhon Go VM</text>
+</svg>

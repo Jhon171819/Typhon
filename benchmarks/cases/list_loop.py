@@ -1,0 +1,8 @@
+def sum_values(values: list[int]) -> int:
+    total: int = 0
+    for value in values:
+        total = total + value
+    return total
+
+
+print(sum_values([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))

@@ -1,0 +1,46 @@
+{
+  "name": "typhon-language",
+  "displayName": "Typhon Language",
+  "description": "Recognize .ty files as Typhon with syntax highlighting and indentation.",
+  "version": "0.1.0",
+  "publisher": "typhon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jhon171819/Typhon.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "scripts": {
+    "test": "node test.cjs"
+  },
+  "devDependencies": {
+    "vscode-oniguruma": "2.0.1",
+    "vscode-textmate": "9.3.2"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "typhon",
+        "aliases": ["Typhon", "typhon"],
+        "extensions": [".ty"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "typhon",
+        "scopeName": "source.typhon",
+        "path": "./syntaxes/typhon.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[typhon]": {
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+import typhon.postgres as pg
+
+url: str = pg.env('DATABASE_URL')
+if url == '':
+    print('Defina DATABASE_URL para executar este exemplo')
+else:
+    db: pg.Connection = pg.connect(url, 5)
+    rows: pg.Rows = db.query('SELECT $1::bigint AS id, $2::text AS name', [9007199254740993, 'Ada'])
+    print(rows.columns, rows.count, rows.get(0, 'id'), rows.get(0, 'name'))
+
+    tx: pg.Transaction = db.begin()
+    tx.exec('CREATE TEMP TABLE typhon_example (name text) ON COMMIT DROP')
+    print(tx.exec('INSERT INTO typhon_example VALUES ($1)', ['Typhon']))
+    print(tx.query('SELECT name FROM typhon_example').row(0))
+    tx.rollback()
+    db.close()

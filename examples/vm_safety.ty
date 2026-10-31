@@ -1,0 +1,31 @@
+from typhon.parallel import TyphonTask, spawn, join
+
+
+type State = "open" | "closed"
+
+
+def total_cents(prices: list[int]) -> int:
+    total: int = 0
+    for price: int in prices:
+        if price < 0:
+            continue
+        total = total + price
+    return total
+
+
+def label(value: int) -> str:
+    if value < 0:
+        return "negative"
+    elif value == 0:
+        return "zero"
+    else:
+        return "positive"
+
+
+state: State = "open"
+prices: list[int] = [1299, 2500, -1]
+task: TyphonTask = spawn(total_cents, prices)
+print(state, join(task), join(task))
+print(label(-1), label(0), label(1))
+print(prices is prices, prices == [1299, 2500, -1])
+print(-7 // 3, -7 % 3)
