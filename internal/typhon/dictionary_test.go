@@ -140,6 +140,60 @@ func TestDictionaryValidationIsAtomic(t *testing.T) {
 	}
 }
 
+func TestDictionaryUnionValidationRollback(t *testing.T) {
+	kept := ListValue([]Value{IntValue(1)})
+	inner := ListValue([]Value{IntValue(2)})
+	d := DictValue()
+	_ = d.Dict.put(StringValue("values"), inner)
+	_ = d.Dict.put(StringValue("label"), StringValue("ok"))
+	rows := ListValue([]Value{kept, d})
+	floats := listType(FloatType())
+	fallback := dictType(StrType(), AnyType())
+	typ := listType(unionType(floats, dictType(StrType(), floats), fallback))
+	if _, err := validateValue(rows, typ); err != nil {
+		t.Fatal(err)
+	}
+	if (*kept.List)[0].Kind != ValueFloat || kept.ListGuard.elem == nil {
+		t.Fatal("union rollback discarded an earlier successful conversion")
+	}
+	if (*inner.List)[0].Kind != ValueInt || inner.ListGuard.elem != nil {
+		t.Fatal("failed union option changed a nested alias")
+	}
+	if d.Dict.Contract == nil || !d.Dict.Contract.Equal(fallback) {
+		t.Fatal("failed union option left a dictionary contract behind")
+	}
+	if err := setIndex(inner, IntValue(0), StringValue("still dynamic")); err != nil {
+		t.Fatal(err)
+	}
+	if err := setIndex(kept, IntValue(0), StringValue("wrong")); err == nil {
+		t.Fatal("earlier successful list contract was lost")
+	}
+
+	bad := DictValue()
+	list := ListValue([]Value{IntValue(3)})
+	_ = bad.Dict.put(StringValue("first"), list)
+	_ = bad.Dict.put(StringValue("last"), BoolValue(true))
+	_, err := validateValue(bad, unionType(dictType(StrType(), floats), dictType(StrType(), StrType())))
+	if err == nil || bad.Dict.Contract != nil || list.ListGuard.elem != nil || (*list.List)[0].Kind != ValueInt {
+		t.Fatalf("failed union validation mutated aliases: %v", err)
+	}
+}
+
+func TestDictionaryBoundMethodsKeepReceivers(t *testing.T) {
+	output, err := captureRun(t, sourceFile(t, `
+first: dict[str, int] = {'id': 1}
+second: dict[str, int] = {'id': 2}
+get_first: Any = first.get
+get_second: Any = second.get
+print(get_first('id'), get_second('id'), first.get('absent', 3), second.get('absent'))
+first['id'] = 4
+print(get_first('id'), get_second('id'))
+`))
+	if err != nil || output != "1 2 3 None\n4 2\n" {
+		t.Fatalf("bound dictionary methods: %q, %v", output, err)
+	}
+}
+
 func TestDictionaryKeysAndCycles(t *testing.T) {
 	d := DictValue()
 	keys := []Value{IntValue(1), FloatValue(1), BoolValue(true), FloatValue(math.Copysign(0, -1)), IntValue(0), NoneValue(), StringValue("1"), IntValue(math.MaxInt64), FloatValue(9223372036854775808)}

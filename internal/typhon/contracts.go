@@ -10,6 +10,9 @@ import (
 // validateValue enforces contracts at dynamic boundaries and preserves the
 // contracts on mutable collection aliases. Updates commit only after validation.
 func validateValue(value Value, typ Type) (Value, error) {
+	if typ.Kind != TypeList && typ.Kind != TypeDict && typ.Kind != TypeUnion {
+		return validateAtomicValue(value, typ)
+	}
 	plan := newValidationPlan()
 	result, err := plan.validate(value, typ, 0)
 	if err != nil {
@@ -39,6 +42,8 @@ type listContractUpdate struct {
 type validationPlan struct {
 	lists map[*[]Value]*listContractUpdate
 	dicts map[*Dictionary]*dictContractUpdate
+	// Only new collection entries need undoing when a union option fails.
+	pending []any
 }
 
 type dictContractUpdate struct {
@@ -47,32 +52,26 @@ type dictContractUpdate struct {
 }
 
 func newValidationPlan() *validationPlan {
-	return &validationPlan{lists: map[*[]Value]*listContractUpdate{}, dicts: map[*Dictionary]*dictContractUpdate{}}
+	return &validationPlan{}
 }
 
-func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, error) {
-	if depth > 64 {
-		return NoneValue(), fmt.Errorf("type validation depth limit exceeded")
+func (plan *validationPlan) rollback(mark int) {
+	for _, target := range plan.pending[mark:] {
+		switch key := target.(type) {
+		case *[]Value:
+			delete(plan.lists, key)
+		case *Dictionary:
+			delete(plan.dicts, key)
+		}
 	}
+	clear(plan.pending[mark:])
+	plan.pending = plan.pending[:mark]
+}
+
+// Atomic types cannot install collection contracts or require a commit plan.
+func validateAtomicValue(value Value, typ Type) (Value, error) {
 	if typ.Kind == "" || typ.Kind == TypeAny || typ.Kind == TypePy {
 		return value, nil
-	}
-	if typ.Kind == TypeUnion {
-		for _, option := range typ.Options {
-			trial := newValidationPlan()
-			for key, update := range plan.lists {
-				trial.lists[key] = update
-			}
-			for key, update := range plan.dicts {
-				trial.dicts[key] = update
-			}
-			if result, err := trial.validate(value, option, depth+1); err == nil {
-				plan.lists = trial.lists
-				plan.dicts = trial.dicts
-				return result, nil
-			}
-		}
-		return NoneValue(), fmt.Errorf("expected %s, got %s", typ, value.Kind)
 	}
 	ok := false
 	switch typ.Kind {
@@ -99,6 +98,26 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 		ok = value.Kind == ValueObject && value.Object != nil && value.Object.Class.Spec.Info == typ.Class
 	case TypeFunc:
 		ok = value.Kind == ValueFunction && value.Function.Signature.Equal(typ)
+	}
+	if !ok {
+		return NoneValue(), fmt.Errorf("expected %s, got %s", typ, value.Kind)
+	}
+	return value, nil
+}
+
+func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, error) {
+	if depth > 64 {
+		return NoneValue(), fmt.Errorf("type validation depth limit exceeded")
+	}
+	switch typ.Kind {
+	case TypeUnion:
+		for _, option := range typ.Options {
+			mark := len(plan.pending)
+			if result, err := plan.validate(value, option, depth+1); err == nil {
+				return result, nil
+			}
+			plan.rollback(mark)
+		}
 	case TypeDict:
 		if value.Kind == ValueDict && value.Dict != nil && typ.Key != nil && typ.Elem != nil {
 			if update, ok := plan.dicts[value.Dict]; ok {
@@ -114,7 +133,11 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 				return value, nil
 			}
 			converted := DictValue()
+			if plan.dicts == nil {
+				plan.dicts = make(map[*Dictionary]*dictContractUpdate)
+			}
 			plan.dicts[value.Dict] = &dictContractUpdate{value: converted, typ: typePtr(typ)}
+			plan.pending = append(plan.pending, value.Dict)
 			for _, entry := range value.Dict.Entries {
 				key, err := plan.validate(entry.Key, *typ.Key, depth+1)
 				if err != nil {
@@ -145,7 +168,11 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 				return value, nil
 			}
 			items := make([]Value, len(*value.List))
+			if plan.lists == nil {
+				plan.lists = make(map[*[]Value]*listContractUpdate)
+			}
 			plan.lists[value.List] = &listContractUpdate{value: value, elem: typ.Elem, items: items}
+			plan.pending = append(plan.pending, value.List)
 			for i, item := range *value.List {
 				converted, err := plan.validate(item, *typ.Elem, depth+1)
 				if err != nil {
@@ -155,11 +182,10 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 			}
 			return value, nil
 		}
+	default:
+		return validateAtomicValue(value, typ)
 	}
-	if !ok {
-		return NoneValue(), fmt.Errorf("expected %s, got %s", typ, value.Kind)
-	}
-	return value, nil
+	return NoneValue(), fmt.Errorf("expected %s, got %s", typ, value.Kind)
 }
 
 const maxCollectionItems = 1_000_000

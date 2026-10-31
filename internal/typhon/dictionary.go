@@ -331,10 +331,12 @@ func nativeDict(vm *VM, args []Value) (Value, error) {
 	return copy, nil
 }
 
-func dictMethod(receiver Value, name string) (Value, bool) {
-	switch name {
-	case "get", "keys", "values", "items", "pop", "clear", "copy", "update", "setdefault":
-		return boundNative(receiver, "dict."+name, func(vm *VM, args []Value) (Value, error) {
+// Method implementations are immutable and shared; only the receiver is bound.
+var dictionaryMethods = func() map[string]*NativeFunc {
+	methods := make(map[string]*NativeFunc)
+	for _, name := range []string{"get", "keys", "values", "items", "pop", "clear", "copy", "update", "setdefault"} {
+		methods[name] = &NativeFunc{Name: "dict." + name, Fn: func(vm *VM, args []Value) (Value, error) {
+			receiver := args[0]
 			d := args[0].Dict
 			if d == nil {
 				return NoneValue(), fmt.Errorf("invalid dictionary")
@@ -420,7 +422,14 @@ func dictMethod(receiver Value, name string) (Value, bool) {
 				return ListValue(items), nil
 			}
 			return NoneValue(), nil
-		}), true
+		}}
+	}
+	return methods
+}()
+
+func dictMethod(receiver Value, name string) (Value, bool) {
+	if method, ok := dictionaryMethods[name]; ok {
+		return Value{Kind: ValueBoundMethod, Bound: &BoundMethod{Receiver: receiver, Native: method}}, true
 	}
 	return NoneValue(), false
 }

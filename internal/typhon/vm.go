@@ -474,7 +474,9 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 			return NoneValue(), fmt.Errorf("Typhon methods do not accept keyword arguments")
 		}
 		if callee.Bound.Native != nil {
-			nativeArgs := append([]Value{callee.Bound.Receiver}, args...)
+			nativeArgs := make([]Value, len(args)+1)
+			nativeArgs[0] = callee.Bound.Receiver
+			copy(nativeArgs[1:], args)
 			return callee.Bound.Native.Fn(vm, nativeArgs)
 		}
 		methodArgs := append([]Value{callee.Bound.Receiver}, args...)
