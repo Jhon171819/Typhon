@@ -49,10 +49,25 @@ const (
 	OpSetIndex
 	OpDelIndex
 	OpContains
+	OpTry
+	OpLeave
+	OpEndFinally
+	OpRaise
+	OpReraise
 )
 
 func (op Op) String() string {
 	switch op {
+	case OpTry:
+		return "TRY"
+	case OpLeave:
+		return "LEAVE"
+	case OpEndFinally:
+		return "END_FINALLY"
+	case OpRaise:
+		return "RAISE"
+	case OpReraise:
+		return "RERAISE"
 	case OpMakeDict:
 		return "MAKE_DICT"
 	case OpGetIndex:
@@ -146,6 +161,7 @@ type Instr struct {
 	Type     Type
 	Op       Op
 	A        int
+	Depth    int
 	S        string
 	Names    []string
 	Keywords []string
@@ -163,6 +179,19 @@ type Function struct {
 	Code       []Instr
 	ModulePath string
 	Module     *LoadedModule
+	regions    []exceptionRegion
+}
+
+type exceptionRegion struct {
+	bodyEnd  int
+	cleanup  int // -1 when the region has no finally
+	handlers []exceptionHandler
+}
+
+type exceptionHandler struct {
+	kind   string
+	target int
+	slot   int // -1 when the handler has no binding
 }
 
 type ClassSpec struct {
@@ -204,6 +233,20 @@ func writeFunction(out *strings.Builder, fn *Function) {
 			fmt.Fprintf(out, " %s", instr.S)
 		case OpLoadLocal, OpStoreLocal, OpJump, OpJumpIfFalse, OpCall, OpMakeList, OpMakeDict, OpIterNext:
 			fmt.Fprintf(out, " %d", instr.A)
+		case OpTry:
+			region := fn.regions[instr.A]
+			fmt.Fprintf(out, " bodyEnd=%d", region.bodyEnd)
+			for _, handler := range region.handlers {
+				fmt.Fprintf(out, " except %s -> %d", handler.kind, handler.target)
+				if handler.slot >= 0 {
+					fmt.Fprintf(out, " (local %d)", handler.slot)
+				}
+			}
+			if region.cleanup >= 0 {
+				fmt.Fprintf(out, " finally -> %d", region.cleanup)
+			}
+		case OpLeave:
+			fmt.Fprintf(out, " %d depth=%d", instr.A, instr.Depth)
 		case OpContains:
 			fmt.Fprintf(out, " %s", instr.S)
 		case OpUnpackStore:

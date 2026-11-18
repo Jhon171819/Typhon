@@ -38,7 +38,7 @@ func CheckModule(module *Module, resolver ImportResolver) (*ModuleInfo, error) {
 	}
 	exports := map[string]Type{}
 	for name, typ := range c.globals {
-		if !isBuiltinName(name) {
+		if !isBuiltinName(name) && typ.Kind != typeExceptionConstructor {
 			exports[name] = typ
 		}
 	}
@@ -46,7 +46,7 @@ func CheckModule(module *Module, resolver ImportResolver) (*ModuleInfo, error) {
 }
 
 func builtinTypes() map[string]Type {
-	return map[string]Type{
+	types := map[string]Type{
 		"print":       {Kind: TypeFunc, Name: "print", Variadic: true, Params: []Type{AnyType()}, Return: typePtr(NoneType())},
 		"len":         {Kind: TypeFunc, Name: "len", Params: []Type{AnyType()}, Return: typePtr(IntType())},
 		"dict":        {Kind: TypeFunc, Name: "dict", Params: []Type{AnyType()}, Optional: 1, Return: typePtr(dictType(AnyType(), AnyType()))},
@@ -68,6 +68,10 @@ func builtinTypes() map[string]Type {
 		"__file__":    StrType(),
 		"__package__": AnyType(),
 	}
+	for _, name := range exceptionNames {
+		types[name] = Type{Kind: typeExceptionConstructor, Name: name}
+	}
+	return types
 }
 
 func isBuiltinName(name string) bool {
@@ -239,6 +243,16 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 		if !assignable(actual, expectedReturn) {
 			c.fail(s.Line, fmt.Sprintf("return expected %s, got %s", expectedReturn.String(), actual.String()))
 		}
+	case *RaiseStmt:
+		if s.Value == nil {
+			if !scope.inExcept() {
+				c.fail(s.Line, "bare raise requires an enclosing except in the same function")
+			}
+		} else if actual := c.inferExpr(s.Value, scope, classInfo); !assignable(actual, exceptionType(errorKind)) {
+			c.fail(s.Line, fmt.Sprintf("raise requires Error, got %s", actual))
+		}
+	case *TryStmt:
+		c.checkTry(s, scope, classInfo, expectedReturn)
 	case *IfStmt:
 		c.inferExpr(s.Cond, scope, classInfo)
 		child := scope.child()
@@ -248,18 +262,18 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 		narrowNone(s.Cond, other, false)
 		c.checkStatements(s.Else, other, classInfo, expectedReturn)
 		for name := range scope.initialized {
-			if alwaysReturns(s.Body) {
+			if endsBlock(s.Body) {
 				scope.initialized[name] = other.initialized[name]
-			} else if alwaysReturns(s.Else) {
+			} else if endsBlock(s.Else) {
 				scope.initialized[name] = child.initialized[name]
 			} else {
 				scope.initialized[name] = child.initialized[name] && other.initialized[name]
 			}
-			if alwaysReturns(s.Body) {
+			if endsBlock(s.Body) {
 				if typ, ok := other.lookup(name); ok {
 					scope.values[name] = typ
 				}
-			} else if alwaysReturns(s.Else) {
+			} else if endsBlock(s.Else) {
 				if typ, ok := child.lookup(name); ok {
 					scope.values[name] = typ
 				}
@@ -283,6 +297,9 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 			targets = []ForTarget{{Name: s.Name, Type: s.ItemType, Line: s.Line}}
 		}
 		for _, target := range targets {
+			if scope.exceptionBinding(target.Name) {
+				c.fail(target.Line, "except binding is read-only")
+			}
 			itemType, err := c.resolveTypeRef(target.Type)
 			if err != nil {
 				c.fail(target.Line, err.Error())
@@ -308,6 +325,57 @@ func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, 
 			}
 		}
 		c.inferExpr(s.Expr, scope, classInfo)
+	}
+}
+
+func (c *checker) checkTry(s *TryStmt, outer *scope, classInfo *ClassInfo, expectedReturn Type) {
+	body := outer.child()
+	c.checkStatements(s.Body, body, classInfo, expectedReturn)
+	c.checkStatements(s.Else, body, classInfo, expectedReturn)
+	var normal []*scope
+	if !endsBlock(s.Body) && !endsBlock(s.Else) {
+		normal = append(normal, body)
+	}
+	var previous []string
+	for i := range s.Excepts {
+		clause := &s.Excepts[i]
+		typ, err := c.resolveTypeRef(TypeRef{Name: clause.Type})
+		if err != nil || typ.Kind != TypeException {
+			c.fail(clause.Line, fmt.Sprintf("except requires an Error type, got %s", clause.Type))
+			typ = exceptionType(errorKind)
+		}
+		clause.CheckedType = typ.Name
+		for _, earlier := range previous {
+			if exceptionMatches(typ.Name, earlier) {
+				c.fail(clause.Line, fmt.Sprintf("except %s is already covered by %s", typ, earlier))
+				break
+			}
+		}
+		previous = append(previous, typ.Name)
+		handler := outer.child()
+		handler.except = true
+		handler.binding = clause.Binding
+		if clause.Binding != "" {
+			handler.set(clause.Binding, typ)
+		}
+		c.checkStatements(clause.Body, handler, classInfo, expectedReturn)
+		// The temporary binding does not initialize an outer name it shadows.
+		if clause.Binding != "" {
+			handler.initialized[clause.Binding] = outer.initialized[clause.Binding]
+		}
+		if !endsBlock(clause.Body) {
+			normal = append(normal, handler)
+		}
+	}
+	// Both handlers and finally may run before the first statement completes.
+	cleanup := outer.child()
+	c.checkStatements(s.Finally, cleanup, classInfo, expectedReturn)
+	for name := range outer.initialized {
+		initialized := len(normal) > 0
+		for _, path := range normal {
+			initialized = initialized && path.initialized[name]
+		}
+		outer.initialized[name] = initialized || cleanup.initialized[name]
 	}
 }
 
@@ -340,10 +408,10 @@ func (c *checker) checkFunction(fn *FuncDefStmt, classInfo *ClassInfo) {
 		child.set(param.Name, typ)
 	}
 	c.checkStatements(fn.Body, child, classInfo, ret)
-	if !alwaysReturns(fn.Body) {
+	if !endsBlock(fn.Body) {
 		c.checkInitializedFields(fn.Line, child)
 	}
-	if !assignable(NoneType(), ret) && !alwaysReturns(fn.Body) {
+	if !assignable(NoneType(), ret) && !endsBlock(fn.Body) {
 		c.fail(fn.Line, fmt.Sprintf("%s must return %s on every path", fn.Name, ret))
 	}
 }
@@ -390,6 +458,10 @@ func (c *checker) checkAnnAssign(stmt *AnnAssignStmt, scope *scope, classInfo *C
 	}
 	switch target := stmt.Target.(type) {
 	case *NameExpr:
+		if scope.exceptionBinding(target.Name) {
+			c.fail(stmt.Line, "except binding is read-only")
+			return
+		}
 		if previous, exists := scope.lookup(target.Name); exists {
 			if _, declared := scope.initialized[target.Name]; declared && !previous.Equal(typ) {
 				c.fail(stmt.Line, fmt.Sprintf("cannot redeclare %s from %s to %s", target.Name, previous, typ))
@@ -427,6 +499,10 @@ func (c *checker) checkAssign(stmt *AssignStmt, scope *scope, classInfo *ClassIn
 	}
 	switch target := stmt.Target.(type) {
 	case *NameExpr:
+		if scope.exceptionBinding(target.Name) {
+			c.fail(stmt.Line, "except binding is read-only")
+			return
+		}
 		expected, ok := scope.lookup(target.Name)
 		if !ok {
 			c.fail(stmt.Line, "variable declarations must use an explicit type")
@@ -605,7 +681,10 @@ func (c *checker) inferExpr(expr Expr, scope *scope, classInfo *ClassInfo) Type 
 
 func (c *checker) inferAttr(expr *AttrExpr, scope *scope, classInfo *ClassInfo) Type {
 	objType := c.inferExpr(expr.Object, scope, classInfo)
-	if objType.Kind == TypeNative || objType.Kind == TypeModule {
+	if objType.Kind == TypeException && (expr.Name == "kind" || expr.Name == "message") {
+		return StrType()
+	}
+	if objType.Kind == TypeNative || objType.Kind == TypeModule || objType.Kind == TypeException {
 		if typ, ok := objType.Members[expr.Name]; ok {
 			return typ
 		}
@@ -701,7 +780,7 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 			c.fail(expr.Line, "Typhon calls do not accept keyword arguments")
 		}
 	}
-	if name, ok := expr.Callee.(*NameExpr); ok {
+	if name, ok := expr.Callee.(*NameExpr); ok && !scope.exceptionBinding(name.Name) {
 		if name.Name == "dict" {
 			if len(expr.Args) == 0 {
 				return dictType(Type{Kind: TypeNever}, Type{Kind: TypeNever})
@@ -729,6 +808,9 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 		}
 	}
 	calleeType := c.inferExpr(expr.Callee, scope, classInfo)
+	if calleeType.Kind == typeExceptionConstructor {
+		calleeType = nativeFuncType(calleeType.Name, []Type{StrType()}, exceptionType(calleeType.Name), 0)
+	}
 	if calleeType.Kind == TypeAny || calleeType.Kind == TypePy {
 		for _, arg := range expr.Args {
 			c.inferExpr(arg, scope, classInfo)
@@ -905,6 +987,9 @@ func (c *checker) resolveTypeRef(ref TypeRef) (Type, error) {
 			return Type{Kind: TypeClass, Name: name, Class: classInfo}, nil
 		}
 		if typ, ok := c.globals[name]; ok {
+			if typ.Kind == typeExceptionConstructor {
+				return exceptionType(typ.Name), nil
+			}
 			return typ, nil
 		}
 		if module, member, ok := strings.Cut(name, "."); ok {
@@ -928,6 +1013,8 @@ type scope struct {
 	values      map[string]Type
 	parent      *scope
 	globals     map[string]Type
+	except      bool
+	binding     string
 }
 
 func newScope(globals map[string]Type) *scope {
@@ -948,13 +1035,46 @@ func (s *scope) set(name string, typ Type) {
 	s.initialized[name] = true
 }
 
-func alwaysReturns(stmts []Stmt) bool {
-	for _, stmt := range stmts {
-		if _, ok := stmt.(*ReturnStmt); ok {
+func (s *scope) inExcept() bool {
+	for ; s != nil; s = s.parent {
+		if s.except {
 			return true
 		}
-		if branch, ok := stmt.(*IfStmt); ok && alwaysReturns(branch.Body) && alwaysReturns(branch.Else) {
+	}
+	return false
+}
+
+func (s *scope) exceptionBinding(name string) bool {
+	for ; s != nil; s = s.parent {
+		if s.binding == name {
 			return true
+		}
+	}
+	return false
+}
+
+func endsBlock(stmts []Stmt) bool {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *ReturnStmt, *RaiseStmt, *BreakStmt, *ContinueStmt:
+			return true
+		case *IfStmt:
+			if endsBlock(s.Body) && endsBlock(s.Else) {
+				return true
+			}
+		case *TryStmt:
+			if endsBlock(s.Finally) {
+				return true
+			}
+			if endsBlock(s.Body) || endsBlock(s.Else) {
+				ends := true
+				for _, clause := range s.Excepts {
+					ends = ends && endsBlock(clause.Body)
+				}
+				if ends {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -974,6 +1094,13 @@ func (c *checker) declareLocals(stmts []Stmt, scope *scope) {
 			c.declareLocals(s.Else, scope)
 		case *WhileStmt:
 			c.declareLocals(s.Body, scope)
+		case *TryStmt:
+			c.declareLocals(s.Body, scope)
+			for _, clause := range s.Excepts {
+				c.declareLocals(clause.Body, scope)
+			}
+			c.declareLocals(s.Else, scope)
+			c.declareLocals(s.Finally, scope)
 		case *ForStmt:
 			for _, target := range s.Targets {
 				typ, _ := c.resolveTypeRef(target.Type)

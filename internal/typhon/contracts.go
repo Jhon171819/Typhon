@@ -75,6 +75,8 @@ func validateAtomicValue(value Value, typ Type) (Value, error) {
 	}
 	ok := false
 	switch typ.Kind {
+	case TypeException:
+		ok = value.Kind == ValueException && value.Exception != nil && exceptionMatches(value.Exception.kind, typ.Name)
 	case TypeNative:
 		ok = value.Kind == ValueNativeObject && value.NativeObject != nil && value.NativeObject.Type.Equal(typ)
 	case TypeNone:

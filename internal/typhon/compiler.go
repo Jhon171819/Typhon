@@ -7,16 +7,19 @@ type compiler struct {
 }
 
 type functionCompiler struct {
-	loops    []*loopCompiler
-	line     int
-	module   *Module
-	fn       *Function
-	isModule bool
+	exceptionLocals map[string]int
+	tryDepth        int
+	loops           []*loopCompiler
+	line            int
+	module          *Module
+	fn              *Function
+	isModule        bool
 }
 
 type loopCompiler struct {
-	start  int
-	breaks []int
+	start    int
+	breaks   []int
+	tryDepth int
 }
 
 func CompileModule(module *Module) (*Program, error) {
@@ -82,6 +85,13 @@ func (fc *functionCompiler) collectLocals(stmts []Stmt) {
 			fc.collectLocals(s.Else)
 		case *WhileStmt:
 			fc.collectLocals(s.Body)
+		case *TryStmt:
+			fc.collectLocals(s.Body)
+			for _, clause := range s.Excepts {
+				fc.collectLocals(clause.Body)
+			}
+			fc.collectLocals(s.Else)
+			fc.collectLocals(s.Finally)
 		}
 	}
 }
@@ -204,6 +214,17 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 			return err
 		}
 		fc.emit(Instr{Op: OpReturn})
+	case *TryStmt:
+		return fc.compileTry(s)
+	case *RaiseStmt:
+		if s.Value == nil {
+			fc.emit(Instr{Op: OpReraise})
+			return nil
+		}
+		if err := fc.compileExpr(s.Value); err != nil {
+			return err
+		}
+		fc.emit(Instr{Op: OpRaise})
 	case *IfStmt:
 		if err := fc.compileExpr(s.Cond); err != nil {
 			return err
@@ -223,7 +244,7 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 		}
 		fc.patch(end, len(fc.fn.Code))
 	case *WhileStmt:
-		loop := &loopCompiler{start: len(fc.fn.Code)}
+		loop := &loopCompiler{start: len(fc.fn.Code), tryDepth: fc.tryDepth}
 		fc.loops = append(fc.loops, loop)
 		if err := fc.compileExpr(s.Cond); err != nil {
 			return err
@@ -245,19 +266,20 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 			return fmt.Errorf("break requires a loop")
 		}
 		loop := fc.loops[len(fc.loops)-1]
-		loop.breaks = append(loop.breaks, fc.emit(Instr{Op: OpJump}))
+		loop.breaks = append(loop.breaks, fc.emitLoopJump(loop, 0))
 	case *ContinueStmt:
 		if len(fc.loops) == 0 {
 			return fmt.Errorf("continue requires a loop")
 		}
-		fc.emit(Instr{Op: OpJump, A: fc.loops[len(fc.loops)-1].start})
+		loop := fc.loops[len(fc.loops)-1]
+		fc.emitLoopJump(loop, loop.start)
 	case *ForStmt:
 		if err := fc.compileExpr(s.Iterable); err != nil {
 			return err
 		}
 		fc.emit(Instr{Op: OpIter})
 		start := len(fc.fn.Code)
-		loop := &loopCompiler{start: start}
+		loop := &loopCompiler{start: start, tryDepth: fc.tryDepth}
 		fc.loops = append(fc.loops, loop)
 		iterNext := fc.emit(Instr{Op: OpIterNext})
 		targets := s.Targets
@@ -302,6 +324,75 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 	return nil
 }
 
+func (fc *functionCompiler) emitLoopJump(loop *loopCompiler, target int) int {
+	if fc.tryDepth > loop.tryDepth {
+		return fc.emit(Instr{Op: OpLeave, A: target, Depth: loop.tryDepth})
+	}
+	return fc.emit(Instr{Op: OpJump, A: target})
+}
+
+func (fc *functionCompiler) compileTry(s *TryStmt) error {
+	index := len(fc.fn.regions)
+	fc.fn.regions = append(fc.fn.regions, exceptionRegion{})
+	fc.emit(Instr{Op: OpTry, A: index})
+	outerDepth := fc.tryDepth
+	fc.tryDepth++
+	defer func() { fc.tryDepth = outerDepth }()
+	for _, child := range s.Body {
+		if err := fc.compileStmt(child); err != nil {
+			return err
+		}
+	}
+	region := exceptionRegion{bodyEnd: len(fc.fn.Code), cleanup: -1}
+	for _, child := range s.Else {
+		if err := fc.compileStmt(child); err != nil {
+			return err
+		}
+	}
+	leaves := []int{fc.emit(Instr{Op: OpLeave, Depth: outerDepth})}
+	for _, clause := range s.Excepts {
+		handler := exceptionHandler{kind: clause.CheckedType, target: len(fc.fn.Code), slot: -1}
+		if handler.kind == "" {
+			return fmt.Errorf("except clause must be type checked before compilation")
+		}
+		previous, shadowed := fc.exceptionLocals[clause.Binding]
+		if clause.Binding != "" {
+			handler.slot = len(fc.fn.LocalNames)
+			fc.fn.LocalNames = append(fc.fn.LocalNames, clause.Binding)
+			if fc.exceptionLocals == nil {
+				fc.exceptionLocals = map[string]int{}
+			}
+			fc.exceptionLocals[clause.Binding] = handler.slot
+		}
+		for _, child := range clause.Body {
+			if err := fc.compileStmt(child); err != nil {
+				return err
+			}
+		}
+		if shadowed {
+			fc.exceptionLocals[clause.Binding] = previous
+		} else {
+			delete(fc.exceptionLocals, clause.Binding)
+		}
+		region.handlers = append(region.handlers, handler)
+		leaves = append(leaves, fc.emit(Instr{Op: OpLeave, Depth: outerDepth}))
+	}
+	if len(s.Finally) > 0 {
+		region.cleanup = len(fc.fn.Code)
+		for _, child := range s.Finally {
+			if err := fc.compileStmt(child); err != nil {
+				return err
+			}
+		}
+		fc.emit(Instr{Op: OpEndFinally})
+	}
+	for _, pos := range leaves {
+		fc.patch(pos, len(fc.fn.Code))
+	}
+	fc.fn.regions[index] = region
+	return nil
+}
+
 func (fc *functionCompiler) compileStore(target Expr) error {
 	if typ, ok := fc.module.Contracts[target]; ok {
 		fc.emit(Instr{Op: OpCheckType, Type: typ})
@@ -327,7 +418,9 @@ func (fc *functionCompiler) compileStore(target Expr) error {
 func (fc *functionCompiler) compileExpr(expr Expr) error {
 	switch e := expr.(type) {
 	case *NameExpr:
-		if idx, ok := fc.fn.LocalIndex[e.Name]; ok && !fc.isModule {
+		if idx, ok := fc.exceptionLocals[e.Name]; ok {
+			fc.emit(Instr{Op: OpLoadLocal, A: idx})
+		} else if idx, ok := fc.fn.LocalIndex[e.Name]; ok && !fc.isModule {
 			fc.emit(Instr{Op: OpLoadLocal, A: idx})
 		} else {
 			fc.emit(Instr{Op: OpLoadGlobal, S: e.Name})

@@ -140,6 +140,33 @@ type ReturnStmt struct {
 func (*ReturnStmt) stmtNode()     {}
 func (s *ReturnStmt) LineNo() int { return s.Line }
 
+type TryStmt struct {
+	Line    int
+	Body    []Stmt
+	Excepts []ExceptClause
+	Else    []Stmt
+	Finally []Stmt
+}
+
+type ExceptClause struct {
+	Line        int
+	Type        string
+	Binding     string
+	Body        []Stmt
+	CheckedType string
+}
+
+func (*TryStmt) stmtNode()     {}
+func (s *TryStmt) LineNo() int { return s.Line }
+
+type RaiseStmt struct {
+	Line  int
+	Value Expr
+}
+
+func (*RaiseStmt) stmtNode()     {}
+func (s *RaiseStmt) LineNo() int { return s.Line }
+
 type IfStmt struct {
 	Else []Stmt
 	Line int

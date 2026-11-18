@@ -5,23 +5,25 @@ import "strings"
 type TypeKind string
 
 const (
-	TypeAny     TypeKind = "any"
-	TypeNone    TypeKind = "none"
-	TypeInt     TypeKind = "int"
-	TypeFloat   TypeKind = "float"
-	TypeStr     TypeKind = "str"
-	TypeBool    TypeKind = "bool"
-	TypeList    TypeKind = "list"
-	TypeDict    TypeKind = "dict"
-	TypeClass   TypeKind = "class"
-	TypeFunc    TypeKind = "func"
-	TypeTask    TypeKind = "task"
-	TypeUnion   TypeKind = "union"
-	TypeModule  TypeKind = "module"
-	TypePy      TypeKind = "pyobject"
-	TypeLiteral TypeKind = "literal"
-	TypeNever   TypeKind = "never"
-	TypeNative  TypeKind = "native"
+	TypeAny                  TypeKind = "any"
+	TypeNone                 TypeKind = "none"
+	TypeInt                  TypeKind = "int"
+	TypeFloat                TypeKind = "float"
+	TypeStr                  TypeKind = "str"
+	TypeBool                 TypeKind = "bool"
+	TypeList                 TypeKind = "list"
+	TypeDict                 TypeKind = "dict"
+	TypeClass                TypeKind = "class"
+	TypeFunc                 TypeKind = "func"
+	TypeTask                 TypeKind = "task"
+	TypeUnion                TypeKind = "union"
+	TypeModule               TypeKind = "module"
+	TypePy                   TypeKind = "pyobject"
+	TypeLiteral              TypeKind = "literal"
+	TypeNever                TypeKind = "never"
+	TypeNative               TypeKind = "native"
+	TypeException            TypeKind = "exception"
+	typeExceptionConstructor TypeKind = "exception_constructor"
 )
 
 type Type struct {
@@ -104,7 +106,7 @@ func (t Type) Equal(other Type) bool {
 	switch t.Kind {
 	case TypeDict:
 		return t.Key != nil && other.Key != nil && t.Elem != nil && other.Elem != nil && t.Key.Equal(*other.Key) && t.Elem.Equal(*other.Elem)
-	case TypeNative, TypeModule:
+	case TypeNative, TypeModule, TypeException, typeExceptionConstructor:
 		return t.Name == other.Name
 	case TypeList:
 		if t.Elem == nil || other.Elem == nil {
@@ -165,6 +167,9 @@ func assignable(from Type, to Type) bool {
 	}
 	if from.Kind == TypeInt && to.Kind == TypeFloat {
 		return true
+	}
+	if from.Kind == TypeException && to.Kind == TypeException {
+		return exceptionMatches(from.Name, to.Name)
 	}
 	if from.Kind == TypePy || to.Kind == TypePy {
 		return true

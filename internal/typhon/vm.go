@@ -19,11 +19,13 @@ type VM struct {
 }
 
 type frame struct {
-	fn     *Function
-	locals []Value
-	stack  []Value
-	pc     int
-	module *LoadedModule
+	fn      *Function
+	locals  []Value
+	stack   []Value
+	pc      int
+	module  *LoadedModule
+	line    int
+	regions []activeRegion
 }
 
 func runtimeGlobals() map[string]Value {
@@ -42,6 +44,9 @@ func runtimeGlobals() map[string]Value {
 	globals["False"] = BoolValue(false)
 	globals["__name__"] = StringValue("")
 	globals["__file__"] = StringValue("")
+	for _, name := range exceptionNames {
+		globals[name] = exceptionConstructor(name)
+	}
 	return globals
 }
 
@@ -49,7 +54,7 @@ func nativeValue(name string, fn func(*VM, []Value) (Value, error)) Value {
 	return Value{Kind: ValueNative, Native: &NativeFunc{Name: name, Fn: fn}}
 }
 
-func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr error) {
+func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 	if vm.depth == 0 {
 		vm.engine.execMu.Lock()
 		defer vm.engine.execMu.Unlock()
@@ -57,16 +62,10 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 	vm.depth++
 	defer func() { vm.depth-- }()
 	if vm.depth > 256 {
-		return NoneValue(), fmt.Errorf("Typhon call depth limit exceeded")
+		return NoneValue(), &executionStop{cause: errors.New("Typhon call depth limit exceeded")}
 	}
 	previousModule := vm.module
-	line := 0
-	defer func() {
-		vm.module = previousModule
-		if runErr != nil {
-			runErr = fmt.Errorf("%s:%d in %s: %w", fn.ModulePath, line, fn.Name, runErr)
-		}
-	}()
+	defer func() { vm.module = previousModule }()
 	if fn.Module != nil {
 		vm.module = fn.Module
 	}
@@ -74,7 +73,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 		vm.module = fn.Module
 	}
 	if len(args) != len(fn.Params) {
-		return NoneValue(), fmt.Errorf("%s expected %d arguments, got %d", fn.Name, len(fn.Params), len(args))
+		return NoneValue(), traceFrame(fn, 0, fmt.Errorf("%s expected %d arguments, got %d", fn.Name, len(fn.Params), len(args)))
 	}
 	locals := make([]Value, len(fn.LocalNames))
 	for i, arg := range args {
@@ -82,25 +81,68 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			var err error
 			arg, err = validateValue(arg, fn.Signature.Params[i])
 			if err != nil {
-				return NoneValue(), fmt.Errorf("argument %s: %w", fn.Params[i], err)
+				return NoneValue(), traceFrame(fn, 0, fmt.Errorf("argument %s: %w", fn.Params[i], err))
 			}
 		}
 		locals[i] = arg
 	}
 	f := &frame{fn: fn, locals: locals, module: vm.module}
+	for {
+		exit, err := vm.runFrame(f)
+		if stop := vm.executionError(); stop != nil {
+			var stopped *executionStop
+			if !errors.As(err, &stopped) {
+				err = stop
+			}
+		}
+		if err != nil {
+			exit = completion{target: -1, err: traceFrame(fn, f.line, err)}
+		}
+		if f.unwind(exit) {
+			continue
+		}
+		if exit.err != nil {
+			return NoneValue(), exit.err
+		}
+		if fn.Signature.Return != nil {
+			value, err := validateValue(exit.value, *fn.Signature.Return)
+			if err != nil {
+				return NoneValue(), traceFrame(fn, exit.line, err)
+			}
+			return value, nil
+		}
+		return exit.value, nil
+	}
+}
 
+func (vm *VM) runFrame(f *frame) (completion, error) {
+	fn := f.fn
 	for f.pc < len(fn.Code) {
-		if err := vm.context().Err(); err != nil {
-			return NoneValue(), err
+		if err := vm.executionError(); err != nil {
+			return completion{}, err
 		}
 		vm.instructions++
 		if vm.instructions > 10_000_000 {
-			return NoneValue(), fmt.Errorf("instruction budget exceeded")
+			return completion{}, &executionStop{cause: errors.New("instruction budget exceeded")}
 		}
 		instr := fn.Code[f.pc]
-		line = instr.Line
+		f.line = instr.Line
 		f.pc++
 		switch instr.Op {
+		case OpTry:
+			f.regions = append(f.regions, activeRegion{spec: &fn.regions[instr.A], height: len(f.stack), slot: -1})
+		case OpLeave:
+			return completion{target: instr.A, depth: instr.Depth}, nil
+		case OpEndFinally:
+			return f.regions[len(f.regions)-1].pending, nil
+		case OpRaise:
+			value := f.pop()
+			if value.Kind != ValueException || value.Exception == nil {
+				return completion{}, &Exception{kind: validationKind, message: fmt.Sprintf("raise requires Error, got %s", value.Kind)}
+			}
+			return completion{}, value.Exception
+		case OpReraise:
+			return completion{target: -1, err: f.reraise()}, nil
 		case OpDup:
 			f.push(f.peek())
 		case OpJumpIfTrue:
@@ -114,12 +156,12 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 				continue
 			}
 			if value.Kind != ValueInt && value.Kind != ValueFloat {
-				return NoneValue(), fmt.Errorf("unary sign requires a number")
+				return completion{}, fmt.Errorf("unary sign requires a number")
 			}
 			if instr.S == "-" {
 				if value.Kind == ValueInt {
 					if value.Int == math.MinInt64 {
-						return NoneValue(), fmt.Errorf("int64 overflow in unary -")
+						return completion{}, fmt.Errorf("int64 overflow in unary -")
 					}
 					value.Int = -value.Int
 				} else {
@@ -131,7 +173,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			right, left := f.pop(), f.pop()
 			cmp, err := compareValues(left, right)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			result := false
 			switch instr.S {
@@ -148,7 +190,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 		case OpCheckType:
 			value, err := validateValue(f.pop(), instr.Type)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(value)
 		case OpConst:
@@ -156,14 +198,14 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 		case OpLoadGlobal:
 			value, ok := f.module.Globals[instr.S]
 			if !ok {
-				return NoneValue(), fmt.Errorf("%s: unknown global %q", fn.Name, instr.S)
+				return completion{}, fmt.Errorf("%s: unknown global %q", fn.Name, instr.S)
 			}
 			f.push(value)
 		case OpStoreGlobal:
 			f.module.Globals[instr.S] = f.pop()
 		case OpLoadLocal:
 			if f.locals[instr.A].Kind == "" {
-				return NoneValue(), fmt.Errorf("variable %q is not initialized", fn.LocalNames[instr.A])
+				return completion{}, fmt.Errorf("variable %q is not initialized", fn.LocalNames[instr.A])
 			}
 			f.push(f.locals[instr.A])
 		case OpStoreLocal:
@@ -175,7 +217,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			left := f.pop()
 			value, err := arithmetic(instr.Op, left, right)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(value)
 		case OpEqual:
@@ -215,15 +257,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			callee := f.pop()
 			result, err := vm.callValue(callee, args[:positionalCount], kwargs)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(result)
 		case OpReturn:
-			value := f.pop()
-			if fn.Signature.Return != nil {
-				return validateValue(value, *fn.Signature.Return)
-			}
-			return value, nil
+			return completion{target: -1, value: f.pop(), line: instr.Line}, nil
 		case OpMakeList:
 			items := make([]Value, instr.A)
 			for i := instr.A - 1; i >= 0; i-- {
@@ -232,7 +270,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			f.push(ListValue(items))
 		case OpMakeDict:
 			if instr.A > maxCollectionItems {
-				return NoneValue(), fmt.Errorf("dictionary size limit exceeded")
+				return completion{}, fmt.Errorf("dictionary size limit exceeded")
 			}
 			entries := make([]DictEntry, instr.A)
 			for i := instr.A - 1; i >= 0; i-- {
@@ -242,7 +280,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			dict := DictValue()
 			for _, entry := range entries {
 				if err := dict.Dict.put(entry.Key, entry.Value); err != nil {
-					return NoneValue(), err
+					return completion{}, err
 				}
 			}
 			f.push(dict)
@@ -250,36 +288,36 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			key, obj := f.pop(), f.pop()
 			value, err := getIndex(obj, key)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(value)
 		case OpSetIndex:
 			key, obj, value := f.pop(), f.pop(), f.pop()
 			if err := setIndex(obj, key, value); err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 		case OpDelIndex:
 			key, obj := f.pop(), f.pop()
 			if obj.Kind != ValueDict || obj.Dict == nil {
-				return NoneValue(), fmt.Errorf("del requires a dictionary")
+				return completion{}, fmt.Errorf("del requires a dictionary")
 			}
 			key, err := obj.Dict.checkKey(key)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			i, ok, err := obj.Dict.lookup(key)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			if !ok {
-				return NoneValue(), fmt.Errorf("KeyError: %s", key.String())
+				return completion{}, fmt.Errorf("KeyError: %s", key.String())
 			}
 			obj.Dict.remove(i)
 		case OpContains:
 			obj, key := f.pop(), f.pop()
 			ok, err := containsValue(obj, key)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			if instr.S == "not in" {
 				ok = !ok
@@ -288,26 +326,26 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 		case OpGetAttr:
 			value, err := vm.getAttr(f.pop(), instr.S)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(value)
 		case OpSetAttr:
 			value := f.pop()
 			object := f.pop()
 			if err := vm.setAttr(object, instr.S, value); err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 		case OpIter:
 			iterable := f.pop()
 			items, err := collectionValues(iterable)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.push(Value{Kind: ValueIterator, Iterator: &Iterator{values: items}})
 		case OpIterNext:
 			iter := f.peek()
 			if iter.Kind != ValueIterator || iter.Iterator == nil {
-				return NoneValue(), fmt.Errorf("invalid iterator")
+				return completion{}, fmt.Errorf("invalid iterator")
 			}
 			if iter.Iterator.index >= len(iter.Iterator.values) {
 				f.pc = instr.A
@@ -320,13 +358,13 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			value := f.pop()
 			items, err := unpackValues(value, len(instr.Names))
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			for i, name := range instr.Names {
 				if i < len(instr.Types) {
 					items[i], err = validateValue(items[i], instr.Types[i])
 					if err != nil {
-						return NoneValue(), err
+						return completion{}, err
 					}
 				}
 				if idx, ok := f.fn.LocalIndex[name]; ok && f.fn.Name != "<module>" {
@@ -349,11 +387,11 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			}
 			bridge, err := vm.engine.PythonBridge()
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			module, err := bridge.ImportModule(instr.S)
 			if err != nil {
-				return NoneValue(), err
+				return completion{}, err
 			}
 			f.module.Globals[instr.Names[0]] = module
 		case OpImportFrom:
@@ -361,7 +399,7 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 				for _, name := range instr.Names {
 					value, ok := module.Module.Exports[name]
 					if !ok {
-						return NoneValue(), fmt.Errorf("module %q has no export %q", instr.S, name)
+						return completion{}, fmt.Errorf("module %q has no export %q", instr.S, name)
 					}
 					f.module.Globals[name] = value
 				}
@@ -370,17 +408,17 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			if isPythonImport(instr.S) {
 				bridge, err := vm.engine.PythonBridge()
 				if err != nil {
-					return NoneValue(), err
+					return completion{}, err
 				}
 				module, err := bridge.ImportModule(instr.S)
 				if err != nil {
-					return NoneValue(), err
+					return completion{}, err
 				}
 				pyModule := module.PyObject
 				for _, name := range instr.Names {
 					value, err := bridge.GetAttr(pyModule, name)
 					if err != nil {
-						return NoneValue(), err
+						return completion{}, err
 					}
 					f.module.Globals[name] = value
 				}
@@ -389,21 +427,21 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			imported, err := vm.engine.loadModuleByNameLocked(instr.S, filepathDir(f.module.Path))
 			if err != nil {
 				if !errors.Is(err, ErrModuleNotFound) {
-					return NoneValue(), err
+					return completion{}, err
 				}
 				bridge, bridgeErr := vm.engine.PythonBridge()
 				if bridgeErr != nil {
-					return NoneValue(), err
+					return completion{}, err
 				}
 				module, importErr := bridge.ImportModule(instr.S)
 				if importErr != nil {
-					return NoneValue(), err
+					return completion{}, err
 				}
 				pyModule := module.PyObject
 				for _, name := range instr.Names {
 					value, attrErr := bridge.GetAttr(pyModule, name)
 					if attrErr != nil {
-						return NoneValue(), attrErr
+						return completion{}, attrErr
 					}
 					f.module.Globals[name] = value
 				}
@@ -412,19 +450,19 @@ func (vm *VM) runFunction(fn *Function, args []Value) (result Value, runErr erro
 			for _, name := range instr.Names {
 				value, ok := imported.Globals[name]
 				if !ok {
-					return NoneValue(), fmt.Errorf("module %q has no export %q", instr.S, name)
+					return completion{}, fmt.Errorf("module %q has no export %q", instr.S, name)
 				}
 				f.module.Globals[name] = value
 			}
 		case OpString:
 			value := f.pop()
 			if instr.S == ".2f" && value.Kind != ValueInt && value.Kind != ValueFloat {
-				return NoneValue(), fmt.Errorf(".2f format requires a number")
+				return completion{}, fmt.Errorf(".2f format requires a number")
 			}
 			f.push(StringValue(formatValue(value, instr.S)))
 		}
 	}
-	return NoneValue(), nil
+	return completion{target: -1, value: NoneValue()}, nil
 }
 
 func filepathDir(path string) string {
@@ -447,7 +485,7 @@ func runtimeClass(spec *ClassSpec, module *LoadedModule) *RuntimeClass {
 }
 
 func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Value, error) {
-	if err := vm.context().Err(); err != nil {
+	if err := vm.executionError(); err != nil {
 		return NoneValue(), err
 	}
 	switch callee.Kind {
@@ -502,6 +540,13 @@ func (vm *VM) callClass(class *RuntimeClass, args []Value) (Value, error) {
 
 func (vm *VM) getAttr(value Value, name string) (Value, error) {
 	switch value.Kind {
+	case ValueException:
+		switch name {
+		case "kind":
+			return StringValue(value.Exception.Kind()), nil
+		case "message":
+			return StringValue(value.Exception.Message()), nil
+		}
 	case ValueNativeObject:
 		if value.NativeObject.Owner != nil && value.NativeObject.Owner != vm.engine {
 			return NoneValue(), fmt.Errorf("native object belongs to another Engine")
@@ -629,9 +674,9 @@ func nativeJoin(vm *VM, args []Value) (Value, error) {
 	select {
 	case <-args[0].Task.done:
 	case <-vm.context().Done():
-		waitErr = vm.context().Err()
+		waitErr = vm.executionError()
 	case <-timer.C:
-		waitErr = fmt.Errorf("join timed out after %s; execution cancelled", timeout)
+		waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled)}
 		vm.engine.cancel()
 		vm.engine.bridgeMu.Lock()
 		bridge := vm.engine.bridge
@@ -644,6 +689,7 @@ func nativeJoin(vm *VM, args []Value) (Value, error) {
 	if waitErr != nil {
 		return NoneValue(), waitErr
 	}
+	args[0].Task.observed = true
 	result := args[0].Task.result
 	return result.value, result.err
 }

@@ -26,6 +26,7 @@ const (
 	ValueIterator     ValueKind = "iterator"
 	ValuePyObject     ValueKind = "pyobject"
 	ValueNativeObject ValueKind = "native_object"
+	ValueException    ValueKind = "exception"
 )
 
 type Value struct {
@@ -47,6 +48,7 @@ type Value struct {
 	Task         *Task
 	Iterator     *Iterator
 	PyObject     *PyObject
+	Exception    *Exception
 }
 
 type NativeFunc struct {
@@ -87,6 +89,7 @@ type BoundMethod struct {
 type Task struct {
 	cancel    context.CancelFunc
 	cancelled bool
+	observed  bool
 	done      chan struct{}
 	result    taskResult
 }
@@ -137,6 +140,8 @@ func (v Value) stringValue(depth int, seen map[any]bool) string {
 		return "<depth limit>"
 	}
 	switch v.Kind {
+	case ValueException:
+		return v.Exception.Error()
 	case ValueNativeObject:
 		return "<" + v.NativeObject.Type.Name + ">"
 	case ValueNone:
@@ -304,6 +309,8 @@ func equalValues(left Value, right Value, seen map[[2]any]bool) bool {
 		return left.Object == right.Object
 	case ValueNativeObject:
 		return left.NativeObject == right.NativeObject
+	case ValueException:
+		return left.Exception == right.Exception
 	case ValueClass:
 		return left.Class == right.Class
 	default:

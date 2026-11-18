@@ -197,6 +197,18 @@ func (p *parser) parseStmt(indent int) (Stmt, error) {
 		return p.parseFunc(line, indent)
 	case strings.HasPrefix(text, "if ") && strings.HasSuffix(text, ":"):
 		return p.parseIf(line, indent)
+	case text == "try:":
+		return p.parseTry(line, indent)
+	case text == "except:" || strings.HasPrefix(text, "except ") || text == "finally:":
+		return nil, syntaxError(p.path, line.line, "misplaced except or finally clause")
+	case text == "raise":
+		return &RaiseStmt{Line: line.line}, nil
+	case strings.HasPrefix(text, "raise "):
+		expr, err := parseExpr(strings.TrimSpace(strings.TrimPrefix(text, "raise ")), line.line)
+		if err != nil {
+			return nil, syntaxError(p.path, line.line, err.Error())
+		}
+		return &RaiseStmt{Line: line.line, Value: expr}, nil
 	case strings.HasPrefix(text, "while ") && strings.HasSuffix(text, ":"):
 		cond, err := parseExpr(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, "while "), ":")), line.line)
 		if err != nil {
@@ -407,6 +419,66 @@ func (p *parser) parseIf(line sourceLine, indent int) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+func (p *parser) parseTry(line sourceLine, indent int) (Stmt, error) {
+	block := func(header sourceLine) ([]Stmt, error) {
+		if p.pos >= len(p.lines) || p.lines[p.pos].indent <= indent {
+			return nil, syntaxError(p.path, header.line, "exception clause body cannot be empty")
+		}
+		return p.parseBlock(p.lines[p.pos].indent)
+	}
+	s := &TryStmt{Line: line.line}
+	var err error
+	s.Body, err = block(line)
+	if err != nil {
+		return nil, err
+	}
+clauses:
+	for p.pos < len(p.lines) && p.lines[p.pos].indent == indent {
+		next := p.lines[p.pos]
+		switch {
+		case strings.HasPrefix(next.text, "except ") && strings.HasSuffix(next.text, ":") && s.Else == nil:
+			parts := strings.Fields(strings.TrimSuffix(strings.TrimPrefix(next.text, "except "), ":"))
+			if len(parts) != 1 && (len(parts) != 3 || parts[1] != "as") {
+				return nil, syntaxError(p.path, next.line, "expected 'except Type [as name]:'")
+			}
+			clause := ExceptClause{Line: next.line, Type: parts[0]}
+			names := []string{clause.Type}
+			if len(parts) == 3 {
+				clause.Binding = parts[2]
+				names = append(names, clause.Binding)
+			}
+			for _, name := range names {
+				expr, _ := parseExpr(name, next.line)
+				if id, ok := expr.(*NameExpr); !ok || id.Name != name {
+					return nil, syntaxError(p.path, next.line, "expected an identifier in except clause")
+				}
+			}
+			p.pos++
+			clause.Body, err = block(next)
+			s.Excepts = append(s.Excepts, clause)
+		case next.text == "else:" && len(s.Excepts) > 0 && s.Else == nil:
+			p.pos++
+			s.Else, err = block(next)
+		case next.text == "finally:":
+			p.pos++
+			s.Finally, err = block(next)
+			break clauses
+		default:
+			break clauses
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(s.Excepts) == 0 && s.Finally == nil {
+		return nil, syntaxError(p.path, line.line, "try requires a typed except or finally")
+	}
+	return s, nil
 }
 
 func (p *parser) parseFor(line sourceLine, indent int) (Stmt, error) {

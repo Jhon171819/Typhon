@@ -353,20 +353,32 @@ func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
 	err := e.executeModuleLocked(module, main)
 	if main {
 		if err != nil {
-			e.cancel()
+			e.stopTasks(err)
 		}
 		for i := 0; i < len(e.tasks); i++ {
 			task := e.tasks[i]
 			e.execMu.Unlock()
 			<-task.done
 			e.execMu.Lock()
-			if err == nil && task.result.err != nil && !(task.cancelled && errors.Is(task.result.err, context.Canceled)) {
+			if err == nil && !task.observed && task.result.err != nil && !(task.cancelled && errors.Is(task.result.err, context.Canceled)) {
 				err = fmt.Errorf("child task: %w", task.result.err)
-				e.cancel()
+				e.stopTasks(err)
 			}
+			task.observed = true
 		}
 	}
 	return err
+}
+
+func (e *Engine) stopTasks(err error) {
+	var exception *Exception
+	if !errors.As(err, &exception) {
+		e.cancel()
+		return
+	}
+	for _, task := range e.tasks {
+		task.cancel()
+	}
 }
 
 func (e *Engine) executeModuleLocked(module *LoadedModule, main bool) error {
