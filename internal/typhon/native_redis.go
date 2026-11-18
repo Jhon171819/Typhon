@@ -43,7 +43,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	}
 	options, err := redis.ParseURL(args[0].Str)
 	if err != nil {
-		return NoneValue(), fmt.Errorf("invalid Redis connection URL")
+		return NoneValue(), driverFailure("Redis", validationKind, err)
 	}
 	options.DialTimeout, options.ReadTimeout, options.WriteTimeout = timeout, timeout, timeout
 	options.ContextTimeoutEnabled = true
@@ -56,7 +56,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	cancel()
 	if err != nil {
 		_ = client.Close()
-		return NoneValue(), err
+		return NoneValue(), driverFailure("Redis", databaseKind, err)
 	}
 	var closed atomic.Bool
 	scope := vm.resourceScope()
@@ -65,7 +65,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 			return nil
 		}
 		scope.remove(&closed)
-		return client.Close()
+		return driverFailure("Redis", databaseKind, client.Close())
 	}
 	if err := scope.add(&closed, close); err != nil {
 		return NoneValue(), err
@@ -82,13 +82,13 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 			switch name {
 			case "ping":
 				value, err := client.Ping(ctx).Result()
-				return StringValue(value), err
+				return StringValue(value), driverFailure("Redis", databaseKind, err)
 			case "get":
 				value, err := client.Get(ctx, args[0].Str).Result()
 				if err == redis.Nil {
 					return NoneValue(), nil
 				}
-				return StringValue(value), err
+				return StringValue(value), driverFailure("Redis", databaseKind, err)
 			case "set":
 				var ttl time.Duration
 				if len(args) == 3 {
@@ -101,23 +101,23 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 						return NoneValue(), fmt.Errorf("Redis TTL must be at least 0.001 seconds")
 					}
 				}
-				return NoneValue(), client.Set(ctx, args[0].Str, args[1].Str, ttl).Err()
+				return NoneValue(), driverFailure("Redis", databaseKind, client.Set(ctx, args[0].Str, args[1].Str, ttl).Err())
 			case "delete":
 				value, err := client.Del(ctx, args[0].Str).Result()
-				return IntValue(value), err
+				return IntValue(value), driverFailure("Redis", databaseKind, err)
 			case "exists":
 				value, err := client.Exists(ctx, args[0].Str).Result()
-				return BoolValue(value > 0), err
+				return BoolValue(value > 0), driverFailure("Redis", databaseKind, err)
 			case "incr":
 				value, err := client.Incr(ctx, args[0].Str).Result()
-				return IntValue(value), err
+				return IntValue(value), driverFailure("Redis", databaseKind, err)
 			case "ttl":
 				value, err := client.PTTL(ctx, args[0].Str).Result()
 				// go-redis preserves -1/-2 as nanosecond sentinels.
 				if value < 0 {
-					return FloatValue(float64(value)), err
+					return FloatValue(float64(value)), driverFailure("Redis", databaseKind, err)
 				}
-				return FloatValue(value.Seconds()), err
+				return FloatValue(value.Seconds()), driverFailure("Redis", databaseKind, err)
 			case "command":
 				items := *args[0].List
 				if len(items) == 0 {
@@ -136,7 +136,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 					return NoneValue(), nil
 				}
 				if err != nil {
-					return NoneValue(), err
+					return NoneValue(), driverFailure("Redis", databaseKind, err)
 				}
 				return redisValue(value, 0)
 			}

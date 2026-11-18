@@ -142,7 +142,7 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, args[0].Str, args[1].Str, strings.NewReader(args[2].Str))
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("HTTP", validationKind, err)
 		}
 		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 			return NoneValue(), fmt.Errorf("HTTP URL must use http or https")
@@ -155,12 +155,12 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("HTTP", connectionKind, err)
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody+1))
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("HTTP", connectionKind, err)
 		}
 		return httpResponse(vm, int64(resp.StatusCode), string(body), resp.Header)
 	}
@@ -234,11 +234,11 @@ func nativeHTTPServe(vm *VM, args []Value) (Value, error) {
 	}
 	listener, err := net.Listen("tcp", args[0].Str)
 	if err != nil {
-		return NoneValue(), err
+		return NoneValue(), driverFailure("HTTP", connectionKind, err)
 	}
 	server := &http.Server{Handler: httpVMHandler(vm.engine, handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	scope := vm.resourceScope()
-	if err := scope.add(server, server.Close); err != nil {
+	if err := scope.add(server, func() error { return driverFailure("HTTP", connectionKind, server.Close()) }); err != nil {
 		_ = listener.Close()
 		return NoneValue(), err
 	}
@@ -259,5 +259,5 @@ func nativeHTTPServe(vm *VM, args []Value) (Value, error) {
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
-	return NoneValue(), err
+	return NoneValue(), driverFailure("HTTP", connectionKind, err)
 }

@@ -99,7 +99,7 @@ func (tx *postgresTransaction) rollback() error {
 	if err == pgx.ErrTxClosed {
 		return nil
 	}
-	return err
+	return driverFailure("PostgreSQL", databaseKind, err)
 }
 
 func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
@@ -112,7 +112,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 	}
 	config, err := pgxpool.ParseConfig(args[0].Str)
 	if err != nil {
-		return NoneValue(), fmt.Errorf("invalid PostgreSQL connection configuration")
+		return NoneValue(), driverFailure("PostgreSQL", validationKind, err)
 	}
 	config.MaxConns = 16
 	config.ConnConfig.ConnectTimeout = timeout
@@ -120,11 +120,11 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 	defer cancel()
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return NoneValue(), err
+		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
 	}
 	if err = pool.Ping(ctx); err != nil {
 		pool.Close()
-		return NoneValue(), err
+		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
 	}
 	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout, txs: map[*postgresTransaction]bool{}}
 	if err := db.scope.add(db, db.close); err != nil {
@@ -144,7 +144,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			ctx, cancel := driverContext(vm, db.timeout)
 			defer cancel()
 			tag, err := db.pool.Exec(ctx, args[0].Str, params...)
-			return IntValue(tag.RowsAffected()), err
+			return IntValue(tag.RowsAffected()), driverFailure("PostgreSQL", databaseKind, err)
 		}),
 		"query": driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
@@ -158,7 +158,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			defer cancel()
 			rows, err := db.pool.Query(ctx, args[0].Str, params...)
 			if err != nil {
-				return NoneValue(), err
+				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
 			return postgresRows(vm, rows)
 		}),
@@ -170,7 +170,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			defer cancel()
 			raw, err := db.pool.Begin(ctx)
 			if err != nil {
-				return NoneValue(), err
+				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
 			tx := &postgresTransaction{scope: vm.resourceScope(), parent: db, tx: raw}
 			db.mu.Lock()
@@ -206,7 +206,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			ctx, cancel := driverContext(vm, tx.parent.timeout)
 			defer cancel()
 			tag, err := tx.tx.Exec(ctx, args[0].Str, params...)
-			return IntValue(tag.RowsAffected()), err
+			return IntValue(tag.RowsAffected()), driverFailure("PostgreSQL", databaseKind, err)
 		}),
 		"query": driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
@@ -222,7 +222,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			defer cancel()
 			rows, err := tx.tx.Query(ctx, args[0].Str, params...)
 			if err != nil {
-				return NoneValue(), err
+				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
 			return postgresRows(vm, rows)
 		}),
@@ -240,7 +240,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			tx.parent.mu.Lock()
 			delete(tx.parent.txs, tx)
 			tx.parent.mu.Unlock()
-			return NoneValue(), err
+			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}),
 		"rollback": driverFunc(typ.Members["rollback"], func(vm *VM, args []Value) (Value, error) { return NoneValue(), tx.rollback() }),
 	})
@@ -304,7 +304,7 @@ func postgresValue(value any, depth int) (Value, error) {
 	case pgtype.Numeric:
 		encoded, err := value.Value()
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}
 		return postgresValue(encoded, depth+1)
 	case [16]byte:
@@ -339,7 +339,7 @@ func postgresValue(value any, depth int) (Value, error) {
 	case driver.Valuer:
 		encoded, err := value.Value()
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}
 		return postgresValue(encoded, depth+1)
 	default:
@@ -362,7 +362,7 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 		}
 		values, err := rows.Values()
 		if err != nil {
-			return NoneValue(), err
+			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}
 		var row []Value
 		for _, value := range values {
@@ -375,7 +375,7 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 		result = append(result, row)
 	}
 	if err := rows.Err(); err != nil {
-		return NoneValue(), err
+		return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 	}
 	typ := postgresDriverTypes()["Rows"]
 	getRow := func(index int64) ([]Value, error) {
@@ -393,7 +393,7 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 			}
 			col, ok := index[args[1].Str]
 			if !ok {
-				return NoneValue(), fmt.Errorf("unknown PostgreSQL column %q", args[1].Str)
+				return NoneValue(), fmt.Errorf("unknown PostgreSQL column")
 			}
 			return row[col], nil
 		}),

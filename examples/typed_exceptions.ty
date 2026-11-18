@@ -1,0 +1,28 @@
+import typhon.http as http
+
+upstream: http.Client = http.client(2)
+
+def handle(req: http.Request) -> http.Response:
+    try:
+        if req.path == '/health':
+            return http.response(200, 'ready')
+        if req.query('name') == '':
+            raise ValidationError('name is required')
+        result: http.Response = upstream.get('http://127.0.0.1:8081/profile')
+        if result.status != 200:
+            return http.response(502, 'upstream rejected the request')
+        return http.response(200, result.body)
+    except ValidationError as err:
+        return http.response(400, err.message)
+    except TimeoutError:
+        return http.response(504, 'upstream timed out')
+    except ConnectionError:
+        return http.response(502, 'upstream unavailable')
+    finally:
+        print('finished', req.path)
+
+if __name__ == '__main__':
+    try:
+        http.serve('127.0.0.1:8080', handle)
+    finally:
+        upstream.close()

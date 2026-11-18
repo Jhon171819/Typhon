@@ -2,6 +2,7 @@ package typhon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestNativeDriverContracts(t *testing.T) {
@@ -179,6 +182,171 @@ serve(%q, handle)
 	}
 }
 
+func TestNativeHTTPExceptions(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			<-r.Context().Done()
+			return
+		}
+		panic(http.ErrAbortHandler)
+	}))
+	defer upstream.Close()
+	failedURL := upstream.URL + "/failure?token=private-http-token"
+	engine := NewEngine()
+	defer engine.Close()
+	module, err := engine.LoadModule(sourceFile(t, fmt.Sprintf(`import typhon.http as http
+client: http.Client = http.client(0.15)
+def fetch() -> http.Response:
+    return client.get(%q)
+def handle(req: http.Request) -> http.Response:
+    if req.path == '/uncaught':
+        return fetch()
+    if req.path == '/handled':
+        try:
+            return fetch()
+        except ConnectionError as err:
+            return http.response(502, err.kind)
+    if req.path == '/timeout':
+        try:
+            return client.get(%q)
+        except TimeoutError:
+            return http.response(504, 'upstream timed out')
+    return http.response(200, 'ready')
+`, failedURL, upstream.URL+"/slow")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = engine.ExecuteModule(module, false); err != nil {
+		t.Fatal(err)
+	}
+	handler := httpVMHandler(engine, module.Globals["handle"])
+	for _, tc := range []struct {
+		path   string
+		status int
+		body   string
+	}{
+		{"/handled", 502, "ConnectionError"},
+		{"/ready", 200, "ready"},
+		{"/uncaught", 500, "internal server error\n"},
+		{"/ready", 200, "ready"},
+		{"/timeout", 504, "upstream timed out"},
+		{"/ready", 200, "ready"},
+	} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("GET", tc.path, nil))
+		if w.Code != tc.status || w.Body.String() != tc.body {
+			t.Fatalf("%s: got %d %q, want %d %q", tc.path, w.Code, w.Body.String(), tc.status, tc.body)
+		}
+	}
+	err = RunFile(sourceFile(t, fmt.Sprintf(`import typhon.http as http
+def fetch() -> http.Response:
+    client: http.Client = http.client()
+    return client.get(%q)
+try:
+    fetch()
+except ConnectionError:
+    raise
+`, failedURL)))
+	nativeException(t, err, connectionKind, "HTTP", "", "private-http-token")
+	for _, frame := range []string{":4 in fetch", ":6 in <module>"} {
+		if !strings.Contains(err.Error(), frame) {
+			t.Errorf("missing %s: %v", frame, err)
+		}
+	}
+}
+
+func TestRunTypedExceptionsExample(t *testing.T) {
+	engine := NewEngine()
+	defer engine.Close()
+	module, err := engine.LoadModule(examplePath(t, "typed_exceptions.ty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ExecuteModule(module, false); err != nil {
+		t.Fatal(err)
+	}
+	handler := httpVMHandler(engine, module.Globals["handle"])
+	for path, status := range map[string]int{"/": 400, "/health": 200} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != status {
+			t.Errorf("%s: got %d, want %d", path, w.Code, status)
+		}
+	}
+}
+
+func nativeException(t *testing.T, err error, kind, driver, code, secret string) {
+	t.Helper()
+	var exception *Exception
+	var cause *NativeCause
+	if !errors.As(err, &exception) || exception.Kind() != kind || !errors.As(err, &cause) || cause.Driver() != driver || cause.Code() != code {
+		t.Fatalf("unexpected error chain: %v", err)
+	}
+	for link := err; link != nil; link = errors.Unwrap(link) {
+		if strings.Contains(link.Error(), secret) {
+			t.Fatalf("driver leak in %T: %v", link, link)
+		}
+	}
+}
+
+func TestNativeRedisExceptions(t *testing.T) {
+	server := miniredis.RunT(t)
+	source := fmt.Sprintf(`import typhon.redis as redis
+db: redis.Connection = redis.connect(%q)
+try:
+    db.command(['private-redis-command'])
+except DatabaseError as problem:
+    print(problem.kind, db.ping())
+`, "redis://"+server.Addr())
+	path := sourceFile(t, source)
+	output, err := captureRun(t, path)
+	if err != nil || output != "DatabaseError PONG\n" {
+		t.Fatalf("could not recover from Redis reply: %q %v", output, err)
+	}
+	err = RunFile(sourceFile(t, source+"db.command(['private-redis-command'])\n"))
+	nativeException(t, err, databaseKind, "Redis", "", "private-redis-command")
+}
+
+func TestNativePostgresExceptionRedaction(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		backend := pgproto3.NewBackend(conn, conn)
+		if _, err := backend.ReceiveStartupMessage(); err != nil {
+			done <- err
+			return
+		}
+		backend.Send(&pgproto3.ErrorResponse{
+			Severity: "FATAL", Code: "28P01", Message: "server sent private-postgres-data",
+		})
+		done <- backend.Flush()
+	}()
+	dsn := "postgres://typhon:private-dsn-password@" + listener.Addr().String() + "/typhon?sslmode=disable"
+	err = RunFile(sourceFile(t, fmt.Sprintf("from typhon.postgres import connect\nconnect(%q, 1)\n", dsn)))
+	if serverErr := <-done; serverErr != nil {
+		t.Fatal(serverErr)
+	}
+	nativeException(t, err, databaseKind, "PostgreSQL", "28P01", "private-")
+	var raw *pgconn.PgError
+	if errors.As(err, &raw) {
+		t.Fatal("raw PostgreSQL error accessible through Unwrap")
+	}
+}
+
 func testRedisProgram(t *testing.T, url string) {
 	t.Helper()
 	source := fmt.Sprintf(`from typhon.redis import Connection, connect
@@ -293,6 +461,19 @@ db.close()
 	if err != nil || output != want {
 		t.Fatalf("got %q (%v), want %q", output, err, want)
 	}
+	recoverSource := fmt.Sprintf(`import typhon.postgres as pg
+db: pg.Connection = pg.connect(%q, 2)
+try:
+    db.query('SELECT private_missing_column')
+except DatabaseError as err:
+    print(err.kind, db.query('SELECT 1 AS id').get(0, 'id'))
+`, url)
+	output, err = captureRun(t, sourceFile(t, recoverSource))
+	if err != nil || output != "DatabaseError 1\n" {
+		t.Fatalf("could not recover from PostgreSQL reply: %q %v", output, err)
+	}
+	err = RunFile(sourceFile(t, recoverSource+"db.query('SELECT private_missing_column')\n"))
+	nativeException(t, err, databaseKind, "PostgreSQL", "42703", "private_missing_column")
 	for _, statement := range []string{
 		"db.query('SELECT missing_column')",
 		"db.query('SELECT 1').get(1, 'missing')",

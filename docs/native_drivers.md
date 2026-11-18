@@ -112,9 +112,9 @@ representação, use cast SQL para `text`. Arrays como parâmetros ainda não s�
 `commit` confirma apenas quando chamado explicitamente. Transações abandonadas
 fazem rollback ao encerrar a Engine; as abertas dentro de handlers HTTP fazem
 rollback ao terminar a requisição, inclusive em erros. Fechamento e rollback são
-idempotentes. Uso após fechamento/commit/rollback gera erro. Não há `try/except`
-na linguagem ainda: fora do HTTP, um erro de driver encerra o programa e limpa
-os recursos.
+idempotentes. Uso após fechamento/commit/rollback gera `ValidationError`.
+Uma falha SQL capturada pode deixar a transação abortada. Use `rollback()`
+para encerrá-la e continuar usando o pool.
 
 ## Redis
 
@@ -150,6 +150,11 @@ e respeitam o contexto da Engine/requisição. Clientes, pools e transações
 pertencem à Engine; recursos criados dentro de um callback HTTP pertencem
 àquela requisição. Compartilhe clientes criados antes de `serve` e feche-os
 quando não precisar mais deles. O host fecha os recursos restantes ao encerrar.
+
+Falhas recuperáveis de driver podem ser tratadas com `except` tipado.
+O [contrato de exceções](typed_exceptions.md) documenta o mapeamento para
+`ValidationError`, `TimeoutError`, `ConnectionError` e `DatabaseError`,
+o cancelamento do runtime e a cadeia sanitizada de erros.
 
 ```powershell
 go build -o typhon.exe ./cmd/typhon

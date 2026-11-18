@@ -50,11 +50,12 @@ The Go runtime currently supports:
 - `print`, `len`, `dict`, `range`, `enumerate`, `list.append`, and the string methods
   `strip`, `title`, and `upper`.
 - Local `.ty` modules through `from module import name`.
+- Typed recovery with `try`/`except`/`else`/`finally` and `raise` for
+  application errors and failures from HTTP, PostgreSQL, and Redis.
 
-Syntax outside that subset may be valid Python but is not necessarily valid
-Typhon. In particular, the native AST currently has no general implementation
-for exceptions, comprehensions, sets, slices, closures,
-decorators, or arbitrary Python operators.
+Comprehensions, sets, slices, closures, and decorators remain outside the
+current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
+and the [HTTP recovery example](examples/typed_exceptions.ty).
 
 The audit changes, precise contracts, limits, and remaining roadmap are recorded
 in [VM contracts and audit status](docs/vm_contract.md).

@@ -28,6 +28,7 @@ continuam descritos abaixo, separados do que já tem implementação e testes.
 | R04 parcial | Limites de instruções, profundidade, tarefas, coleções, strings e mensagens | `TestAuditRuntimeRegressions` |
 | R05 | Overflow int64 explícito; comparação mista exata; política de divisão e resto | `TestControlFlowAndOperators` |
 | R06 parcial | Erros com arquivo, linha e cadeia de funções Typhon | Erros verificados na suíte de regressões |
+| TYP-001 | [Exceções tipadas e recuperação de falhas dos drivers](typed_exceptions.md) | `TestExceptionUnwind`, `TestExceptionMandatoryCancellation`, `TestNativeHTTPExceptions`, `TestNativeRedisExceptions`, `TestNativePostgresExceptionRedaction` |
 | M02 parcial | Ciclos de carregamento e execução diagnosticados; falha de módulo não é executada de novo | `TestInvalidLocalModuleDoesNotFallBackToPython` |
 | M01 parcial | Erro em módulo `.ty` existente não provoca fallback Python | `TestInvalidLocalModuleDoesNotFallBackToPython` |
 | L01 / L02 | `else`, `elif`, `while`, `break`, `continue`, comparações, lógica, divisão, resto e sinais | `TestControlFlowAndOperators`, `TestControlFlowErrors` |
@@ -72,7 +73,8 @@ mesmo tipo usam seu valor para `is`; não se promete o interning de CPython.
 Uma Engine executa uma VM por vez. O compartilhamento de listas e objetos é
 permitido, mas a execução é serializada. `join` libera o acesso à Engine enquanto
 espera, permitindo executar filhos e filhos de filhos. Ao terminar o módulo
-principal, o host espera pelas tarefas; falhas de filhos são propagadas.
+principal, o host espera pelas tarefas; falhas cujo resultado não foi entregue
+por `join` são propagadas.
 Uma tarefa cancelada explicitamente antes da execução não roda. O cancelamento
 é cooperativo e é consultado entre instruções.
 
@@ -130,8 +132,8 @@ sequência de entradas. Iteração e `keys`/`values`/`items` usam snapshots, e `
 aceitam índices inteiros, inclusive negativos. `json.dumps` aceita dicionários.
 Esses contratos são verificados em `dictionary_test.go`.
 
-1. Dados e recuperação: slices, tuplas, `try`/`except`/
-   `finally`, `raise`, limpeza determinística e JSON completo.
+1. Dados e recursos: slices, tuplas, protocolo de gerenciamento de recursos
+   e JSON completo.
 2. Funções e módulos: defaults/kwargs Typhon, closures, aliases de import,
    `import` local unificado, `Task[T]` e assinaturas completas.
 3. Integração recomendada A: os drivers Go HTTP/PostgreSQL/Redis e contextos

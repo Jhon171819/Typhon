@@ -2,11 +2,17 @@ package typhon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/redis/go-redis/v9"
 )
 
 func nativeFuncType(name string, params []Type, result Type, optional int) Type {
@@ -68,7 +74,7 @@ func driverTypeSymbols(types map[string]Type) map[string]Value {
 func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 	typ := fn.Signature
 	if len(args) < len(typ.Params)-typ.Optional || len(args) > len(typ.Params) {
-		return NoneValue(), fmt.Errorf("%s expected %d to %d arguments, got %d", fn.Name, len(typ.Params)-typ.Optional, len(typ.Params), len(args))
+		return NoneValue(), &Exception{kind: validationKind, message: fmt.Sprintf("%s expected %d to %d arguments, got %d", fn.Name, len(typ.Params)-typ.Optional, len(typ.Params), len(args))}
 	}
 	converted := make([]Value, len(args))
 	for i, arg := range args {
@@ -77,15 +83,97 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 		}
 		value, err := validateValue(arg, typ.Params[i])
 		if err != nil {
-			return NoneValue(), fmt.Errorf("%s argument %d: %w", fn.Name, i+1, err)
+			return NoneValue(), &Exception{kind: validationKind, message: fmt.Sprintf("%s argument %d: %s", fn.Name, i+1, err)}
 		}
 		converted[i] = value
 	}
 	value, err := fn.Fn(vm, converted)
+	if stop := vm.executionError(); stop != nil {
+		return NoneValue(), stop
+	}
 	if err != nil {
-		return NoneValue(), fmt.Errorf("%s: %w", fn.Name, err)
+		var exception *Exception
+		if errors.As(err, &exception) {
+			return NoneValue(), fmt.Errorf("%s: %w", fn.Name, err)
+		}
+		// Driver implementations sanitize third-party failures at the call site.
+		// Remaining errors are local diagnostics with controlled text.
+		return NoneValue(), &Exception{kind: validationKind, message: fmt.Sprintf("%s: %s", fn.Name, err)}
 	}
 	return validateValue(value, *typ.Return)
+}
+
+// NativeCause keeps only structured diagnostics safe to pass across the
+// driver boundary. Raw third-party errors may contain credentials or data.
+type NativeCause struct {
+	driver string
+	code   string
+	detail string
+	marker error
+}
+
+func (e *NativeCause) Driver() string { return e.driver }
+func (e *NativeCause) Code() string   { return e.code }
+func (e *NativeCause) Unwrap() error  { return e.marker }
+func (e *NativeCause) Error() string {
+	if e.code != "" {
+		return e.driver + ": " + e.detail + " (SQLSTATE " + e.code + ")"
+	}
+	return e.driver + ": " + e.detail
+}
+
+func driverFailure(driver, kind string, err error) error {
+	if err == nil {
+		return nil
+	}
+	code := ""
+	if kind != validationKind {
+		var network net.Error
+		var postgres *pgconn.PgError
+		var connect *pgconn.ConnectError
+		switch {
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, redis.ErrPoolTimeout),
+			pgconn.Timeout(err), errors.As(err, &network) && network.Timeout():
+			kind = timeoutKind
+		case errors.As(err, &postgres):
+			kind = databaseKind
+			code = postgres.Code
+			if len(code) != 5 || !validSQLState(code) {
+				code = ""
+			}
+		case errors.As(err, &network), errors.As(err, &connect),
+			errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, net.ErrClosed):
+			kind = connectionKind
+		}
+	}
+	var detail string
+	switch kind {
+	case timeoutKind:
+		detail = "operation deadline exceeded"
+	case connectionKind:
+		detail = "connection or transport failed"
+	case databaseKind:
+		detail = "database operation failed"
+	case validationKind:
+		detail = "invalid request or connection configuration"
+	}
+	cause := &NativeCause{driver: driver, code: code, detail: detail}
+	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, sentinel) {
+			cause.marker = sentinel
+			break
+		}
+	}
+	return &Exception{kind: kind, message: cause.Error(), cause: cause}
+}
+
+func validSQLState(code string) bool {
+	for _, ch := range code {
+		if (ch < '0' || ch > '9') && (ch < 'A' || ch > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 func driverTimeout(args []Value, index int) (time.Duration, error) {
