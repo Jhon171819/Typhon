@@ -20,6 +20,8 @@ processe lotes sucessivos de uma fonte, como
 [`cursor.batch()`](postgres_cursor.md). Use conexões separadas
 para ler e gravar ao mesmo tempo. Passe JSONB, UUID, Decimal
 e outros valores com os [tipos de parâmetro](postgres_parameters.md).
+O driver verifica se todos os valores do COPY cabem no tipo
+binário de suas colunas antes de iniciar a transferência.
 
 Fora de transação explícita, cada chamada é atômica no PostgreSQL.
 Se o processo enviar vários lotes separados, cada um pode ser

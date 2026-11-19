@@ -136,11 +136,14 @@ func postgresParamSize(value any) int64 {
 	return valueSlotBytes
 }
 
-func (command postgresBulk) execute(ctx context.Context, writer postgresBulkWriter) (_ int64, runErr error) {
+func (command postgresBulk) execute(ctx context.Context, writer postgresBulkWriter, conn *pgx.Conn) (_ int64, runErr error) {
 	if len(command.rows) == 0 {
 		return 0, nil
 	}
 	if command.table != nil {
+		if err := command.validateCopyEncoding(ctx, conn); err != nil {
+			return 0, err
+		}
 		offset := 0
 		return writer.CopyFrom(ctx, command.table, command.columns, pgx.CopyFromFunc(func() ([]any, error) {
 			if err := ctx.Err(); err != nil {
@@ -175,6 +178,42 @@ func (command postgresBulk) execute(ctx context.Context, writer postgresBulkWrit
 	return count, nil
 }
 
+func (command postgresBulk) validateCopyEncoding(ctx context.Context, conn *pgx.Conn) error {
+	fields := make([]string, len(command.columns))
+	for i, name := range command.columns {
+		fields[i] = pgx.Identifier{name}.Sanitize()
+	}
+	description, err := conn.Prepare(ctx, "", "SELECT "+strings.Join(fields, ", ")+" FROM "+command.table.Sanitize())
+	if err != nil {
+		return err
+	}
+	types := conn.TypeMap()
+	var scratch []byte
+	for _, row := range command.rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for i, value := range row {
+			data, err := types.Encode(description.Fields[i].DataTypeOID, pgtype.BinaryFormatCode, value, scratch[:0])
+			if err != nil {
+				return &Exception{kind: validationKind, message: "PostgreSQL COPY value does not match its target column type"}
+			}
+			if data != nil {
+				scratch = data
+			}
+		}
+	}
+	return nil
+}
+
+func postgresBulkFailure(err error) error {
+	var validation *Exception
+	if errors.As(err, &validation) {
+		return err
+	}
+	return driverFailure("PostgreSQL", databaseKind, err)
+}
+
 func executePostgresBulk(vm *VM, db *postgresConnection, tx *postgresTransaction, method string, args []Value) (Value, error) {
 	if tx == nil {
 		command, err := makePostgresBulk(vm, method, args)
@@ -187,9 +226,9 @@ func executePostgresBulk(vm *VM, db *postgresConnection, tx *postgresTransaction
 		}
 		defer conn.Release()
 		defer cancel()
-		count, err := command.execute(ctx, conn)
+		count, err := command.execute(ctx, conn, conn.Conn())
 		if err != nil {
-			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
+			return NoneValue(), postgresBulkFailure(err)
 		}
 		return IntValue(count), nil
 	}
@@ -206,8 +245,8 @@ func executePostgresBulk(vm *VM, db *postgresConnection, tx *postgresTransaction
 		}
 		ctx, cancel := tx.operation(vm)
 		defer cancel()
-		n, err := command.execute(ctx, tx.tx)
-		return n, driverFailure("PostgreSQL", databaseKind, err)
+		n, err := command.execute(ctx, tx.tx, tx.tx.Conn())
+		return n, postgresBulkFailure(err)
 	}()
 	if err != nil {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(vm.context()), cleanupTimeout)

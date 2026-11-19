@@ -75,7 +75,7 @@ except DatabaseError as err:
 
 try:
     db.copy_from(['incoming'], columns, [[3002, id, document, 'ok'], [3003, 'invalid uuid', document, 'bad']])
-except DatabaseError:
+except ValidationError:
     print('copy type error')
 
 try:
@@ -141,9 +141,9 @@ func BenchmarkNativePostgresBulk(b *testing.B) {
 				case "INSERT":
 					n, err = serialPostgresInserts(ctx, conn, template, input)
 				case "batch":
-					n, err = (postgresBulk{sql: template, rows: input}).execute(ctx, conn)
+					n, err = (postgresBulk{sql: template, rows: input}).execute(ctx, conn, conn)
 				case "COPY":
-					n, err = (postgresBulk{table: pgx.Identifier{"ingest"}, columns: []string{"id", "label"}, rows: input}).execute(ctx, conn)
+					n, err = (postgresBulk{table: pgx.Identifier{"ingest"}, columns: []string{"id", "label"}, rows: input}).execute(ctx, conn, conn)
 				}
 				if err != nil || n != rowCount {
 					b.Fatalf("inserted %d rows: %v", n, driverFailure("PostgreSQL", databaseKind, err))
