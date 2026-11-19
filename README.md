@@ -123,6 +123,8 @@ The Go runtime currently supports:
   workload, fault-injection and soak tests for the reference stack.
 - [CI and release integrity](docs/ci_security.md) explains compatibility
   gates, credential and dependency scans, SBOMs and artifact verification.
+- [Configured native HTTP clients](docs/http_client.md) send JSON or bytes
+  with TLS verification, bounded responses and opt-in retry.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

@@ -1,0 +1,21 @@
+import typhon.http as http
+
+options: dict[str, Any] = {
+    'connect_timeout': 1,
+    'read_timeout': 2,
+    'total_timeout': 3,
+    'max_response_bytes': 65536,
+    'retries': 1
+}
+client: http.Client = http.client_with_options(options)
+
+try:
+    result: http.Response = client.get(http.env('UPSTREAM_URL'))
+    if result.status == 200:
+        print(result.json())
+    else:
+        print('upstream status', result.status)
+except TimeoutError:
+    print('upstream deadline exceeded')
+finally:
+    client.close()

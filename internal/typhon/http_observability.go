@@ -288,7 +288,7 @@ func observedNativeCall(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 			return fn.Fn(vm, args)
 		}
 	case "http":
-		if operation != "request" && operation != "get" {
+		if operation != "request" && operation != "get" && operation != "request_json" && operation != "request_bytes" {
 			return fn.Fn(vm, args)
 		}
 	default:

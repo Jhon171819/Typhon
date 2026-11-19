@@ -25,6 +25,7 @@ Implementado com [`net/http`](https://pkg.go.dev/net/http).
 | Função/método | Retorno e comportamento |
 | --- | --- |
 | `http.client(timeout=10)` | `http.Client`; prazo em segundos por requisição |
+| `http.client_with_options(options)` | `http.Client`; [TLS, deadlines, redirects e retry configuráveis](http_client.md) |
 | `client.get(url)` | `http.Response`; GET HTTP ou HTTPS |
 | `client.request(method, url, body, headers=[])` | `http.Response`; corpo `str`, headers `list[list[str]]` |
 | `client.close()` | `None`; fecha conexões ociosas e impede novas chamadas |
@@ -37,6 +38,8 @@ O `=` nas tabelas indica o valor padrão; na chamada Typhon, passe valores
 posicionais: `http.client(5)`, `http.response(200, 'ok', [['X-App', 'Typhon']])`.
 
 `http.Response` oferece `status: int`, `body: str` e `header(name: str) -> str`.
+Os métodos `header_values(name)`, `json()` e `bytes()` também estão
+disponíveis para respostas com corpo em memória.
 O cliente verifica certificados HTTPS e segue redirecionamentos segundo as regras
 do cliente Go. Códigos 4xx/5xx são respostas normais; falhas de transporte são erros.
 

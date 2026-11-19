@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +19,9 @@ func httpDriverTypes() map[string]Type {
 	header := nativeFuncType("http.header", []Type{StrType()}, StrType(), 0)
 	response := Type{Kind: TypeNative, Name: "typhon.http.Response", Members: map[string]Type{
 		"status": IntType(), "body": StrType(), "header": header,
+		"header_values": nativeFuncType("http.response.header_values", []Type{StrType()}, listType(StrType()), 0),
+		"json":          nativeFuncType("http.response.json", nil, AnyType(), 0),
+		"bytes":         nativeFuncType("http.response.bytes", nil, scalarType("Bytes"), 0),
 	}}
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
@@ -42,17 +44,20 @@ func httpDriverTypes() map[string]Type {
 	request.Members["multipart"] = nativeFuncType("http.request.multipart", nil, form, 0)
 	producer := nativeFuncType("http.stream.producer", []Type{AnyType()}, unionType(scalarType("Bytes"), NoneType()), 0)
 	client := Type{Kind: TypeNative, Name: "typhon.http.Client", Members: map[string]Type{
-		"get":     nativeFuncType("http.get", []Type{StrType()}, response, 0),
-		"request": nativeFuncType("http.request", []Type{StrType(), StrType(), StrType(), headers}, response, 1),
-		"close":   nativeFuncType("http.close", nil, NoneType(), 0),
+		"get":           nativeFuncType("http.get", []Type{StrType()}, response, 0),
+		"request":       nativeFuncType("http.request", []Type{StrType(), StrType(), StrType(), headers}, response, 1),
+		"request_json":  nativeFuncType("http.request_json", []Type{StrType(), StrType(), AnyType(), headers}, response, 1),
+		"request_bytes": nativeFuncType("http.request_bytes", []Type{StrType(), StrType(), scalarType("Bytes"), headers}, response, 1),
+		"close":         nativeFuncType("http.close", nil, NoneType(), 0),
 	}}
 	types := map[string]Type{
 		"Request": request, "Response": response, "Client": client,
-		"client":   nativeFuncType("http.client", []Type{FloatType()}, client, 1),
-		"response": nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
-		"json":     nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
-		"stream":   nativeFuncType("http.stream", []Type{IntType(), producer, AnyType(), headers}, response, 1),
-		"Body":     bodyType, "Multipart": form, "Part": part,
+		"client":              nativeFuncType("http.client", []Type{FloatType()}, client, 1),
+		"client_with_options": nativeFuncType("http.client_with_options", []Type{dictType(StrType(), AnyType())}, client, 0),
+		"response":            nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
+		"json":                nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
+		"stream":              nativeFuncType("http.stream", []Type{IntType(), producer, AnyType(), headers}, response, 1),
+		"Body":                bodyType, "Multipart": form, "Part": part,
 		"serve":        nativeFuncType("http.serve", []Type{StrType(), unionType(httpHandlerType(), Type{Kind: TypeNative, Name: routerTypeName}), IntType(), IntType(), FloatType()}, NoneType(), 3),
 		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
 		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
@@ -64,6 +69,7 @@ func httpDriverTypes() map[string]Type {
 func httpDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
 	exports["client"] = driverFunc(types["client"], nativeHTTPClient)
+	exports["client_with_options"] = driverFunc(types["client_with_options"], nativeHTTPClientWithOptions)
 	exports["stream"] = driverFunc(types["stream"], makeHTTPStream)
 	exports["event"] = driverFunc(types["event"], makeSSEEvent)
 	exports["sse"] = driverFunc(types["sse"], makeSSEResponse)
@@ -142,85 +148,30 @@ func httpResponse(vm *VM, status int64, body string, headers http.Header) (Value
 	value := nativeObject(vm, typ, map[string]Value{
 		"status": IntValue(status), "body": StringValue(body),
 		"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(headers.Get(args[0].Str)), nil }),
+		"header_values": driverFunc(typ.Members["header_values"], func(vm *VM, args []Value) (Value, error) {
+			values := headers.Values(args[0].Str)
+			items := make([]Value, len(values))
+			for i, item := range values {
+				if err := vm.chargeBytes(valueSlotBytes + int64(len(item))); err != nil {
+					return NoneValue(), err
+				}
+				items[i] = StringValue(item)
+			}
+			return ListValue(items), nil
+		}),
+		"json": driverFunc(typ.Members["json"], func(vm *VM, _ []Value) (Value, error) {
+			values := headers.Values("Content-Type")
+			if len(values) != 1 || !httpJSONMediaType(values[0]) {
+				return NoneValue(), fmt.Errorf("HTTP JSON decoding requires a JSON Content-Type")
+			}
+			return loadJSON(vm, body)
+		}),
+		"bytes": driverFunc(typ.Members["bytes"], func(vm *VM, _ []Value) (Value, error) {
+			return nativeScalarValue(vm, "Bytes", []byte(body))
+		}),
 	})
 	value.NativeObject.data = headers.Clone()
 	return value, nil
-}
-
-func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
-	timeout, err := driverTimeout(args, 0)
-	if err != nil {
-		return NoneValue(), err
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxConnsPerHost = 16
-	client := &http.Client{Transport: transport, Timeout: timeout}
-	var closed atomic.Bool
-	scope := vm.resourceScope()
-	close := func(context.Context) error {
-		if !closed.Swap(true) {
-			scope.remove(&closed)
-			transport.CloseIdleConnections()
-		}
-		return nil
-	}
-	if err := scope.add(vm.context(), &closed, "HTTP client close", close); err != nil {
-		return NoneValue(), err
-	}
-	typ := httpDriverTypes()["Client"]
-	request := func(vm *VM, args []Value) (Value, error) {
-		if closed.Load() {
-			return NoneValue(), fmt.Errorf("HTTP client is closed")
-		}
-		if len(args[2].Str) > maxHTTPBody {
-			return NoneValue(), fmt.Errorf("HTTP body limit exceeded")
-		}
-		if err := vm.chargeBytes(int64(len(args[2].Str))); err != nil {
-			return NoneValue(), err
-		}
-		ctx, cancel := driverContext(vm, timeout)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, args[0].Str, args[1].Str, strings.NewReader(args[2].Str)) // #nosec G704 -- The trusted Typhon application chooses its upstream URL.
-		if err != nil {
-			return NoneValue(), driverFailure("HTTP", validationKind, err)
-		}
-		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-			return NoneValue(), fmt.Errorf("HTTP URL must use http or https")
-		}
-		if len(args) == 4 {
-			req.Header, err = httpHeaders(args[3])
-			if err != nil {
-				return NoneValue(), err
-			}
-		}
-		injectHTTPTrace(req)
-		resp, err := client.Do(req) // #nosec G704 -- The trusted Typhon application chooses its upstream URL.
-		if err != nil {
-			return NoneValue(), driverFailure("HTTP", connectionKind, err)
-		}
-		budget := vm.executionBudget()
-		limit := min(int64(maxHTTPBody), budget.byteLimit-budget.bytes)
-		body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-		closeErr := driverFailure("HTTP", connectionKind, resp.Body.Close())
-		if err != nil {
-			reportCleanupError("HTTP response body close", closeErr)
-			return NoneValue(), driverFailure("HTTP", connectionKind, err)
-		}
-		if closeErr != nil {
-			return NoneValue(), closeErr
-		}
-		if int64(len(body)) > limit && limit < maxHTTPBody {
-			return NoneValue(), quotaStop("byte", budget.byteLimit)
-		}
-		return httpResponse(vm, int64(resp.StatusCode), string(body), resp.Header)
-	}
-	return scopedNativeObject(vm, typ, map[string]Value{
-		"request": driverFunc(typ.Members["request"], request),
-		"get": driverFunc(typ.Members["get"], func(vm *VM, args []Value) (Value, error) {
-			return request(vm, []Value{StringValue("GET"), args[0], StringValue("")})
-		}),
-		"close": driverCloser(typ.Members["close"], close),
-	}), nil
 }
 
 func httpVMHandler(engine *Engine, handler Value) http.Handler {
