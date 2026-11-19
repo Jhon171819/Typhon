@@ -121,6 +121,8 @@ The Go runtime currently supports:
   Prometheus histograms and OTLP traces for native driver work.
 - [Performance and resilience](docs/performance.md) records reproducible
   workload, fault-injection and soak tests for the reference stack.
+- [CI and release integrity](docs/ci_security.md) explains compatibility
+  gates, credential and dependency scans, SBOMs and artifact verification.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

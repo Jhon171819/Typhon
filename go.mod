@@ -2,6 +2,8 @@ module typhon
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/go-jose/go-jose/v4 v4.1.9
