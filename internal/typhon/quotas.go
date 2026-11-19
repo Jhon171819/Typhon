@@ -99,6 +99,9 @@ func (vm *VM) chargeWork() error {
 }
 
 func (vm *VM) chargeBytes(n int64) error {
+	if vm == nil {
+		return nil
+	}
 	if err := vm.executionError(); err != nil {
 		return err
 	}
