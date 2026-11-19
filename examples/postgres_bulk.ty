@@ -1,0 +1,17 @@
+import typhon.postgres as pg
+import typhon.scalars as s
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+external: s.UUID = s.uuid('ad5a739a-7641-4b2b-b4df-4b62b0f31d5d')
+items: list[list[Any]] = [
+    [1, external, pg.jsonb({'source': 'import'}), 'São Paulo'],
+    [2, external, pg.jsonb({'source': 'import'}), 'Belém']
+]
+
+def ingest(tx: pg.Transaction) -> Any:
+    accepted: int = tx.copy_from(['incoming'], ['id', 'external', 'payload', 'label'], items)
+    tx.exec_many('UPDATE incoming SET label = $2 WHERE id = $1', [[2, 'Belém–PA']])
+    tx.commit()
+    return accepted
+
+print(db.transaction(ingest))

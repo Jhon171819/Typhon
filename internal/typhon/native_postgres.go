@@ -26,11 +26,13 @@ func postgresDriverTypes() map[string]Type {
 		"row": nativeFuncType("postgres.rows.row", []Type{IntType()}, listType(AnyType()), 0),
 	}}
 	methods := func() map[string]Type {
-		return map[string]Type{
+		output := map[string]Type{
 			"exec":   nativeFuncType("postgres.exec", []Type{StrType(), listType(AnyType())}, IntType(), 1),
 			"query":  nativeFuncType("postgres.query", []Type{StrType(), listType(AnyType())}, rows, 1),
 			"cursor": nativeFuncType("postgres.cursor", []Type{StrType(), listType(AnyType()), IntType()}, cursor, 2),
 		}
+		postgresBulkMethods(output)
+		return output
 	}
 	tx := Type{Kind: TypeNative, Name: "typhon.postgres.Transaction", Members: methods()}
 	tx.Members["commit"] = nativeFuncType("postgres.commit", nil, NoneType(), 0)
@@ -337,6 +339,7 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 		"transaction": driverFunc(typ.Members["transaction"], db.transaction),
 		"cursor":      driverFunc(typ.Members["cursor"], db.cursor),
 	}
+	postgresBulkBindings(attrs, typ, db, nil)
 	value := scopedNativeObject(vm, typ, attrs)
 	value.NativeObject.data = db
 	return value, nil
@@ -344,7 +347,7 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 
 func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 	typ := postgresDriverTypes()["Transaction"]
-	value := scopedNativeObject(vm, typ, map[string]Value{
+	attrs := map[string]Value{
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
@@ -394,7 +397,9 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 		}),
 		"rollback": driverCloser(typ.Members["rollback"], tx.rollback),
 		"cursor":   driverFunc(typ.Members["cursor"], tx.openCursor),
-	})
+	}
+	postgresBulkBindings(attrs, typ, tx.parent, tx)
+	value := scopedNativeObject(vm, typ, attrs)
 	value.NativeObject.data = tx
 	return value
 }
@@ -403,8 +408,12 @@ func postgresParams(vm *VM, args []Value) ([]any, error) {
 	if len(args) < 2 {
 		return nil, nil
 	}
-	var params []any
-	for _, value := range *args[1].List {
+	return postgresEncodeParams(vm, *args[1].List)
+}
+
+func postgresEncodeParams(vm *VM, values []Value) ([]any, error) {
+	params := make([]any, 0, len(values))
+	for _, value := range values {
 		switch value.Kind {
 		case ValueNone:
 			params = append(params, nil)

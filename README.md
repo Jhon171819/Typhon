@@ -99,6 +99,8 @@ The Go runtime currently supports:
   explicit commit, bounded rollback and opt-in SQLSTATE retry.
 - [Streaming PostgreSQL cursors](docs/postgres_cursor.md) read bounded
   batches and release their connections on EOF, close, or cancellation.
+- [Bulk PostgreSQL writes](docs/postgres_bulk.md) support bounded,
+  parameterized COPY FROM and batch execution.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
