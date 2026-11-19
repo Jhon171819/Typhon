@@ -40,7 +40,7 @@ func redisDriverTypes() map[string]Type {
 		"Connection":        connection,
 		"Result":            result,
 		"connect":           nativeFuncType("redis.connect", []Type{StrType(), FloatType()}, connection, 1),
-		"connect_with_pool": nativeFuncType("redis.connect_with_pool", []Type{StrType(), IntType(), IntType(), FloatType(), FloatType(), FloatType()}, connection, 3),
+		"connect_with_pool": nativeFuncType("redis.connect_with_pool", []Type{StrType(), IntType(), IntType(), FloatType(), FloatType(), FloatType(), BoolType()}, connection, 4),
 		"env":               nativeFuncType("redis.env", []Type{StrType()}, StrType(), 0),
 	}
 }
@@ -64,7 +64,8 @@ func redisDriverExports(types map[string]Type) map[string]Value {
 		if err != nil {
 			return NoneValue(), err
 		}
-		return connectRedis(vm, args[0].Str, int(args[1].Int), int(args[2].Int), dial, read, write, true)
+		probe := len(args) < 7 || args[6].Bool
+		return connectRedis(vm, args[0].Str, int(args[1].Int), int(args[2].Int), dial, read, write, true, probe)
 	})
 	exports["env"] = driverFunc(types["env"], driverEnv)
 	return exports
@@ -127,10 +128,10 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	if err != nil {
 		return NoneValue(), err
 	}
-	return connectRedis(vm, args[0].Str, 16, 0, timeout, timeout, timeout, false)
+	return connectRedis(vm, args[0].Str, 16, 0, timeout, timeout, timeout, false, true)
 }
 
-func connectRedis(vm *VM, dsn string, poolSize, minIdle int, dialTimeout, read, write time.Duration, configured bool) (Value, error) {
+func connectRedis(vm *VM, dsn string, poolSize, minIdle int, dialTimeout, read, write time.Duration, configured, probe bool) (Value, error) {
 	options, err := redis.ParseURL(dsn)
 	if err != nil {
 		return NoneValue(), driverFailure("Redis", validationKind, err)
@@ -162,12 +163,14 @@ func connectRedis(vm *VM, dsn string, poolSize, minIdle int, dialTimeout, read, 
 	}
 	client := redis.NewClient(options)
 	db.client = client
-	ctx, done := db.start(vm.context(), db.timeout)
-	err = client.Ping(ctx).Err()
-	done(err)
-	if err != nil {
-		reportCleanupError("Redis client after failed ping", driverFailure("Redis", databaseKind, client.Close()))
-		return NoneValue(), driverFailure("Redis", databaseKind, err)
+	if probe {
+		ctx, done := db.start(vm.context(), db.timeout)
+		err = client.Ping(ctx).Err()
+		done(err)
+		if err != nil {
+			reportCleanupError("Redis client after failed ping", driverFailure("Redis", databaseKind, client.Close()))
+			return NoneValue(), driverFailure("Redis", databaseKind, err)
+		}
 	}
 	scope := vm.resourceScope()
 	close := func(context.Context) error {

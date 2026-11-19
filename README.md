@@ -81,6 +81,8 @@ The Go runtime currently supports:
   allowlists, security headers, and secure session cookie serialization.
 - [Redis pipelines and pools](docs/native_drivers.md#redis) batch commands
   in order and expose per-command outcomes and pool telemetry.
+- [Distributed request limits](docs/http_rate_limit.md) share authenticated
+  quotas across API replicas through Redis.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

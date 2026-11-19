@@ -1,0 +1,22 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.redis as redis
+import typhon.web as web
+
+cache: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 4, 0, 1, 1, 1, False)
+verifier: auth.Authenticator = auth.jwt(
+    http.env('AUTH_ISSUER'), http.env('AUTH_AUDIENCE'), http.env('AUTH_JWKS_URL')
+)
+quota: web.RateLimiter = web.rate_limiter(cache, 'orders-v1', 100, 60, False, {'plan:team': 300})
+routes: web.Router = web.router()
+routes.use_errors()
+
+def list_orders(req: http.Request) -> http.Response:
+    return http.json(200, [])
+
+routes.add('GET', '/v1/orders', list_orders)
+routes.require_auth('GET', '/v1/orders', verifier)
+routes.rate_limit('GET', '/v1/orders', quota)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

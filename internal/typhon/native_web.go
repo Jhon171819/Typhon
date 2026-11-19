@@ -24,6 +24,7 @@ type webRoute struct {
 	auth    webAuthenticator
 	policy  *webPolicy
 	action  string
+	rate    *webRouteRate
 }
 
 type webNode struct {
@@ -44,13 +45,14 @@ type webRouter struct {
 }
 
 type webRequest struct {
-	path      string
-	params    map[string]string
-	id        string
-	sendID    bool
-	state     map[string]string
-	principal verifiedRequestIdentity
-	bearer    string
+	path        string
+	params      map[string]string
+	id          string
+	sendID      bool
+	state       map[string]string
+	principal   verifiedRequestIdentity
+	bearer      string
+	rateHeaders http.Header
 }
 
 func httpHandlerType() Type {
@@ -76,6 +78,7 @@ func webDriverTypes() map[string]Type {
 	strings := listType(StrType())
 	router.Members["use_cors"] = nativeFuncType("web.use_cors", []Type{strings, strings, strings, BoolType()}, NoneType(), 1)
 	router.Members["use_security_headers"] = nativeFuncType("web.use_security_headers", []Type{StrType(), StrType(), IntType()}, NoneType(), 3)
+	router.Members["rate_limit"] = nativeFuncType("web.rate_limit", []Type{StrType(), StrType(), webRateLimiterType()}, NoneType(), 0)
 	return map[string]Type{
 		"Router":         router,
 		"Next":           next,
@@ -84,11 +87,15 @@ func webDriverTypes() map[string]Type {
 		"reject":         nativeFuncType("web.reject", []Type{IntType()}, exceptionType(errorKind), 0),
 		"validate":       nativeFuncType("web.validate", []Type{httpTypes["Request"], validationTypes()["Schema"], AnyType()}, unionType(httpTypes["Response"], NoneType()), 0),
 		"session_cookie": nativeFuncType("web.session_cookie", []Type{StrType(), StrType(), StrType(), IntType()}, StrType(), 2),
+		"RateLimiter":    webRateLimiterType(),
+		"rate_limiter": nativeFuncType("web.rate_limiter",
+			[]Type{redisDriverTypes()["Connection"], StrType(), IntType(), IntType(), BoolType(), dictType(StrType(), IntType())}, webRateLimiterType(), 2),
 	}
 }
 
 func webDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	exports["rate_limiter"] = driverFunc(types["rate_limiter"], makeWebRateLimiter)
 	exports["session_cookie"] = driverFunc(types["session_cookie"], func(vm *VM, args []Value) (Value, error) {
 		return webSessionCookie(args)
 	})
@@ -209,6 +216,21 @@ func webDriverExports(types map[string]Type) map[string]Value {
 				policy, err := newWebSecurityHeaders(args)
 				router.browser.security = policy
 				return NoneValue(), err
+			}),
+			"rate_limit": driverFunc(typ.Members["rate_limit"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen {
+					return NoneValue(), errors.New("router was already started")
+				}
+				route := router.routes[[2]string{args[0].Str, args[1].Str}]
+				if route == nil || route.auth == nil || route.rate != nil {
+					return NoneValue(), errors.New("rate limiting requires a registered authenticated route without a limiter")
+				}
+				limiter, ok := args[2].NativeObject.data.(*webRateLimiter)
+				if !ok {
+					return NoneValue(), errors.New("invalid route rate limiter")
+				}
+				route.rate = limiter.bind(args[0].Str, args[1].Str)
+				return NoneValue(), nil
 			}),
 		})
 		value.NativeObject.data = router
@@ -390,6 +412,36 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 			logWebAuthorization(state.id, route.pattern, route.action, allowed)
 			if !allowed {
 				return r.problem(vm, state, 403, "permission denied", http.Header{"Cache-Control": {"no-store"}})
+			}
+		}
+		if route.rate != nil {
+			if principal.tenant == "" {
+				return r.problem(vm, state, 403, "rate limiting requires a verified tenant", nil)
+			}
+			headers, allowed, err := route.rate.take(vm, principal)
+			if stop := vm.executionError(); stop != nil {
+				return NoneValue(), stop
+			}
+			stats := vm.engine.httpMetrics.Load()
+			switch {
+			case err != nil:
+				if stats != nil {
+					stats.rateErrors.Add(1)
+				}
+				logWebFailure(state.id, route.pattern, 503, err)
+				if !route.rate.limiter.failOpen {
+					return r.problem(vm, state, 503, "rate limit temporarily unavailable", nil)
+				}
+			case !allowed:
+				if stats != nil {
+					stats.rateDenied.Add(1)
+				}
+				return r.problem(vm, state, 429, "too many requests", headers)
+			default:
+				if stats != nil {
+					stats.rateAllowed.Add(1)
+				}
+				state.rateHeaders = headers
 			}
 		}
 	}

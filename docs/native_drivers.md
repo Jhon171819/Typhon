@@ -142,7 +142,7 @@ operações que falharam, evitando duplicar uma escrita com resultado incerto.
 | Função/método | Retorno e comportamento |
 | --- | --- |
 | `redis.connect(url, timeout=10)` | `redis.Connection`; prazo por operação |
-| `redis.connect_with_pool(url, pool_size, min_idle, dial=10, read=10, write=10)` | `redis.Connection`; configuração por Engine, de 1 a 64 conexões |
+| `redis.connect_with_pool(url, pool_size, min_idle, dial=10, read=10, write=10, probe=True)` | `redis.Connection`; configuração por Engine, de 1 a 64 conexões |
 | `cache.ping()` | `str`; normalmente `PONG` |
 | `cache.get(key)` | `str \| None`; `None` quando a chave não existe |
 | `cache.set(key, value, ttl=0)` | `None`; chave/valor `str`, TTL em segundos, zero sem expiração |
@@ -171,6 +171,8 @@ tamanho configurado. Cada worker tem seu próprio pool. Forneça URL com ACL
 (`rediss://usuário:senha@host:6379/0` em produção) por variável de ambiente.
 O modo configurável exige verificação do certificado TLS. A VM sanitiza
 erros e as métricas omitem URL, comandos e credenciais.
+Passe `False` no argumento final e use `min_idle=0` para adiar a
+conexão até a primeira operação.
 
 O pipeline valida o lote antes do envio e agrupa os comandos de uso comum
 para evitar uma espera de rede por comando. Aceita PING, GET, SET, DEL,

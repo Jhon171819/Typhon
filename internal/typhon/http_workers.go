@@ -10,9 +10,10 @@ import (
 )
 
 type httpPoolMetrics struct {
-	admitted, rejected, completed atomic.Int64
-	waiting, peak, waitNS         atomic.Int64
-	quotaRejected                 atomic.Int64
+	admitted, rejected, completed       atomic.Int64
+	waiting, peak, waitNS               atomic.Int64
+	quotaRejected                       atomic.Int64
+	rateAllowed, rateDenied, rateErrors atomic.Int64
 }
 
 func (m *httpPoolMetrics) snapshot() Value {
@@ -24,6 +25,7 @@ func (m *httpPoolMetrics) snapshot() Value {
 		{"admitted", &m.admitted}, {"rejected", &m.rejected}, {"completed", &m.completed},
 		{"queued", &m.waiting}, {"queue_peak", &m.peak}, {"queue_wait_ns", &m.waitNS},
 		{"quota_rejected", &m.quotaRejected},
+		{"rate_allowed", &m.rateAllowed}, {"rate_denied", &m.rateDenied}, {"rate_errors", &m.rateErrors},
 	} {
 		_ = result.Dict.put(StringValue(metric.name), IntValue(metric.value.Load()))
 	}

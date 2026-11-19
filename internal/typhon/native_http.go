@@ -388,6 +388,9 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		for name, values := range headers {
 			writer.Header()[name] = values
 		}
+		for name, values := range webState.rateHeaders {
+			writer.Header()[name] = values
+		}
 		if webState.sendID {
 			writer.Header().Set("X-Request-ID", webState.id)
 		}
