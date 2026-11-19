@@ -39,6 +39,7 @@ type httpWorkerPool struct {
 	requestTimeout time.Duration
 	liveness       string
 	apiErrors      bool
+	browser        webBrowserPolicy
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
@@ -53,6 +54,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 	if routed {
 		router.frozen = true
 		p.apiErrors = router.apiErrors
+		p.browser = router.browser
 	}
 	p.idle <- httpVMHandlerWithTimeout(vm.engine, handler, p.requestTimeout)
 	if cap(p.idle) == 1 {

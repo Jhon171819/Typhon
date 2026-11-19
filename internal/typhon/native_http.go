@@ -95,22 +95,25 @@ func httpHeaders(value Value) (http.Header, error) {
 			return nil, fmt.Errorf("header must contain name and value")
 		}
 		name, content := (*pair.List)[0].Str, (*pair.List)[1].Str
-		if name == "" {
-			return nil, fmt.Errorf("invalid HTTP header")
+		if !validHTTPHeaderValue(content) {
+			return nil, fmt.Errorf("invalid HTTP header value")
 		}
-		for _, ch := range content {
-			if ch < ' ' && ch != '\t' || ch == 127 {
-				return nil, fmt.Errorf("invalid HTTP header value")
-			}
-		}
-		for _, ch := range name {
-			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", ch)) {
-				return nil, fmt.Errorf("invalid HTTP header name")
-			}
+		if !validHTTPHeaderName(name) {
+			return nil, fmt.Errorf("invalid HTTP header name")
 		}
 		headers.Add(name, content)
 	}
 	return headers, nil
+}
+
+func validHTTPHeaderName(name string) bool {
+	return name != "" && strings.IndexFunc(name, func(ch rune) bool {
+		return !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", ch))
+	}) < 0
+}
+
+func validHTTPHeaderValue(value string) bool {
+	return strings.IndexFunc(value, func(ch rune) bool { return ch < ' ' && ch != '\t' || ch == 127 }) < 0
 }
 
 func httpResponse(vm *VM, status int64, body string, headers http.Header) (Value, error) {
@@ -208,7 +211,11 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 }
 
 func httpVMHandler(engine *Engine, handler Value) http.Handler {
-	return httpVMHandlerWithTimeout(engine, handler, defaultRequestTimeout)
+	server := httpVMHandlerWithTimeout(engine, handler, defaultRequestTimeout)
+	if router, ok := routerValue(handler); ok {
+		return router.browser.wrap(server, router.apiErrors)
+	}
+	return server
 }
 
 func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Duration) http.Handler {
@@ -444,7 +451,7 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 		reportCleanupError("HTTP listener after worker startup failure", driverFailure("HTTP", connectionKind, listener.Close()))
 		return NoneValue(), err
 	}
-	server := &http.Server{Handler: pool, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	server := &http.Server{Handler: pool.browser.wrap(pool, pool.apiErrors), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	vm.engine.execMu.Unlock()

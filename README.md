@@ -77,6 +77,8 @@ The Go runtime currently supports:
   exposes a request-scoped principal in protected routes.
 - [Tenant authorization](docs/http_authorization.md) enforces route
   permissions and demonstrates ownership filters in PostgreSQL.
+- [Browser HTTP policy](docs/http_browser.md) supports explicit CORS
+  allowlists, security headers, and secure session cookie serialization.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

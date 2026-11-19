@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="pt-BR">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eco HTTP do Typhon</title>
+<h1>Eco HTTP do Typhon</h1>
+<button type="button" id="send">Enviar JSON à API</button>
+<pre id="result" aria-live="polite"></pre>
+<script>
+  const button = document.querySelector('#send');
+  const result = document.querySelector('#result');
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    result.textContent = '';
+    try {
+      const response = await fetch('http://localhost:8080/v1/echo', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({message: 'Olá do navegador'}),
+      });
+      result.textContent = await response.text();
+    } catch (error) {
+      result.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</html>

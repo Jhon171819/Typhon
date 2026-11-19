@@ -40,6 +40,7 @@ type webRouter struct {
 	routes    map[[2]string]*webRoute
 	steps     []webStep
 	apiErrors bool
+	browser   webBrowserPolicy
 }
 
 type webRequest struct {
@@ -72,18 +73,25 @@ func webDriverTypes() map[string]Type {
 	router.Members["use_errors"] = nativeFuncType("web.use_errors", nil, NoneType(), 0)
 	router.Members["require_auth"] = nativeFuncType("web.require_auth", []Type{StrType(), StrType(), authDriverTypes()["Authenticator"]}, NoneType(), 0)
 	router.Members["authorize"] = nativeFuncType("web.authorize", []Type{StrType(), StrType(), authorizationPolicyType(), StrType()}, NoneType(), 0)
+	strings := listType(StrType())
+	router.Members["use_cors"] = nativeFuncType("web.use_cors", []Type{strings, strings, strings, BoolType()}, NoneType(), 1)
+	router.Members["use_security_headers"] = nativeFuncType("web.use_security_headers", []Type{StrType(), StrType(), IntType()}, NoneType(), 3)
 	return map[string]Type{
-		"Router":   router,
-		"Next":     next,
-		"router":   nativeFuncType("web.router", nil, router, 0),
-		"problem":  nativeFuncType("web.problem", []Type{httpTypes["Request"], IntType()}, httpTypes["Response"], 0),
-		"reject":   nativeFuncType("web.reject", []Type{IntType()}, exceptionType(errorKind), 0),
-		"validate": nativeFuncType("web.validate", []Type{httpTypes["Request"], validationTypes()["Schema"], AnyType()}, unionType(httpTypes["Response"], NoneType()), 0),
+		"Router":         router,
+		"Next":           next,
+		"router":         nativeFuncType("web.router", nil, router, 0),
+		"problem":        nativeFuncType("web.problem", []Type{httpTypes["Request"], IntType()}, httpTypes["Response"], 0),
+		"reject":         nativeFuncType("web.reject", []Type{IntType()}, exceptionType(errorKind), 0),
+		"validate":       nativeFuncType("web.validate", []Type{httpTypes["Request"], validationTypes()["Schema"], AnyType()}, unionType(httpTypes["Response"], NoneType()), 0),
+		"session_cookie": nativeFuncType("web.session_cookie", []Type{StrType(), StrType(), StrType(), IntType()}, StrType(), 2),
 	}
 }
 
 func webDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	exports["session_cookie"] = driverFunc(types["session_cookie"], func(vm *VM, args []Value) (Value, error) {
+		return webSessionCookie(args)
+	})
 	exports["problem"] = driverFunc(types["problem"], func(vm *VM, args []Value) (Value, error) {
 		status := int(args[1].Int)
 		if _, ok := webStatuses[status]; !ok {
@@ -185,6 +193,22 @@ func webDriverExports(types map[string]Type) map[string]Value {
 				}
 				route.policy, route.action = policy, args[3].Str
 				return NoneValue(), nil
+			}),
+			"use_cors": driverFunc(typ.Members["use_cors"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen || router.browser.cors != nil {
+					return NoneValue(), errors.New("configure CORS once before starting the router")
+				}
+				policy, err := newWebCORS(args)
+				router.browser.cors = policy
+				return NoneValue(), err
+			}),
+			"use_security_headers": driverFunc(typ.Members["use_security_headers"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen || router.browser.security != nil {
+					return NoneValue(), errors.New("configure security headers once before starting the router")
+				}
+				policy, err := newWebSecurityHeaders(args)
+				router.browser.security = policy
+				return NoneValue(), err
 			}),
 		})
 		value.NativeObject.data = router
