@@ -50,6 +50,18 @@ tabela temporária, com truncamento fora do tempo registrado.
 O CI executa o teste com PostgreSQL 16 e publica linhas/s,
 bytes/op e alocações/op no log.
 
+Uma amostra do CI em Linux amd64, com três execuções de cada modo,
+produziu os números abaixo. A medição exclui a montagem das linhas
+Typhon e inclui a validação de tipos do COPY.
+
+| Modo | Linhas/s | Bytes/op | Alocações/op |
+| --- | ---: | ---: | ---: |
+| INSERT serial | 14.627 | 369.424 | 6.019 |
+| Batch | 271.640 | 829.386 | 9.048 |
+| COPY | 485.339 | 179.232 | 77 |
+
+[Execução do benchmark no CI](https://github.com/Jhon171819/Typhon/actions/runs/44450214739)
+
 ```sh
 go test ./internal/typhon -run '^$' -bench '^BenchmarkNativePostgresBulk$' -benchmem -benchtime=3x
 ```
