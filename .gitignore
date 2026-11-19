@@ -9,3 +9,6 @@ dist/
 *.vsix
 editors/typhon/node_modules/
 editors/zed/grammar/node_modules/
+.env
+.env.*
+!.env.example

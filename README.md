@@ -115,6 +115,8 @@ The Go runtime currently supports:
   SIGTERM and SIGINT, with a configurable grace period.
 - [Host HTTP health probes](docs/http_health.md) report liveness, readiness
   and authenticated dependency diagnostics outside the VM queue.
+- [Docker Compose example](docs/docker_compose.md) runs the Typhon API,
+  PostgreSQL, Redis and a one-shot schema migration.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
