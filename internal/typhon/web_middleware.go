@@ -30,6 +30,9 @@ func newWebRequest(req *http.Request) *webRequest {
 	}
 	state := &webRequest{path: req.URL.EscapedPath(), rawQuery: req.URL.RawQuery, id: rand.Text(), principal: principal,
 		bearer: bearerToken(req.Header.Values("Authorization")), contentType: req.Header.Get("Content-Type")}
+	if observation := observeRequest(req.Context()); observation != nil {
+		state.id = observation.id
+	}
 	if keys := req.Header.Values("Idempotency-Key"); len(keys) == 1 {
 		state.idempotencyKey = keys[0]
 	}
@@ -95,6 +98,9 @@ func (p webPipeline) run(vm *VM, index int) (Value, error) {
 		p.state.sendID = true
 		return p.run(vm, index+1)
 	case webLogging:
+		if observation := observeRequest(vm.context()); observation != nil && observation.observer.logger != nil {
+			return p.run(vm, index+1)
+		}
 		start := time.Now()
 		response, err := p.run(vm, index+1)
 		method := p.request.NativeObject.Attrs["method"].Str

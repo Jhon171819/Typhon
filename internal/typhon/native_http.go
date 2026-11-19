@@ -193,6 +193,7 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 				return NoneValue(), err
 			}
 		}
+		injectHTTPTrace(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			return NoneValue(), driverFailure("HTTP", connectionKind, err)
@@ -389,7 +390,9 @@ func httpVMHandlerWithContext(engine *Engine, handler Value, timeout time.Durati
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()
 			defer engine.execMu.Unlock()
+			started := time.Now()
 			result, err := callHTTPHandler(child, handler, request)
+			observeRequest(ctx).stage("vm", time.Since(started))
 			if err == nil && result.Kind == ValueNativeObject {
 				stream, _ = result.NativeObject.data.(*httpStreamingResponse)
 				events, _ = result.NativeObject.data.(*httpSSEResponse)
@@ -469,7 +472,11 @@ func httpVMHandlerWithContext(engine *Engine, handler Value, timeout time.Durati
 				return
 			}
 			if !problems.enabled {
-				log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
+				if observation := observeRequest(req.Context()); observation == nil || observation.observer.logger == nil {
+					log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
+				} else {
+					logWebFailure(webState.id, observation.route, http.StatusInternalServerError, runErr)
+				}
 			}
 			var quota *QuotaError
 			if errors.As(primary, &quota) {
@@ -615,7 +622,14 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 			return NoneValue(), err
 		}
 	}
-	drain := newHTTPDrain(httpHandler, pool, readiness)
+	observer, err := newHTTPObserver(workerContext, pool, append([]*Engine{vm.engine}, pool.engines...))
+	if err != nil {
+		reportCleanupError("HTTP listener after observability configuration failure", driverFailure("HTTP", connectionKind, listener.Close()))
+		return NoneValue(), err
+	}
+	defer observer.close()
+	router, _ := routerValue(handler)
+	drain := newHTTPDrain(observer.wrap(httpHandler, router), pool, readiness)
 	health, err := newHTTPHealth(workerContext, readiness, pool.liveness)
 	if err != nil {
 		reportCleanupError("HTTP listener after health configuration failure", driverFailure("HTTP", connectionKind, listener.Close()))

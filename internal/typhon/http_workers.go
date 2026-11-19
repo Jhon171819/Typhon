@@ -180,6 +180,7 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 		return
 	}
 	p.metrics.admitted.Add(1)
+	queuedAt := time.Now()
 	var worker http.Handler
 	select {
 	case worker = <-p.idle:
@@ -192,6 +193,7 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 		return
 	}
 	defer func() { p.idle <- worker }()
+	observeRequest(ctx).stage("queue", time.Since(queuedAt))
 	if ctx.Err() != nil || p.ctx.Err() != nil {
 		p.metrics.rejected.Add(1)
 		writeHTTPStop(writer, p.ctx, ctx.Err(), problems)

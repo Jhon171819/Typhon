@@ -117,6 +117,8 @@ The Go runtime currently supports:
   and authenticated dependency diagnostics outside the VM queue.
 - [Docker Compose example](docs/docker_compose.md) runs the Typhon API,
   PostgreSQL, Redis and a one-shot schema migration.
+- [HTTP observability](docs/observability.md) adds opt-in JSON logs,
+  Prometheus histograms and OTLP traces for native driver work.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

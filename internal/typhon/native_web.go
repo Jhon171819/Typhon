@@ -491,6 +491,9 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 			return r.problem(vm, state, 503, "authentication temporarily unavailable", nil)
 		}
 		state.principal = principal
+		if observation := observeRequest(vm.context()); observation != nil {
+			observation.setTenant(principal.tenant)
+		}
 		request.NativeObject.Attrs["identity"] = StringValue(principal.subject)
 		request.NativeObject.Attrs["tenant"] = optionalWebString(principal.tenant, principal.tenant != "")
 		if route.policy != nil {

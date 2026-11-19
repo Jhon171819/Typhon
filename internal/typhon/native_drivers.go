@@ -156,7 +156,7 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 			return NoneValue(), err
 		}
 	}
-	value, err := fn.Fn(vm, converted)
+	value, err := observedNativeCall(vm, fn, converted)
 	if stop := vm.executionError(); stop != nil {
 		if fn.cleanup && err != nil {
 			reportCleanupError(fn.Name, err)
