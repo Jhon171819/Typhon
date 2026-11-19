@@ -103,6 +103,8 @@ The Go runtime currently supports:
   parameterized COPY FROM and batch execution.
 - [PostgreSQL migrations](docs/postgres_migrations.md) run as an explicit
   deployment step with checksums, revision history and a database lock.
+- [PostgreSQL tenant isolation](docs/postgres_rls.md) binds the authorized
+  tenant to a transaction and illustrates row security and tenant-scoped cache.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

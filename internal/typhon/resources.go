@@ -77,6 +77,7 @@ type requestScope struct {
 	resources resourceScope
 	tasks     []*Task // guarded by the Engine's execMu
 	cancel    context.CancelFunc
+	web       *webRequest
 }
 
 func (s *requestScope) finish(e *Engine) error {

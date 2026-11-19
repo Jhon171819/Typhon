@@ -42,6 +42,10 @@ func postgresDriverTypes() map[string]Type {
 	callback := nativeFuncType("postgres.transaction.callback", []Type{tx}, AnyType(), 0)
 	connection.Members["transaction"] = nativeFuncType("postgres.transaction",
 		[]Type{callback, StrType(), BoolType(), IntType()}, AnyType(), 3)
+	request := httpDriverTypes()["Request"]
+	tenantCallback := nativeFuncType("postgres.tenant_transaction.callback", []Type{tx, request}, AnyType(), 0)
+	connection.Members["tenant_transaction"] = nativeFuncType("postgres.tenant_transaction",
+		[]Type{request, tenantCallback, StrType(), BoolType(), IntType()}, AnyType(), 3)
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
 	connection.Members["stats"] = nativeFuncType("postgres.stats", nil, dictType(StrType(), IntType()), 0)
 	types := map[string]Type{
@@ -336,8 +340,9 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 			}
 			return postgresTxValue(vm, tx), nil
 		}),
-		"transaction": driverFunc(typ.Members["transaction"], db.transaction),
-		"cursor":      driverFunc(typ.Members["cursor"], db.cursor),
+		"transaction":        driverFunc(typ.Members["transaction"], db.transaction),
+		"tenant_transaction": driverFunc(typ.Members["tenant_transaction"], db.tenantTransaction),
+		"cursor":             driverFunc(typ.Members["cursor"], db.cursor),
 	}
 	postgresBulkBindings(attrs, typ, db, nil)
 	value := scopedNativeObject(vm, typ, attrs)

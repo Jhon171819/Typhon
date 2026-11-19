@@ -314,7 +314,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			}
 			return
 		}
-		scope := &requestScope{cancel: cancel}
+		scope := &requestScope{cancel: cancel, web: webState}
 		if inbound != nil {
 			if err := scope.resources.add(ctx, inbound, "HTTP streaming request body", inbound.close); err != nil {
 				problems.write(writer, http.StatusInternalServerError, "could not initialize streaming request body")

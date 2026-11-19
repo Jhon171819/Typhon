@@ -50,15 +50,16 @@ type webRouter struct {
 }
 
 type webRequest struct {
-	path        string
-	rawQuery    string
-	params      map[string]string
-	id          string
-	sendID      bool
-	state       map[string]string
-	principal   verifiedRequestIdentity
-	bearer      string
-	rateHeaders http.Header
+	path                string
+	rawQuery            string
+	params              map[string]string
+	id                  string
+	sendID              bool
+	state               map[string]string
+	principal           verifiedRequestIdentity
+	authorizationAction string
+	bearer              string
+	rateHeaders         http.Header
 }
 
 func httpHandlerType() Type {
@@ -463,6 +464,9 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 		}
 		return r.problem(vm, state, 405, "method not allowed", headers)
 	}
+	previousAction := state.authorizationAction
+	state.authorizationAction = ""
+	defer func() { state.authorizationAction = previousAction }()
 	if route.auth != nil {
 		principal, err := route.auth.verify(vm.context(), state.bearer)
 		if stop := vm.executionError(); stop != nil {
@@ -487,6 +491,7 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 			if !allowed {
 				return r.problem(vm, state, 403, "permission denied", http.Header{"Cache-Control": {"no-store"}})
 			}
+			state.authorizationAction = route.action
 		}
 		if route.rate != nil {
 			if principal.tenant == "" {

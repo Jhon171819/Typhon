@@ -82,13 +82,17 @@ func postgresCommitError(err error) error {
 }
 
 func (db *postgresConnection) transaction(vm *VM, args []Value) (Value, error) {
-	options, err := postgresTxOptions(args[1:])
+	return db.scopedTransaction(vm, args[0], args[1:], nil)
+}
+
+func (db *postgresConnection) scopedTransaction(vm *VM, callback Value, args []Value, prepare func(*postgresTransaction) error, extras ...Value) (Value, error) {
+	options, err := postgresTxOptions(args)
 	if err != nil {
 		return NoneValue(), err
 	}
 	retries := int64(0)
-	if len(args) > 3 {
-		retries = args[3].Int
+	if len(args) > 2 {
+		retries = args[2].Int
 		if retries < 0 || retries > 4 {
 			return NoneValue(), errors.New("PostgreSQL transaction retries must be between 0 and 4")
 		}
@@ -98,7 +102,13 @@ func (db *postgresConnection) transaction(vm *VM, args []Value) (Value, error) {
 		if err != nil {
 			return NoneValue(), err
 		}
-		value, err := vm.callValue(args[0], []Value{postgresTxValue(vm, tx)}, nil)
+		value := NoneValue()
+		if prepare != nil {
+			err = prepare(tx)
+		}
+		if err == nil {
+			value, err = vm.callValue(callback, append([]Value{postgresTxValue(vm, tx)}, extras...), nil)
+		}
 		tx.mu.Lock()
 		canRetry := !tx.committed && (tx.commitErr == nil || postgresRetryable(tx.commitErr))
 		if !tx.ended && tx.tx.Conn().PgConn().TxStatus() == 'I' {
