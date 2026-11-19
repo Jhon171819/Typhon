@@ -10,10 +10,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxHTTPBody = 8 * 1024 * 1024
+
+// Runtime objects read these signatures. The checker gets its own registry.
+var httpRuntimeTypes = sync.OnceValue(httpDriverTypes)
 
 func httpDriverTypes() map[string]Type {
 	header := nativeFuncType("http.header", []Type{StrType()}, StrType(), 0)
@@ -144,7 +148,7 @@ func httpResponse(vm *VM, status int64, body string, headers http.Header) (Value
 	if err := vm.chargeBytes(int64(len(body))); err != nil {
 		return NoneValue(), err
 	}
-	typ := httpDriverTypes()["Response"]
+	typ := httpRuntimeTypes()["Response"]
 	value := nativeObject(vm, typ, map[string]Value{
 		"status": IntValue(status), "body": StringValue(body),
 		"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(headers.Get(args[0].Str)), nil }),
@@ -280,7 +284,7 @@ func httpVMHandlerWithContext(engine *Engine, handler Value, timeout time.Durati
 		}
 		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
 		child.executionBudget().bytes = int64(len(body)) + valueSlotBytes
-		typ := httpDriverTypes()["Request"]
+		typ := httpRuntimeTypes()["Request"]
 		bodyText := string(body)
 		query := req.URL.Query()
 		attrs := map[string]Value{
@@ -459,7 +463,7 @@ func httpVMHandlerWithContext(engine *Engine, handler Value, timeout time.Durati
 			writeHTTPStop(writer, serverContext, context.DeadlineExceeded, problems)
 			return
 		}
-		if result.Kind != ValueNativeObject || !result.NativeObject.Type.Equal(httpDriverTypes()["Response"]) {
+		if result.Kind != ValueNativeObject || !result.NativeObject.Type.Equal(httpRuntimeTypes()["Response"]) {
 			problems.write(writer, http.StatusInternalServerError, "invalid handler response")
 			return
 		}

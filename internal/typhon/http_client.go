@@ -133,7 +133,7 @@ func makeHTTPClient(vm *VM, config httpClientConfig) (Value, error) {
 	if err := scope.add(vm.context(), outbound, "HTTP client close", closeClient); err != nil {
 		return NoneValue(), err
 	}
-	typ := httpDriverTypes()["Client"]
+	typ := httpRuntimeTypes()["Client"]
 	return scopedNativeObject(vm, typ, map[string]Value{
 		"request": driverFunc(typ.Members["request"], func(vm *VM, args []Value) (Value, error) {
 			return outbound.request(vm, args[0].Str, args[1].Str, args[2].Str, args[3:], "")
