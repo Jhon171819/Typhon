@@ -1,0 +1,59 @@
+import typhon.http as http
+import typhon.scalars as s
+import typhon.web as web
+
+sink: http.Client = http.client(2)
+sink_url: str = http.env('STREAM_SINK_URL')
+routes: web.Router = web.router()
+routes.use_errors()
+
+def upload(req: http.Request) -> http.Response:
+    form: http.Multipart = req.multipart()
+    received: int = 0
+    try:
+        while True:
+            part: http.Part | None = form.next()
+            if part is None:
+                break
+            if part.name != 'file' or part.filename == '':
+                return web.problem(req, 400)
+            while True:
+                chunk: s.Bytes | None = part.read(65536)
+                if chunk is None:
+                    break
+                if sink_url != '':
+                    reply: http.Response = sink.request(
+                        'POST', sink_url, chunk.base64(),
+                        [['Content-Type', 'text/plain'], ['X-Upload-ID', req.request_id]]
+                    )
+                    if reply.status != 204:
+                        return web.problem(req, 503)
+                received = received + chunk.size
+            part.close()
+    finally:
+        form.close()
+    return http.json(201, {'bytes_received': received})
+
+def csv_chunk(state: Any) -> s.Bytes | None:
+    position: list[int] = state
+    index: int = position[0]
+    position[0] = index + 1
+    if index == 0:
+        return s.bytes_utf8('id,status\n')
+    if index > 1000:
+        return None
+    return s.bytes_utf8('1,completed\n')
+
+def export(req: http.Request) -> http.Response:
+    position: list[int] = [0]
+    return http.stream(200, csv_chunk, position, [
+        ['Content-Type', 'text/csv; charset=utf-8'],
+        ['Content-Disposition', 'attachment; filename="export.csv"']
+    ])
+
+routes.add('POST', '/v1/uploads', upload)
+routes.stream_upload('POST', '/v1/uploads', 33554432, 16777216, 16)
+routes.add('GET', '/v1/export', export)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

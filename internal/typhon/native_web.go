@@ -26,6 +26,7 @@ type webRoute struct {
 	action  string
 	rate    *webRouteRate
 	doc     *webRouteDoc
+	upload  *httpUploadPolicy
 }
 
 type webNode struct {
@@ -86,6 +87,7 @@ func webDriverTypes() map[string]Type {
 	router.Members["document"] = nativeFuncType("web.document",
 		[]Type{StrType(), StrType(), StrType(), strings, dictType(IntType(), schema), schema, schema}, NoneType(), 2)
 	router.Members["configure_docs"] = nativeFuncType("web.configure_docs", []Type{StrType(), StrType(), BoolType()}, NoneType(), 1)
+	router.Members["stream_upload"] = nativeFuncType("web.stream_upload", []Type{StrType(), StrType(), IntType(), IntType(), IntType()}, NoneType(), 2)
 	types := map[string]Type{
 		"Router":         router,
 		"Next":           next,
@@ -252,6 +254,27 @@ func webDriverExports(types map[string]Type) map[string]Value {
 				router.docs = webDocsConfig{title: args[0].Str, version: args[1].Str, serve: len(args) == 3 && args[2].Bool}
 				return NoneValue(), nil
 			}),
+			"stream_upload": driverFunc(typ.Members["stream_upload"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen {
+					return NoneValue(), errors.New("router was already started")
+				}
+				route := router.routes[[2]string{args[0].Str, args[1].Str}]
+				if route == nil || route.upload != nil || args[0].Str == "HEAD" {
+					return NoneValue(), errors.New("stream upload requires a registered non-HEAD route without an upload policy")
+				}
+				total, part, parts := args[2].Int, args[2].Int, int64(16)
+				if len(args) > 3 {
+					part = args[3].Int
+				}
+				if len(args) > 4 {
+					parts = args[4].Int
+				}
+				if total < 1 || total > maxHTTPStreamBytes || part < 1 || part > total || parts < 1 || parts > 100 {
+					return NoneValue(), errors.New("invalid HTTP streaming upload limits")
+				}
+				route.upload = &httpUploadPolicy{total: total, part: part, parts: int(parts)}
+				return NoneValue(), nil
+			}),
 		})
 		value.NativeObject.data = router
 		return value, nil
@@ -376,22 +399,42 @@ func (n *webNode) allowedMethods() string {
 	return strings.Join(allowed, ", ")
 }
 
+func webRequestSegments(path string) ([]string, error) {
+	segments, err := webSegments(path)
+	if err != nil {
+		return nil, err
+	}
+	for i, segment := range segments {
+		decoded, err := url.PathUnescape(segment)
+		if err != nil || !safeWebSegment(decoded) {
+			return nil, errors.New("invalid request path")
+		}
+		segments[i] = decoded
+	}
+	return segments, nil
+}
+
+func (r *webRouter) uploadPolicy(path, method string) *httpUploadPolicy {
+	segments, err := webRequestSegments(path)
+	if err == nil {
+		if node := r.root.match(segments); node != nil {
+			if route := node.methods[method]; route != nil {
+				return route.upload
+			}
+		}
+	}
+	return nil
+}
+
 func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 	r.frozen = true
 	state, ok := request.NativeObject.data.(*webRequest)
 	if !ok {
 		return NoneValue(), errors.New("invalid router request")
 	}
-	segments, err := webSegments(state.path)
+	segments, err := webRequestSegments(state.path)
 	if err != nil {
 		return r.problem(vm, state, 400, "invalid request path", nil)
-	}
-	for i, segment := range segments {
-		decoded, err := url.PathUnescape(segment)
-		if err != nil || !safeWebSegment(decoded) {
-			return r.problem(vm, state, 400, "invalid request path", nil)
-		}
-		segments[i] = decoded
 	}
 	node := r.root.match(segments)
 	if node == nil {

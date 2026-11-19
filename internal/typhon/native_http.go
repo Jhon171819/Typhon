@@ -36,6 +36,10 @@ func httpDriverTypes() map[string]Type {
 		"set_state":  nativeFuncType("http.request.set_state", []Type{StrType(), StrType()}, NoneType(), 0),
 	}}
 	headers := listType(listType(StrType()))
+	bodyType, form, part := httpStreamTypes()
+	request.Members["stream"] = nativeFuncType("http.request.stream", nil, bodyType, 0)
+	request.Members["multipart"] = nativeFuncType("http.request.multipart", nil, form, 0)
+	producer := nativeFuncType("http.stream.producer", []Type{AnyType()}, unionType(scalarType("Bytes"), NoneType()), 0)
 	client := Type{Kind: TypeNative, Name: "typhon.http.Client", Members: map[string]Type{
 		"get":     nativeFuncType("http.get", []Type{StrType()}, response, 0),
 		"request": nativeFuncType("http.request", []Type{StrType(), StrType(), StrType(), headers}, response, 1),
@@ -43,9 +47,11 @@ func httpDriverTypes() map[string]Type {
 	}}
 	return map[string]Type{
 		"Request": request, "Response": response, "Client": client,
-		"client":       nativeFuncType("http.client", []Type{FloatType()}, client, 1),
-		"response":     nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
-		"json":         nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
+		"client":   nativeFuncType("http.client", []Type{FloatType()}, client, 1),
+		"response": nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
+		"json":     nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
+		"stream":   nativeFuncType("http.stream", []Type{IntType(), producer, AnyType(), headers}, response, 1),
+		"Body":     bodyType, "Multipart": form, "Part": part,
 		"serve":        nativeFuncType("http.serve", []Type{StrType(), unionType(httpHandlerType(), Type{Kind: TypeNative, Name: routerTypeName}), IntType(), IntType(), FloatType()}, NoneType(), 3),
 		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
 		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
@@ -55,6 +61,7 @@ func httpDriverTypes() map[string]Type {
 func httpDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
 	exports["client"] = driverFunc(types["client"], nativeHTTPClient)
+	exports["stream"] = driverFunc(types["stream"], makeHTTPStream)
 	exports["response"] = driverFunc(types["response"], func(vm *VM, args []Value) (Value, error) {
 		headers := http.Header{}
 		if len(args) == 3 {
@@ -225,7 +232,8 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
 		webState := newWebRequest(req)
 		problems := problemWriter{id: webState.id, head: req.Method == http.MethodHead}
-		if router, ok := routerValue(handler); ok {
+		router, routed := routerValue(handler)
+		if routed {
 			problems.enabled = router.apiErrors
 		}
 		select {
@@ -246,7 +254,27 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
 			return
 		}
-		body, err := readHTTPRequestBody(writer, req, ctx, min(int64(maxHTTPBody), engine.quotas.requestBytes-valueSlotBytes))
+		var upload *httpUploadPolicy
+		if routed {
+			upload = router.uploadPolicy(webState.path, req.Method)
+		}
+		var inbound *httpInboundStream
+		var body []byte
+		var err error
+		if upload == nil {
+			body, err = readHTTPRequestBody(writer, req, ctx, min(int64(maxHTTPBody), engine.quotas.requestBytes-valueSlotBytes))
+		} else if req.ContentLength > upload.total {
+			err = &http.MaxBytesError{Limit: upload.total}
+		} else {
+			inbound = &httpInboundStream{
+				ctx: ctx, body: http.MaxBytesReader(writer, req.Body, upload.total), transport: req.Body, contentType: req.Header.Get("Content-Type"),
+				controller: http.NewResponseController(writer), policy: *upload,
+			}
+			// net/http otherwise drains the upload before committing a
+			// response, including when the multipart parser rejected it.
+			_ = inbound.controller.EnableFullDuplex()
+			defer func() { reportCleanupError("HTTP streaming request body", inbound.release()) }()
+		}
 		if ctx.Err() != nil {
 			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
 			return
@@ -267,6 +295,12 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return
 		}
 		scope := &requestScope{cancel: cancel}
+		if inbound != nil {
+			if err := scope.resources.add(ctx, inbound, "HTTP streaming request body", inbound.close); err != nil {
+				problems.write(writer, http.StatusInternalServerError, "could not initialize streaming request body")
+				return
+			}
+		}
 		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
 		child.executionBudget().bytes = int64(len(body)) + valueSlotBytes
 		typ := httpDriverTypes()["Request"]
@@ -290,7 +324,14 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			"param": driverFunc(typ.Members["param"], func(vm *VM, args []Value) (Value, error) {
 				return StringValue(webState.params[args[0].Str]), nil
 			}),
-			"json": driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) { return loadJSON(vm, bodyText) }),
+			"json": driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) {
+				if inbound != nil {
+					return NoneValue(), errors.New("buffered JSON is unavailable on streaming upload routes")
+				}
+				return loadJSON(vm, bodyText)
+			}),
+			"stream":    driverFunc(typ.Members["stream"], func(vm *VM, args []Value) (Value, error) { return inbound.raw(vm) }),
+			"multipart": driverFunc(typ.Members["multipart"], func(vm *VM, args []Value) (Value, error) { return inbound.multipart(vm) }),
 			"remaining": driverFunc(typ.Members["remaining"], func(vm *VM, args []Value) (Value, error) {
 				deadline, _ := ctx.Deadline()
 				if ctx.Err() != nil {
@@ -316,13 +357,38 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		})
 		request := scopedNativeObject(child, typ, attrs)
 		request.NativeObject.data = webState
+		var stream *httpStreamingResponse
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()
 			defer engine.execMu.Unlock()
-			defer cancel()
-			return callHTTPHandler(child, handler, request)
+			result, err := callHTTPHandler(child, handler, request)
+			if err == nil && result.Kind == ValueNativeObject {
+				stream, _ = result.NativeObject.data.(*httpStreamingResponse)
+			}
+			if stream == nil {
+				// Stop request tasks before they can acquire the VM lock.
+				cancel()
+			}
+			return result, err
 		}()
+		streamStarted := false
+		if stream != nil {
+			streamStarted, runErr = writeHTTPStream(child, writer, req, webState, result, stream)
+		}
+		cancel()
 		cleanupErr := scope.finish(engine)
+		if inbound != nil && !inbound.ended && !streamStarted {
+			writer.Header().Set("Connection", "close")
+		}
+		if streamStarted {
+			reportCleanupError("HTTP stream", cleanupErr)
+			if runErr != nil {
+				logWebFailure(webState.id, "", http.StatusInternalServerError, runErr)
+				// A completed HTTP message would hide truncation from the client.
+				panic(http.ErrAbortHandler)
+			}
+			return
+		}
 		if webState.sendID {
 			writer.Header().Set("X-Request-ID", webState.id)
 		}
@@ -337,6 +403,11 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			primary = cleanupErr
 		}
 		if primary != nil {
+			var rejection *webRejection
+			if inbound != nil && errors.As(primary, &rejection) {
+				problems.write(writer, rejection.status, rejection.Error())
+				return
+			}
 			if !problems.enabled {
 				log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
 			}
@@ -384,16 +455,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 				}
 			}
 		}
-		headers := result.NativeObject.data.(http.Header)
-		for name, values := range headers {
-			writer.Header()[name] = values
-		}
-		for name, values := range webState.rateHeaders {
-			writer.Header()[name] = values
-		}
-		if webState.sendID {
-			writer.Header().Set("X-Request-ID", webState.id)
-		}
+		setHTTPResponseHeaders(writer, webState, result.NativeObject.data.(http.Header))
 		status := int(responseAttrs["status"].Int)
 		if req.Method == http.MethodHead && writer.Header().Get("Content-Length") == "" && status != 204 && status != 304 {
 			writer.Header().Set("Content-Length", strconv.Itoa(len(responseAttrs["body"].Str)))
@@ -403,6 +465,18 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			_, _ = io.WriteString(writer, responseAttrs["body"].Str)
 		}
 	})
+}
+
+func setHTTPResponseHeaders(writer http.ResponseWriter, state *webRequest, headers http.Header) {
+	for name, values := range headers {
+		writer.Header()[name] = values
+	}
+	for name, values := range state.rateHeaders {
+		writer.Header()[name] = values
+	}
+	if state.sendID {
+		writer.Header().Set("X-Request-ID", state.id)
+	}
 }
 
 func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaError, problems problemWriter) {

@@ -87,6 +87,8 @@ The Go runtime currently supports:
   their validation schemas, with an opt-in documentation page.
 - [REST pagination](docs/http_pagination.md) provides typed filters,
   bounded pages and opaque cursors for stable SQL ordering.
+- [HTTP streaming](docs/http_streaming.md) handles multipart uploads and
+  binary downloads through bounded, cancellable chunks.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

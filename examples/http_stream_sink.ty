@@ -1,0 +1,17 @@
+import typhon.http as http
+import typhon.scalars as s
+import typhon.web as web
+
+routes: web.Router = web.router()
+routes.use_errors()
+
+def receive(req: http.Request) -> http.Response:
+    block: s.Bytes = s.bytes_base64(req.body)
+    if req.header('X-Upload-ID') == '' or block.size > 65536:
+        return web.problem(req, 400)
+    return http.response(204, '')
+
+routes.add('POST', '/chunks', receive)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8082', routes)

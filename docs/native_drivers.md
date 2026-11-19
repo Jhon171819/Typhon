@@ -54,9 +54,10 @@ http.serve('127.0.0.1:8080', handle)
 ```
 
 `http.Request` oferece `method`, `path`, `body` (`str`), `header(name)` e
-`query(name)` (`str`). Header/query ausente retorna `''`. Não há streaming,
-WebSocket ou upload multipart nesta API; o corpo completo fica em memória,
-com limite de 8 MiB para requests e responses. Headers fornecidos são pares
+`query(name)` (`str`). Header/query ausente retorna `''`. O corpo
+fica em memória por padrão, com limite de 8 MiB para requests e
+responses. Use [streaming HTTP](http_streaming.md) para multipart e
+respostas por blocos. Headers fornecidos são pares
 `[nome, valor]`; nomes inválidos e quebras de linha são rejeitados.
 `req.json()` decodifica o corpo com o mesmo codec de `json.loads`.
 `req.query_all(name)` devolve todas as ocorrências, e `req.param(name)`

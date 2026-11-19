@@ -36,17 +36,7 @@ func writeHTTPStop(w http.ResponseWriter, server context.Context, err error, pro
 
 func readHTTPRequestBody(w http.ResponseWriter, req *http.Request, ctx context.Context, limit int64) ([]byte, error) {
 	controller := http.NewResponseController(w)
-	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		// Some embedding ResponseWriters (including httptest recorders)
-		// have no socket. Real net/http handlers support read deadlines.
-		_ = controller.SetReadDeadline(time.Now())
-		close(done)
-	})
-	defer func() {
-		if !stop() {
-			<-done
-		}
-	}()
+	stop := armSocketDeadline(ctx, controller.SetReadDeadline)
+	defer stop()
 	return io.ReadAll(http.MaxBytesReader(w, req.Body, limit))
 }
