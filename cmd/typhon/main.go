@@ -47,7 +47,7 @@ func runWithContext(ctx context.Context, args []string) error {
 	args = filtered
 
 	if len(args) == 0 {
-		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode> <file.ty>")
+		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode|openapi> <file.ty>")
 	}
 
 	command := args[0]
@@ -55,15 +55,30 @@ func runWithContext(ctx context.Context, args []string) error {
 		fmt.Printf("Typhon %s (Go VM, Python bridge protocol %d)\n", typhon.Version, typhon.PythonProtocolVersion)
 		return nil
 	}
-	if command != "run" && command != "check" && command != "check-imports" && command != "bytecode" {
+	if command != "run" && command != "check" && command != "check-imports" && command != "bytecode" && command != "openapi" {
 		if len(args) == 1 {
 			return typhon.RunFileWithOptions(args[0], typhon.RunOptions{Context: ctx, WarmPython: warmPython, SharedPython: sharedPython})
 		}
-		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode> <file.ty>")
+		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode|openapi> <file.ty>")
 	}
 
 	if (warmPythonFlag || sharedPythonFlag) && command != "run" {
 		return fmt.Errorf("--warm-python and --shared-python only apply to run")
+	}
+	if command == "openapi" {
+		if len(args) != 2 && len(args) != 3 {
+			return fmt.Errorf("usage: typhon openapi <file.ty> [router]")
+		}
+		binding := "routes"
+		if len(args) == 3 {
+			binding = args[2]
+		}
+		document, err := typhon.OpenAPIFile(ctx, args[1], binding)
+		if err != nil {
+			return err
+		}
+		_, err = os.Stdout.Write(document)
+		return err
 	}
 
 	if len(args) != 2 {

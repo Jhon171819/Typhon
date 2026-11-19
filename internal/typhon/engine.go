@@ -38,6 +38,7 @@ type Engine struct {
 	warmPython    bool
 	sharedPython  bool
 	httpWorker    bool
+	openAPIExport bool
 	httpMetrics   atomic.Pointer[httpPoolMetrics]
 	quotas        quotaLimits
 	quotaErr      error

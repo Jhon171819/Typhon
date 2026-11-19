@@ -1,0 +1,78 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.validation as v
+import typhon.web as web
+
+create_body: v.Schema = v.object({'name': v.text(1, 80)})
+record_response: v.Schema = v.object({'id': v.text(1, 4096), 'name': v.text(1, 80)})
+list_query: v.Schema = v.object({}, {'name': v.text(1, 80)})
+rows: dict[str, str] = {}
+verifier: auth.Authenticator = auth.jwt('https://issuer.example.org', 'records-api', 'https://issuer.example.org/jwks')
+routes: web.Router = web.router()
+routes.use_errors()
+routes.configure_docs('Records API', '1.0.0', http.env('TYPHON_DOCS') == '1')
+
+def write_record(req: http.Request, status: int) -> http.Response:
+    payload: Any = req.json()
+    issue: http.Response | None = web.validate(req, create_body, payload)
+    if issue is not None:
+        return issue
+    dto: dict[str, str] = payload
+    id: str = req.param('id')
+    rows[id] = dto['name']
+    return http.json(status, {'id': id, 'name': rows[id]})
+
+def create(req: http.Request) -> http.Response:
+    id: str = req.param('id')
+    if id in rows:
+        return web.problem(req, 409)
+    return write_record(req, 201)
+
+def read(req: http.Request) -> http.Response:
+    id: str = req.param('id')
+    if id not in rows:
+        return web.problem(req, 404)
+    return http.json(200, {'id': id, 'name': rows[id]})
+
+def list_records(req: http.Request) -> http.Response:
+    name: str = req.query('name')
+    if name != '':
+        issue: http.Response | None = web.validate(req, list_query, {'name': name})
+        if issue is not None:
+            return issue
+    records: list[dict[str, str]] = []
+    for id: str, value: str in rows.items():
+        if name == '' or name == value:
+            records.append({'id': id, 'name': value})
+    return http.json(200, records)
+
+def replace(req: http.Request) -> http.Response:
+    if req.param('id') not in rows:
+        return web.problem(req, 404)
+    return write_record(req, 200)
+
+def remove(req: http.Request) -> http.Response:
+    id: str = req.param('id')
+    if id not in rows:
+        return web.problem(req, 404)
+    rows.pop(id)
+    return http.response(204, '')
+
+def internal(req: http.Request) -> http.Response:
+    return http.response(204, '')
+
+routes.add('GET', '/internal/ready', internal)
+routes.add('GET', '/records', list_records)
+routes.document('GET', '/records', 'listRecords', ['records'], {200: v.array(record_response), 422: None}, None, list_query)
+routes.add('POST', '/records/{id}', create)
+routes.document('POST', '/records/{id}', 'createRecord', ['records'], {201: record_response, 409: None}, create_body)
+routes.add('GET', '/records/{id}', read)
+routes.require_auth('GET', '/records/{id}', verifier)
+routes.document('GET', '/records/{id}', 'getRecord', ['records'], {200: record_response, 404: None})
+routes.add('PUT', '/records/{id}', replace)
+routes.document('PUT', '/records/{id}', 'replaceRecord', ['records'], {200: record_response, 404: None}, create_body)
+routes.add('DELETE', '/records/{id}', remove)
+routes.document('DELETE', '/records/{id}', 'deleteRecord', ['records'], {204: None, 404: None})
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

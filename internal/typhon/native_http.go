@@ -414,6 +414,9 @@ func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaErro
 
 func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	handler := args[1]
+	if vm.engine.openAPIExport {
+		return NoneValue(), fmt.Errorf("put http.serve inside the main module guard when exporting OpenAPI")
+	}
 	if _, router := routerValue(handler); !router && (handler.Kind != ValueFunction || !handler.Function.Signature.Equal(httpHandlerType())) {
 		return NoneValue(), fmt.Errorf("handler must be a Router or a function (Request) -> Response")
 	}
@@ -454,7 +457,15 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 		reportCleanupError("HTTP listener after worker startup failure", driverFailure("HTTP", connectionKind, listener.Close()))
 		return NoneValue(), err
 	}
-	server := &http.Server{Handler: pool.browser.wrap(pool, pool.apiErrors), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	httpHandler := pool.browser.wrap(pool, pool.apiErrors)
+	if router, ok := routerValue(handler); ok {
+		httpHandler, err = router.docsHandler(httpHandler)
+		if err != nil {
+			reportCleanupError("HTTP listener after docs configuration failure", driverFailure("HTTP", connectionKind, listener.Close()))
+			return NoneValue(), err
+		}
+	}
+	server := &http.Server{Handler: httpHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	vm.engine.execMu.Unlock()

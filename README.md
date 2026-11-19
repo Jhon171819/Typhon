@@ -83,6 +83,8 @@ The Go runtime currently supports:
   in order and expose per-command outcomes and pool telemetry.
 - [Distributed request limits](docs/http_rate_limit.md) share authenticated
   quotas across API replicas through Redis.
+- [OpenAPI generation](docs/http_openapi.md) exports documented routes and
+  their validation schemas, with an opt-in documentation page.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

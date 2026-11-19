@@ -56,6 +56,12 @@ jobs:
       - run: go vet ./...
       - run: python -m unittest discover -s tests
       - run: go build ./...
+      - name: Validate exported OpenAPI
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: |
+          python -m pip install 'openapi-spec-validator==0.7.2'
+          go run ./cmd/typhon openapi examples/http_openapi.ty > openapi.json
+          python -m openapi_spec_validator openapi.json
       - name: JSON fuzz smoke
         if: runner.os == 'Linux' && matrix.python == '3.12'
         run: go test ./internal/typhon -run '^$' -fuzz '^FuzzNativeJSON$' -fuzztime 5s -parallel 2

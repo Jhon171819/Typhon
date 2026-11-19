@@ -673,7 +673,11 @@ func nativePrint(vm *VM, args []Value) (Value, error) {
 		}
 		parts = append(parts, arg.String())
 	}
-	fmt.Println(strings.Join(parts, " "))
+	text := strings.Join(parts, " ")
+	if vm.engine != nil && vm.engine.openAPIExport {
+		return NoneValue(), openAPIPrint(text)
+	}
+	fmt.Println(text)
 	return NoneValue(), nil
 }
 

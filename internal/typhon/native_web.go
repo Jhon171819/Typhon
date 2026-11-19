@@ -25,6 +25,7 @@ type webRoute struct {
 	policy  *webPolicy
 	action  string
 	rate    *webRouteRate
+	doc     *webRouteDoc
 }
 
 type webNode struct {
@@ -42,6 +43,7 @@ type webRouter struct {
 	steps     []webStep
 	apiErrors bool
 	browser   webBrowserPolicy
+	docs      webDocsConfig
 }
 
 type webRequest struct {
@@ -79,6 +81,10 @@ func webDriverTypes() map[string]Type {
 	router.Members["use_cors"] = nativeFuncType("web.use_cors", []Type{strings, strings, strings, BoolType()}, NoneType(), 1)
 	router.Members["use_security_headers"] = nativeFuncType("web.use_security_headers", []Type{StrType(), StrType(), IntType()}, NoneType(), 3)
 	router.Members["rate_limit"] = nativeFuncType("web.rate_limit", []Type{StrType(), StrType(), webRateLimiterType()}, NoneType(), 0)
+	schema := unionType(validationTypes()["Schema"], NoneType())
+	router.Members["document"] = nativeFuncType("web.document",
+		[]Type{StrType(), StrType(), StrType(), strings, dictType(IntType(), schema), schema, schema}, NoneType(), 2)
+	router.Members["configure_docs"] = nativeFuncType("web.configure_docs", []Type{StrType(), StrType(), BoolType()}, NoneType(), 1)
 	return map[string]Type{
 		"Router":         router,
 		"Next":           next,
@@ -230,6 +236,16 @@ func webDriverExports(types map[string]Type) map[string]Value {
 					return NoneValue(), errors.New("invalid route rate limiter")
 				}
 				route.rate = limiter.bind(args[0].Str, args[1].Str)
+				return NoneValue(), nil
+			}),
+			"document": driverFunc(typ.Members["document"], func(vm *VM, args []Value) (Value, error) {
+				return NoneValue(), router.document(vm, args)
+			}),
+			"configure_docs": driverFunc(typ.Members["configure_docs"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen || !validAuthText(args[0].Str, 256) || !validAuthText(args[1].Str, 80) {
+					return NoneValue(), errors.New("configure OpenAPI title and version before starting the router")
+				}
+				router.docs = webDocsConfig{title: args[0].Str, version: args[1].Str, serve: len(args) == 3 && args[2].Bool}
 				return NoneValue(), nil
 			}),
 		})
