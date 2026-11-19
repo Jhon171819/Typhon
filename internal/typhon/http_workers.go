@@ -48,7 +48,18 @@ func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool 
 }
 
 func (p *httpWorkerPool) load(vm *VM, handler Value) error {
+	router, routed := routerValue(handler)
+	if routed {
+		router.frozen = true
+	}
 	p.idle <- httpVMHandlerWithTimeout(vm.engine, handler, p.requestTimeout)
+	if cap(p.idle) == 1 {
+		return nil
+	}
+	path, binding, err := httpWorkerBinding(handler)
+	if err != nil {
+		return err
+	}
 	for i := 1; i < cap(p.idle); i++ {
 		if err := vm.executionError(); err != nil {
 			return err
@@ -57,20 +68,44 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		engine.httpWorker = true
 		engine.httpMetrics.Store(&p.metrics)
 		p.engines = append(p.engines, engine)
-		module, err := engine.LoadModule(handler.Function.ModulePath)
+		module, err := engine.LoadModule(path)
 		if err == nil {
 			err = engine.ExecuteModule(module, false)
 		}
 		if err != nil {
 			return fmt.Errorf("HTTP worker %d initialization: %w", i+1, err)
 		}
-		entry := module.Globals[handler.Function.Name]
-		if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
-			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, handler.Function.Name)
+		entry := module.Globals[binding]
+		if routed {
+			cloned, ok := routerValue(entry)
+			if !ok {
+				return fmt.Errorf("HTTP worker %d could not resolve router %q", i+1, binding)
+			}
+			cloned.frozen = true
+		} else if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
+			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, binding)
 		}
 		p.idle <- httpVMHandlerWithTimeout(engine, entry, p.requestTimeout)
 	}
 	return nil
+}
+
+func httpWorkerBinding(handler Value) (path, binding string, err error) {
+	router, routed := routerValue(handler)
+	if !routed {
+		return handler.Function.ModulePath, handler.Function.Name, nil
+	}
+	if router.module != nil {
+		for name, value := range router.module.Globals {
+			if value.Kind == ValueNativeObject && value.NativeObject == handler.NativeObject && (binding == "" || name < binding) {
+				binding = name
+			}
+		}
+		if binding != "" {
+			return router.module.Path, binding, nil
+		}
+	}
+	return "", "", errors.New("a multi-worker router must be assigned to a module global")
 }
 
 func (p *httpWorkerPool) close() error {

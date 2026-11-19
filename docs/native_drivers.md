@@ -30,7 +30,7 @@ Implementado com [`net/http`](https://pkg.go.dev/net/http).
 | `client.close()` | `None`; fecha conexões ociosas e impede novas chamadas |
 | `http.response(status, body, headers=[])` | `http.Response`; status de 200 a 599 |
 | `http.json(status, value)` | `http.Response`; [JSON nativo](native_json.md) com Content-Type apropriado |
-| `http.serve(address, handler, workers=1, queue=15, request_timeout=10)` | `None`; bloqueia até cancelamento/encerramento |
+| `http.serve(address, handler, workers=1, queue=15, request_timeout=10)` | `None`; aceita função ou [router](http_router.md) e serve até o encerramento |
 | `http.server_stats()` | `dict[str, int]`; métricas de admissão e espera do servidor ativo |
 
 O `=` nas tabelas indica o valor padrão; na chamada Typhon, passe valores
@@ -59,6 +59,8 @@ WebSocket ou upload multipart nesta API; o corpo completo fica em memória,
 com limite de 8 MiB para requests e responses. Headers fornecidos são pares
 `[nome, valor]`; nomes inválidos e quebras de linha são rejeitados.
 `req.json()` decodifica o corpo com o mesmo codec de `json.loads`.
+`req.query_all(name)` devolve todas as ocorrências, e `req.param(name)`
+expõe os parâmetros do caminho de um router.
 O [orçamento lógico](request_budgets.md) pode impor um teto menor e
 também considera bytes materializados pelo PostgreSQL e os corpos HTTP.
 

@@ -44,6 +44,8 @@ func nativeDriverInfo(name string) (*ModuleInfo, bool) {
 		exports = validationTypes()
 	case "typhon.scalars":
 		exports = scalarTypes()
+	case "typhon.web":
+		exports = webDriverTypes()
 	case "typhon.http":
 		exports = httpDriverTypes()
 	case "typhon.postgres":
@@ -69,6 +71,8 @@ func nativeDriverModule(name string) (Value, bool) {
 		exports = validationExports(info.Exports)
 	case "typhon.scalars":
 		exports = scalarExports(info.Exports)
+	case "typhon.web":
+		exports = webDriverExports(info.Exports)
 	case "typhon.http":
 		exports = httpDriverExports(info.Exports)
 	case "typhon.postgres":

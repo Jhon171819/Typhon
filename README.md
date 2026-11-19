@@ -67,6 +67,8 @@ The Go runtime currently supports:
   work and SQL results.
 - [Native scalar types](docs/native_scalars.md) cover binary data, exact
   decimals, UUIDs and dates with PostgreSQL and JSON codecs.
+- [HTTP routing](docs/http_router.md) supports method dispatch, path
+  parameters and versioned resource routes.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

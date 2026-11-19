@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,8 @@ func httpDriverTypes() map[string]Type {
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
 		"query":     nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
+		"query_all": nativeFuncType("http.query_all", []Type{StrType()}, listType(StrType()), 0),
+		"param":     nativeFuncType("http.param", []Type{StrType()}, StrType(), 0),
 		"json":      nativeFuncType("http.request.json", nil, AnyType(), 0),
 		"remaining": nativeFuncType("http.request.remaining", nil, FloatType(), 0),
 		"cancelled": nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
@@ -38,7 +41,7 @@ func httpDriverTypes() map[string]Type {
 		"client":       nativeFuncType("http.client", []Type{FloatType()}, client, 1),
 		"response":     nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
 		"json":         nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
-		"serve":        nativeFuncType("http.serve", []Type{StrType(), nativeFuncType("http.handler", []Type{request}, response, 0), IntType(), IntType(), FloatType()}, NoneType(), 3),
+		"serve":        nativeFuncType("http.serve", []Type{StrType(), unionType(httpHandlerType(), Type{Kind: TypeNative, Name: routerTypeName}), IntType(), IntType(), FloatType()}, NoneType(), 3),
 		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
 		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
 	}
@@ -251,11 +254,27 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		child.executionBudget().bytes = int64(len(body)) + valueSlotBytes
 		typ := httpDriverTypes()["Request"]
 		bodyText := string(body)
+		query := req.URL.Query()
+		webState := &webRequest{path: req.URL.EscapedPath()}
 		attrs := map[string]Value{
 			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(bodyText),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
-			"query":  driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.URL.Query().Get(args[0].Str)), nil }),
-			"json":   driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) { return loadJSON(vm, bodyText) }),
+			"query":  driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) { return StringValue(query.Get(args[0].Str)), nil }),
+			"query_all": driverFunc(typ.Members["query_all"], func(vm *VM, args []Value) (Value, error) {
+				matches := query[args[0].Str]
+				if err := vm.chargeBytes(int64(len(matches)) * 2 * valueSlotBytes); err != nil {
+					return NoneValue(), err
+				}
+				items := make([]Value, len(matches))
+				for i, match := range matches {
+					items[i] = StringValue(match)
+				}
+				return ListValue(items), nil
+			}),
+			"param": driverFunc(typ.Members["param"], func(vm *VM, args []Value) (Value, error) {
+				return StringValue(webState.params[args[0].Str]), nil
+			}),
+			"json": driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) { return loadJSON(vm, bodyText) }),
 			"remaining": driverFunc(typ.Members["remaining"], func(vm *VM, args []Value) (Value, error) {
 				deadline, _ := ctx.Deadline()
 				if ctx.Err() != nil {
@@ -270,11 +289,12 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		attrs["remaining"].Native.cleanup = true
 		attrs["cancelled"].Native.cleanup = true
 		request := scopedNativeObject(child, typ, attrs)
+		request.NativeObject.data = webState
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()
 			defer engine.execMu.Unlock()
 			defer cancel()
-			return child.runFunction(handler.Function, []Value{request})
+			return callHTTPHandler(child, handler, request)
 		}()
 		cleanupErr := scope.finish(engine)
 		var stopped *executionStop
@@ -315,19 +335,27 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return
 		}
 		responseAttrs := result.NativeObject.Attrs
-		if err := child.executionBudget().chargeBytes(int64(len(responseAttrs["body"].Str))); err != nil {
-			var quota *QuotaError
-			if errors.As(err, &quota) {
-				writeHTTPQuota(writer, engine, quota)
-				return
+		if req.Method != http.MethodHead {
+			if err := child.executionBudget().chargeBytes(int64(len(responseAttrs["body"].Str))); err != nil {
+				var quota *QuotaError
+				if errors.As(err, &quota) {
+					writeHTTPQuota(writer, engine, quota)
+					return
+				}
 			}
 		}
 		headers := result.NativeObject.data.(http.Header)
 		for name, values := range headers {
 			writer.Header()[name] = values
 		}
-		writer.WriteHeader(int(responseAttrs["status"].Int))
-		_, _ = io.WriteString(writer, responseAttrs["body"].Str)
+		status := int(responseAttrs["status"].Int)
+		if req.Method == http.MethodHead && writer.Header().Get("Content-Length") == "" && status != 204 && status != 304 {
+			writer.Header().Set("Content-Length", strconv.Itoa(len(responseAttrs["body"].Str)))
+		}
+		writer.WriteHeader(status)
+		if req.Method != http.MethodHead {
+			_, _ = io.WriteString(writer, responseAttrs["body"].Str)
+		}
 	})
 }
 
@@ -340,9 +368,8 @@ func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaErro
 
 func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	handler := args[1]
-	types := httpDriverTypes()
-	if handler.Kind != ValueFunction || len(handler.Function.Signature.Params) != 1 || !handler.Function.Signature.Params[0].Equal(types["Request"]) || handler.Function.Signature.Return == nil || !handler.Function.Signature.Return.Equal(types["Response"]) {
-		return NoneValue(), fmt.Errorf("handler must have signature (Request) -> Response")
+	if _, router := routerValue(handler); !router && (handler.Kind != ValueFunction || !handler.Function.Signature.Equal(httpHandlerType())) {
+		return NoneValue(), fmt.Errorf("handler must be a Router or a function (Request) -> Response")
 	}
 	if vm.engine.httpWorker || vm.engine.httpMetrics.Load() != nil {
 		return NoneValue(), fmt.Errorf("HTTP serve is unavailable during worker initialization or a running server")
