@@ -3,6 +3,38 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: typhon
+          POSTGRES_PASSWORD: typhon_test
+          POSTGRES_DB: typhon_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U typhon -d typhon_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://typhon:typhon_test@localhost:5432/typhon_test?sslmode=disable
+      TYPHON_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o ./typhon-cli ./cmd/typhon
+      - name: Verify migration and seed lifecycle
+        run: |
+          ./typhon-cli migrate plan examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate status examples/migrations
+          ./typhon-cli migrate down examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate seed examples/seeds
   native-drivers:
     runs-on: ubuntu-latest
     services:

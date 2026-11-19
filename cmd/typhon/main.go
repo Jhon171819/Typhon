@@ -47,7 +47,7 @@ func runWithContext(ctx context.Context, args []string) error {
 	args = filtered
 
 	if len(args) == 0 {
-		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode|openapi> <file.ty>")
+		return fmt.Errorf("usage: typhon <run|check|check-imports|bytecode|openapi|migrate> [arguments]")
 	}
 
 	command := args[0]
@@ -55,15 +55,28 @@ func runWithContext(ctx context.Context, args []string) error {
 		fmt.Printf("Typhon %s (Go VM, Python bridge protocol %d)\n", typhon.Version, typhon.PythonProtocolVersion)
 		return nil
 	}
-	if command != "run" && command != "check" && command != "check-imports" && command != "bytecode" && command != "openapi" {
+	if command != "run" && command != "check" && command != "check-imports" && command != "bytecode" && command != "openapi" && command != "migrate" {
 		if len(args) == 1 {
 			return typhon.RunFileWithOptions(args[0], typhon.RunOptions{Context: ctx, WarmPython: warmPython, SharedPython: sharedPython})
 		}
-		return fmt.Errorf("usage: typhon [--warm-python] [--shared-python] <run|check|check-imports|bytecode|openapi> <file.ty>")
+		return fmt.Errorf("usage: typhon <run|check|check-imports|bytecode|openapi|migrate> [arguments]")
 	}
 
 	if (warmPythonFlag || sharedPythonFlag) && command != "run" {
 		return fmt.Errorf("--warm-python and --shared-python only apply to run")
+	}
+	if command == "migrate" {
+		if len(args) != 2 && len(args) != 3 {
+			return fmt.Errorf("usage: typhon migrate <status|plan|up|down|seed> [directory]")
+		}
+		directory := "migrations"
+		if args[1] == "seed" {
+			directory = "seeds"
+		}
+		if len(args) == 3 {
+			directory = args[2]
+		}
+		return typhon.RunMigrations(ctx, os.Getenv("DATABASE_URL"), directory, args[1], os.Stdout)
 	}
 	if command == "openapi" {
 		if len(args) != 2 && len(args) != 3 {

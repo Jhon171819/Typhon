@@ -101,6 +101,8 @@ The Go runtime currently supports:
   batches and release their connections on EOF, close, or cancellation.
 - [Bulk PostgreSQL writes](docs/postgres_bulk.md) support bounded,
   parameterized COPY FROM and batch execution.
+- [PostgreSQL migrations](docs/postgres_migrations.md) run as an explicit
+  deployment step with checksums, revision history and a database lock.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
