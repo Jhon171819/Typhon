@@ -121,24 +121,22 @@ func writeSSEResponse(vm *VM, writer http.ResponseWriter, state *webRequest, las
 	}
 	controller := http.NewResponseController(writer)
 	write := func(block string) error {
-		deadline := time.Now().Add(sseWriteTimeout)
-		if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
-			deadline = end
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		if err := controller.SetWriteDeadline(time.Now().Add(sseWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
 			return driverFailure("HTTP", connectionKind, err)
 		}
 		stop := armSocketDeadline(ctx, controller.SetWriteDeadline)
-		defer stop()
-		if _, err := io.WriteString(writer, block); err != nil {
-			return driverFailure("HTTP", connectionKind, err)
+		_, err := io.WriteString(writer, block)
+		if err == nil {
+			err = controller.Flush()
 		}
-		if err := controller.Flush(); err != nil {
-			return driverFailure("HTTP", connectionKind, err)
-		}
-		// The standard server timeout must not expire between heartbeats.
+		// Join a concurrent cancellation before clearing the socket
+		// deadline so net/http can finish the response after a clean EOF.
+		stop()
 		_ = controller.SetWriteDeadline(time.Time{})
-		return nil
+		return driverFailure("HTTP", connectionKind, err)
 	}
 	setHTTPResponseHeaders(writer, state, sseResponseHeaders())
 	if state.rateHeaders != nil {
