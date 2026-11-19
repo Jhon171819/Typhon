@@ -79,6 +79,8 @@ The Go runtime currently supports:
   permissions and demonstrates ownership filters in PostgreSQL.
 - [Browser HTTP policy](docs/http_browser.md) supports explicit CORS
   allowlists, security headers, and secure session cookie serialization.
+- [Redis pipelines and pools](docs/native_drivers.md#redis) batch commands
+  in order and expose per-command outcomes and pool telemetry.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

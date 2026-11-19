@@ -142,6 +142,7 @@ operações que falharam, evitando duplicar uma escrita com resultado incerto.
 | Função/método | Retorno e comportamento |
 | --- | --- |
 | `redis.connect(url, timeout=10)` | `redis.Connection`; prazo por operação |
+| `redis.connect_with_pool(url, pool_size, min_idle, dial=10, read=10, write=10)` | `redis.Connection`; configuração por Engine, de 1 a 64 conexões |
 | `cache.ping()` | `str`; normalmente `PONG` |
 | `cache.get(key)` | `str \| None`; `None` quando a chave não existe |
 | `cache.set(key, value, ttl=0)` | `None`; chave/valor `str`, TTL em segundos, zero sem expiração |
@@ -150,6 +151,10 @@ operações que falharam, evitando duplicar uma escrita com resultado incerto.
 | `cache.incr(key)` | `int`; incremento atômico no Redis |
 | `cache.ttl(key)` | `float`; segundos restantes, `-1` sem TTL, `-2` ausente |
 | `cache.command(args)` | `Any`; comando único com `list[str]` |
+| `cache.pipeline(commands)` | `list[redis.Result]`; lote ordenado de até 1.000 comandos com `list[list[str]]` |
+| `cache.mget(keys)`, `cache.mset(pairs)` | `list[str \| None]` na ordem das chaves ou `None` para `dict[str, str]` |
+| `cache.hget(key, field)`, `cache.hset(key, field, value)` | `str \| None` e `int` (campos recém-criados) |
+| `cache.stats()` | `dict[str, int]`; operações, latência acumulada em ns, timeouts, falhas de rede e conexões |
 | `cache.close()` | `None`; idempotente, impede novas chamadas |
 
 TTL positivo mínimo: 0.001 segundos. Respostas de `command` tornam-se escalares,
@@ -158,6 +163,26 @@ TTL positivo mínimo: 0.001 segundos. Respostas de `command` tornam-se escalares
 (`MULTI`, `WATCH`, `SUBSCRIBE`, `AUTH`, `SELECT`, etc.) são rejeitados porque
 chamadas independentes usam um pool. Não há API dedicada de transações, Pub/Sub,
 Sentinel ou cluster nesta versão.
+
+Use `connect_with_pool` para separar prazos de conexão, leitura e escrita.
+O prazo total de uma operação é o maior desses valores, limitado também pelo
+contexto da requisição. `min_idle` é um alvo do pool, menor ou igual ao
+tamanho configurado. Cada worker tem seu próprio pool. Forneça URL com ACL
+(`rediss://usuário:senha@host:6379/0` em produção) por variável de ambiente.
+O modo configurável exige verificação do certificado TLS. A VM sanitiza
+erros e as métricas omitem URL, comandos e credenciais.
+
+O pipeline valida o lote antes do envio e agrupa os comandos de uso comum
+para evitar uma espera de rede por comando. Aceita PING, GET, SET, DEL,
+EXISTS, INCR, DECR, EXPIRE, TTL, PTTL, MGET, MSET, HGET, HSET, HEXISTS e HDEL,
+com até 2 MiB de argumentos no lote. Cada resultado expõe `ok`, `value`
+e `error`. Chave ausente é sucesso com `None`. Uma rejeição do Redis
+produz `redis_error` naquele item. Uma falha de transporte sem resposta
+confirmada produz `outcome_unknown`. O pipeline permite sucesso parcial
+e as escritas podem ter ocorrido mesmo quando a resposta se perde.
+Reenvie somente operações idempotentes após avaliar ou reconciliar o estado.
+Veja [o exemplo Typhon](../examples/redis_pipeline.ty) e a
+[semântica do pipeline no Redis](https://redis.io/docs/latest/develop/using-commands/pipelining/).
 
 ## Executar e testar
 
