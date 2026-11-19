@@ -65,6 +65,8 @@ The Go runtime currently supports:
   requests, Typhon tasks and native driver operations.
 - [Request budgets](docs/request_budgets.md) bound logical allocations,
   work and SQL results.
+- [Native scalar types](docs/native_scalars.md) cover binary data, exact
+  decimals, UUIDs and dates with PostgreSQL and JSON codecs.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

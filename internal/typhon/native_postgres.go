@@ -38,14 +38,20 @@ func postgresDriverTypes() map[string]Type {
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
 	return map[string]Type{
 		"Rows": rows, "Transaction": tx, "Connection": connection,
-		"connect": nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
-		"env":     nativeFuncType("postgres.env", []Type{StrType()}, StrType(), 0),
+		"connect":       nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
+		"connect_typed": nativeFuncType("postgres.connect_typed", []Type{StrType(), FloatType()}, connection, 1),
+		"env":           nativeFuncType("postgres.env", []Type{StrType()}, StrType(), 0),
 	}
 }
 
 func postgresDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
-	exports["connect"] = driverFunc(types["connect"], nativePostgresConnect)
+	exports["connect"] = driverFunc(types["connect"], func(vm *VM, args []Value) (Value, error) {
+		return nativePostgresConnect(vm, args, false)
+	})
+	exports["connect_typed"] = driverFunc(types["connect_typed"], func(vm *VM, args []Value) (Value, error) {
+		return nativePostgresConnect(vm, args, true)
+	})
 	exports["env"] = driverFunc(types["env"], driverEnv)
 	return exports
 }
@@ -54,6 +60,7 @@ type postgresConnection struct {
 	scope   *resourceScope
 	pool    *pgxpool.Pool
 	timeout time.Duration
+	typed   bool
 	closed  atomic.Bool
 	txs     resourceScope
 }
@@ -92,7 +99,7 @@ func (tx *postgresTransaction) rollback(ctx context.Context) error {
 	return driverFailure("PostgreSQL", databaseKind, err)
 }
 
-func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
+func nativePostgresConnect(vm *VM, args []Value, typed bool) (Value, error) {
 	timeout, err := driverTimeout(args, 1)
 	if err != nil {
 		return NoneValue(), err
@@ -122,7 +129,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 		pool.Close()
 		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
 	}
-	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout}
+	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout, typed: typed}
 	if err := db.scope.add(vm.context(), db, "PostgreSQL pool close", db.close); err != nil {
 		return NoneValue(), err
 	}
@@ -133,7 +140,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
 			}
-			params, err := postgresParams(args)
+			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
@@ -146,7 +153,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
 			}
-			params, err := postgresParams(args)
+			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
@@ -156,7 +163,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			if err != nil {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
-			return postgresRows(vm, rows, cancel)
+			return postgresRows(vm, rows, cancel, db.typed)
 		}),
 		"begin": driverFunc(typ.Members["begin"], func(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
@@ -190,7 +197,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if tx.ended || tx.parent.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
 			}
-			params, err := postgresParams(args)
+			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
@@ -205,7 +212,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if tx.ended || tx.parent.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
 			}
-			params, err := postgresParams(args)
+			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
@@ -215,7 +222,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if err != nil {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
-			return postgresRows(vm, rows, cancel)
+			return postgresRows(vm, rows, cancel, tx.parent.typed)
 		}),
 		"commit": driverFunc(typ.Members["commit"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
@@ -235,7 +242,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 	})
 }
 
-func postgresParams(args []Value) ([]any, error) {
+func postgresParams(vm *VM, args []Value) ([]any, error) {
 	if len(args) < 2 {
 		return nil, nil
 	}
@@ -255,6 +262,25 @@ func postgresParams(args []Value) ([]any, error) {
 			params = append(params, value.Str)
 		case ValueBool:
 			params = append(params, value.Bool)
+		case ValueNativeObject:
+			if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+				return nil, err
+			}
+			scalar, ok := scalarData(value)
+			if !ok {
+				return nil, fmt.Errorf("unsupported native SQL parameter")
+			}
+			switch data := scalar.sql.(type) {
+			case pgtype.Timestamp:
+				if data.Time.Nanosecond()%1000 != 0 {
+					return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
+				}
+			case pgtype.Timestamptz:
+				if data.Time.Nanosecond()%1000 != 0 {
+					return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
+				}
+			}
+			params = append(params, scalar.sql)
 		default:
 			return nil, fmt.Errorf("unsupported SQL parameter: %s", value.Kind)
 		}
@@ -336,7 +362,7 @@ func postgresValue(value any, depth int) (Value, error) {
 	}
 }
 
-func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc) (_ Value, runErr error) {
+func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc, typed bool) (_ Value, runErr error) {
 	defer func() {
 		var quota *QuotaError
 		if errors.As(runErr, &quota) {
@@ -346,7 +372,8 @@ func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc) (_ Value, ru
 	}()
 	var columns []Value
 	index := map[string]int{}
-	for i, field := range rows.FieldDescriptions() {
+	fields := rows.FieldDescriptions()
+	for i, field := range fields {
 		if err := vm.chargeBytes(int64(len(field.Name)) + valueSlotBytes); err != nil {
 			return NoneValue(), err
 		}
@@ -366,13 +393,25 @@ func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc) (_ Value, ru
 				return NoneValue(), err
 			}
 		}
-		values, err := rows.Values()
+		var values []any
+		var err error
+		if typed {
+			values = postgresScanTargets(fields)
+			err = rows.Scan(values...)
+		} else {
+			values, err = rows.Values()
+		}
 		if err != nil {
 			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}
 		var row []Value
 		for _, value := range values {
-			converted, err := postgresValue(value, 0)
+			var converted Value
+			if typed {
+				converted, err = postgresTypedValue(vm, value)
+			} else {
+				converted, err = postgresValue(value, 0)
+			}
 			if err != nil {
 				return NoneValue(), err
 			}

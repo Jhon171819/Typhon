@@ -83,6 +83,7 @@ Implementado com [`pgx/v5`](https://github.com/jackc/pgx), com pool de até
 | Função/método | Retorno e comportamento |
 | --- | --- |
 | `pg.connect(dsn, timeout=10)` | `pg.Connection`; URL PostgreSQL ou DSN pgx, prazo por operação |
+| `pg.connect_typed(dsn, timeout=10)` | `pg.Connection`; decodifica [escalares nativos](native_scalars.md) e JSON/JSONB com precisão |
 | `db.exec(sql, params=[])` | `int`; linhas afetadas |
 | `db.query(sql, params=[])` | `pg.Rows`; resultado materializado |
 | `db.begin()` | `pg.Transaction`; reserva uma conexão do pool |
@@ -110,6 +111,7 @@ nomes únicos; em nomes duplicados, `get` seleciona a última coluna.
 Resultados têm limite de 100 mil linhas; use `LIMIT`/paginação em consultas grandes.
 
 Parâmetros aceitam `None`, `bool`, `int`, `float` finito e `str`.
+Também aceitam os escalares de `typhon.scalars`.
 O transporte de inteiros preserva int64; resultados `numeric` tornam-se strings
 para preservar a precisão decimal. Texto, booleanos, inteiros e floats finitos
 tornam-se seus tipos Typhon; datas/timestamps tornam-se strings RFC3339Nano,

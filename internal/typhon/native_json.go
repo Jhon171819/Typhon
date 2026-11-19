@@ -1,6 +1,7 @@
 package typhon
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -316,6 +317,17 @@ func (w *jsonWriter) value(value Value, depth int) error {
 		return err
 	}
 	switch value.Kind {
+	case ValueNativeObject:
+		if scalar, ok := scalarData(value); ok {
+			if data, bytes := scalar.sql.([]byte); bytes {
+				if base64.StdEncoding.EncodedLen(len(data)) > maxJSONBytes-w.text.Len()-2 {
+					return invalidJSON(0, "byte limit exceeded")
+				}
+				return w.string(base64.StdEncoding.EncodeToString(data))
+			}
+			return w.string(scalar.text)
+		}
+		return invalidJSON(0, "unsupported native value")
 	case ValueString:
 		return w.string(value.Str)
 	case ValueList:
