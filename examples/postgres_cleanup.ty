@@ -1,0 +1,20 @@
+import typhon.postgres as pg
+
+def persist(db: pg.Connection, name: str, save: bool) -> bool:
+    tx: pg.Transaction = db.begin()
+    try:
+        tx.exec('INSERT INTO profiles (name) VALUES ($1)', [name])
+        if not save:
+            return False
+        tx.commit()
+        return True
+    finally:
+        tx.rollback()
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+try:
+    # Use a test database with a profiles table.
+    print(persist(db, 'discarded', False))
+    print(persist(db, 'Ada', True))
+finally:
+    db.close()

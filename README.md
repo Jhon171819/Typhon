@@ -52,6 +52,8 @@ The Go runtime currently supports:
 - Local `.ty` modules through `from module import name`.
 - Typed recovery with `try`/`except`/`else`/`finally` and `raise` for
   application errors and failures from HTTP, PostgreSQL, and Redis.
+- [Deterministic native resource cleanup](docs/resource_cleanup.md), with
+  bounded cancellation cleanup and automatic rollback of open transactions.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

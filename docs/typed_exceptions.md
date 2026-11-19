@@ -19,11 +19,14 @@ valor somente para leitura, visível dentro daquele `except`.
 `else` roda quando o corpo termina normalmente. Uma exceção no `else`, em
 um `except` ou no `finally` segue para a próxima região externa. `finally`
 roda uma vez quando a região termina normalmente ou é abandonada por exceção,
-`return`, `break` ou `continue`. Um novo desvio que sai do `finally` substitui
-o desvio pendente. Um desvio interno a um loop do `finally` deixa o desvio
-pendente intacto. Cancelamento do contexto e limites de execução interrompem
-o bytecode imediatamente. A limpeza do host continua sob responsabilidade dos
-escopos de recursos da Engine e da requisição.
+`return`, `break` ou `continue`. Um novo desvio que sai do `finally`
+substitui um retorno ou desvio pendente. Uma falha de limpeza durante a
+propagação de outro erro é registrada e a causa original continua a
+propagar. Um desvio interno a um loop do `finally` deixa o desvio pendente
+intacto. Um `return` explícito no `finally` pode encerrar a propagação de
+um erro comum. O cancelamento habilita a limpeza limitada e continua a propagar
+fora dos `except`. Consulte os prazos e o fechamento nativo no
+[contrato de limpeza](resource_cleanup.md).
 
 `raise ValidationError('mensagem')` cria uma falha de aplicação. Os
 construtores aceitam uma `str` posicional. Os valores expõem `kind` e `message`,

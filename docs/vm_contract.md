@@ -132,8 +132,8 @@ sequência de entradas. Iteração e `keys`/`values`/`items` usam snapshots, e `
 aceitam índices inteiros, inclusive negativos. `json.dumps` aceita dicionários.
 Esses contratos são verificados em `dictionary_test.go`.
 
-1. Dados e recursos: slices, tuplas, protocolo de gerenciamento de recursos
-   e JSON completo.
+1. Dados: slices, tuplas e JSON completo. Os drivers já têm
+   [limpeza determinística e isolamento por escopo](resource_cleanup.md).
 2. Funções e módulos: defaults/kwargs Typhon, closures, aliases de import,
    `import` local unificado, `Task[T]` e assinaturas completas.
 3. Integração recomendada A: os drivers Go HTTP/PostgreSQL/Redis e contextos

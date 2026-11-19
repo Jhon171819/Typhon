@@ -116,6 +116,9 @@ idempotentes. Uso após fechamento/commit/rollback gera `ValidationError`.
 Uma falha SQL capturada pode deixar a transação abortada. Use `rollback()`
 para encerrá-la e continuar usando o pool.
 
+O [contrato de limpeza](resource_cleanup.md) descreve a ordem LIFO, os
+prazos e a propriedade de métodos e recursos por requisição.
+
 ## Redis
 
 Implementado com [`go-redis/v9`](https://github.com/redis/go-redis), RESP2,
