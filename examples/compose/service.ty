@@ -4,7 +4,7 @@ import typhon.redis as redis
 import typhon.validation as v
 import typhon.web as web
 
-db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), {'share': 'records', 'max_connections': 4, 'lazy': True})
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), {'share': 'records', 'max_connections': 4, 'lazy': True, 'connect_seconds': 0.5, 'acquire_seconds': 1, 'query_seconds': 2})
 cache: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 2, 0, 0.5, 0.5, 0.5, False)
 routes: web.Router = web.router()
 routes.use_errors()
@@ -50,11 +50,15 @@ def remove(req: http.Request) -> http.Response:
 def cache_status(req: http.Request) -> http.Response:
     return http.json(200, {'redis': cache.ping()})
 
+def sample(req: http.Request) -> http.Response:
+    return http.json(200, {'items': [{'id': 'one', 'name': 'Ada'}, {'id': 'two', 'name': 'Grace'}]})
+
 routes.add('POST', '/records/{id}', create)
 routes.add('GET', '/records/{id}', get)
 routes.add('PUT', '/records/{id}', update)
 routes.add('DELETE', '/records/{id}', remove)
 routes.add('GET', '/cache', cache_status)
+routes.add('GET', '/sample', sample)
 
 if __name__ == '__main__':
     http.serve('0.0.0.0:8080', routes, 2, 16)

@@ -119,6 +119,8 @@ The Go runtime currently supports:
   PostgreSQL, Redis and a one-shot schema migration.
 - [HTTP observability](docs/observability.md) adds opt-in JSON logs,
   Prometheus histograms and OTLP traces for native driver work.
+- [Performance and resilience](docs/performance.md) records reproducible
+  workload, fault-injection and soak tests for the reference stack.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
