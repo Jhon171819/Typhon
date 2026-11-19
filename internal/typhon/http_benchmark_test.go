@@ -52,14 +52,39 @@ func BenchmarkHTTPJSONReference(b *testing.B) {
 }
 
 func benchmarkTyphonJSON(b *testing.B) http.Handler {
-	b.Helper()
-	file := filepath.Join(b.TempDir(), "sample.ty")
-	if err := os.WriteFile(file, []byte(`
+	engine, module := loadBenchmarkModule(b, `
 import typhon.http as http
 
 def sample(req: http.Request) -> http.Response:
     return http.json(200, {'items': [{'id': 'one', 'name': 'Ada'}, {'id': 'two', 'name': 'Grace'}]})
-`), 0600); err != nil {
+`)
+	return httpVMHandler(engine, module.Globals["sample"])
+}
+
+func BenchmarkWarmedTypedIntegerLoop(b *testing.B) {
+	engine, module := loadBenchmarkModule(b, `
+def sum_values(values: list[int]) -> int:
+    total: int = 0
+    for value: int in values:
+        total = total + value
+    return total
+`)
+	function := module.Globals["sum_values"]
+	args := []Value{ListValue([]Value{IntValue(1), IntValue(2), IntValue(3), IntValue(4), IntValue(5)})}
+	b.ReportAllocs()
+	for b.Loop() {
+		vm := VM{engine: engine, module: module}
+		result, err := vm.callValue(function, args, nil)
+		if err != nil || result.Int != 15 {
+			b.Fatalf("sum: %v, error: %v", result, err)
+		}
+	}
+}
+
+func loadBenchmarkModule(b *testing.B, source string) (*Engine, *LoadedModule) {
+	b.Helper()
+	file := filepath.Join(b.TempDir(), "benchmark.ty")
+	if err := os.WriteFile(file, []byte(source), 0600); err != nil {
 		b.Fatal(err)
 	}
 	engine := NewEngine()
@@ -75,5 +100,5 @@ def sample(req: http.Request) -> http.Response:
 	if err := engine.ExecuteModule(module, false); err != nil {
 		b.Fatal(err)
 	}
-	return httpVMHandler(engine, module.Globals["sample"])
+	return engine, module
 }
