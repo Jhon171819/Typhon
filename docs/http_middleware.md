@@ -39,3 +39,5 @@ rota e omite o corpo, a query e as credenciais.
 
 O [exemplo HTTP](../examples/http_middleware.ty) usa dois workers,
 request-id, logging e mapeamento de `ValidationError` para 400.
+A [fronteira de erros](http_problems.md) oferece um contrato
+comum para as exceções que escapam do pipeline.

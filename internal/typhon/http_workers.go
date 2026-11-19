@@ -38,6 +38,7 @@ type httpWorkerPool struct {
 	metrics        httpPoolMetrics
 	requestTimeout time.Duration
 	liveness       string
+	apiErrors      bool
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
@@ -51,6 +52,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 	router, routed := routerValue(handler)
 	if routed {
 		router.frozen = true
+		p.apiErrors = router.apiErrors
 	}
 	p.idle <- httpVMHandlerWithTimeout(vm.engine, handler, p.requestTimeout)
 	if cap(p.idle) == 1 {
@@ -82,6 +84,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 				return fmt.Errorf("HTTP worker %d could not resolve router %q", i+1, binding)
 			}
 			cloned.frozen = true
+			cloned.apiErrors = p.apiErrors
 		} else if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
 			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, binding)
 		}
@@ -119,6 +122,7 @@ func (p *httpWorkerPool) close() error {
 }
 
 func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request) {
+	problems := problemWriter{enabled: p.apiErrors, head: req.Method == http.MethodHead}
 	if p.liveness != "" && req.URL.Path == p.liveness {
 		if req.Method == http.MethodGet || req.Method == http.MethodHead {
 			writer.WriteHeader(http.StatusNoContent)
@@ -129,7 +133,7 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 		return
 	}
 	if p.ctx.Err() != nil {
-		p.reject(writer, "server shutting down")
+		p.reject(writer, "server shutting down", problems)
 		return
 	}
 	ctx, cancel := httpRequestContext(req.Context(), p.ctx, p.requestTimeout)
@@ -138,7 +142,7 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 	case p.admission <- struct{}{}:
 		defer func() { <-p.admission }()
 	default:
-		p.reject(writer, "server busy")
+		p.reject(writer, "server busy", problems)
 		return
 	}
 	p.metrics.admitted.Add(1)
@@ -150,13 +154,13 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 	}
 	if worker == nil {
 		p.metrics.rejected.Add(1)
-		writeHTTPStop(writer, p.ctx, ctx.Err())
+		writeHTTPStop(writer, p.ctx, ctx.Err(), problems)
 		return
 	}
 	defer func() { p.idle <- worker }()
 	if ctx.Err() != nil || p.ctx.Err() != nil {
 		p.metrics.rejected.Add(1)
-		writeHTTPStop(writer, p.ctx, ctx.Err())
+		writeHTTPStop(writer, p.ctx, ctx.Err(), problems)
 		return
 	}
 	worker.ServeHTTP(writer, req.WithContext(ctx))
@@ -184,7 +188,7 @@ func (p *httpWorkerPool) wait(ctx context.Context) http.Handler {
 	return nil
 }
 
-func (p *httpWorkerPool) reject(writer http.ResponseWriter, message string) {
+func (p *httpWorkerPool) reject(writer http.ResponseWriter, message string, problems problemWriter) {
 	p.metrics.rejected.Add(1)
-	http.Error(writer, message, http.StatusServiceUnavailable)
+	problems.write(writer, http.StatusServiceUnavailable, message)
 }

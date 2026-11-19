@@ -71,6 +71,8 @@ The Go runtime currently supports:
   parameters and versioned resource routes.
 - [HTTP middleware](docs/http_middleware.md) composes route handlers and
   keeps request state isolated.
+- [Structured HTTP errors](docs/http_problems.md) provide stable public
+  codes, validation details and correlation IDs.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

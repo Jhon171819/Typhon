@@ -30,12 +30,13 @@ type webNode struct {
 }
 
 type webRouter struct {
-	root   webNode
-	module *LoadedModule
-	size   int
-	frozen bool
-	routes map[[2]string]*webRoute
-	steps  []webStep
+	root      webNode
+	module    *LoadedModule
+	size      int
+	frozen    bool
+	routes    map[[2]string]*webRoute
+	steps     []webStep
+	apiErrors bool
 }
 
 type webRequest struct {
@@ -64,15 +65,48 @@ func webDriverTypes() map[string]Type {
 	router.Members["use_on"] = nativeFuncType("web.use_on", []Type{StrType(), StrType(), middleware}, NoneType(), 0)
 	router.Members["use_request_id"] = nativeFuncType("web.use_request_id", nil, NoneType(), 0)
 	router.Members["use_logging"] = nativeFuncType("web.use_logging", nil, NoneType(), 0)
+	router.Members["use_errors"] = nativeFuncType("web.use_errors", nil, NoneType(), 0)
 	return map[string]Type{
-		"Router": router,
-		"Next":   next,
-		"router": nativeFuncType("web.router", nil, router, 0),
+		"Router":   router,
+		"Next":     next,
+		"router":   nativeFuncType("web.router", nil, router, 0),
+		"problem":  nativeFuncType("web.problem", []Type{httpTypes["Request"], IntType()}, httpTypes["Response"], 0),
+		"reject":   nativeFuncType("web.reject", []Type{IntType()}, exceptionType(errorKind), 0),
+		"validate": nativeFuncType("web.validate", []Type{httpTypes["Request"], validationTypes()["Schema"], AnyType()}, unionType(httpTypes["Response"], NoneType()), 0),
 	}
 }
 
 func webDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	exports["problem"] = driverFunc(types["problem"], func(vm *VM, args []Value) (Value, error) {
+		status := int(args[1].Int)
+		if _, ok := webStatuses[status]; !ok {
+			return NoneValue(), errors.New("unsupported HTTP problem status")
+		}
+		return webProblemResponse(vm, status, problemRequestID(args[0]), nil, nil)
+	})
+	exports["reject"] = driverFunc(types["reject"], func(vm *VM, args []Value) (Value, error) {
+		status := int(args[0].Int)
+		if _, ok := webStatuses[status]; !ok {
+			return NoneValue(), errors.New("unsupported HTTP rejection status")
+		}
+		rejection := &webRejection{status: status}
+		return Value{Kind: ValueException, Exception: &Exception{kind: errorKind, message: rejection.Error(), cause: rejection}}, nil
+	})
+	exports["validate"] = driverFunc(types["validate"], func(vm *VM, args []Value) (Value, error) {
+		schema, err := validationSchemaFrom(vm, args[1])
+		if err != nil {
+			return NoneValue(), err
+		}
+		check := validationRun{vm: vm}
+		if err := check.value(schema, args[2], "", 0); err != nil {
+			return NoneValue(), err
+		}
+		if len(check.issues) == 0 {
+			return NoneValue(), nil
+		}
+		return webProblemResponse(vm, 422, problemRequestID(args[0]), check.issues, nil)
+	})
 	exports["router"] = driverFunc(types["router"], func(vm *VM, args []Value) (Value, error) {
 		router := &webRouter{module: vm.module, routes: map[[2]string]*webRoute{}}
 		typ := types["Router"]
@@ -102,6 +136,13 @@ func webDriverExports(types map[string]Type) map[string]Value {
 			}),
 			"use_logging": driverFunc(typ.Members["use_logging"], func(vm *VM, args []Value) (Value, error) {
 				return NoneValue(), router.appendStep(&router.steps, webStep{native: webLogging})
+			}),
+			"use_errors": driverFunc(typ.Members["use_errors"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen {
+					return NoneValue(), errors.New("router was already started")
+				}
+				router.apiErrors = true
+				return NoneValue(), nil
 			}),
 		})
 		value.NativeObject.data = router
@@ -235,18 +276,18 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 	}
 	segments, err := webSegments(state.path)
 	if err != nil {
-		return httpResponse(vm, 400, "invalid request path", nil)
+		return r.problem(vm, state, 400, "invalid request path", nil)
 	}
 	for i, segment := range segments {
 		decoded, err := url.PathUnescape(segment)
 		if err != nil || !safeWebSegment(decoded) {
-			return httpResponse(vm, 400, "invalid request path", nil)
+			return r.problem(vm, state, 400, "invalid request path", nil)
 		}
 		segments[i] = decoded
 	}
 	node := r.root.match(segments)
 	if node == nil {
-		return httpResponse(vm, 404, "not found", nil)
+		return r.problem(vm, state, 404, "not found", nil)
 	}
 	method := request.NativeObject.Attrs["method"].Str
 	route, found := node.methods[method]
@@ -258,7 +299,7 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 		if method == http.MethodOptions {
 			return httpResponse(vm, 204, "", headers)
 		}
-		return httpResponse(vm, 405, "method not allowed", headers)
+		return r.problem(vm, state, 405, "method not allowed", headers)
 	}
 	old := state.params
 	state.params = map[string]string{}
@@ -269,7 +310,21 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 		}
 	}
 	pipeline := webPipeline{route: route, routerSteps: r.steps, request: request, state: state}
-	return pipeline.run(vm, 0)
+	result, err := pipeline.run(vm, 0)
+	var stop *executionStop
+	if err == nil || !r.apiErrors || errors.As(err, &stop) || vm.context().Err() != nil {
+		return result, err
+	}
+	status := webErrorStatus(err)
+	logWebFailure(state.id, route.pattern, status, err)
+	return webProblemResponse(vm, status, state.id, nil, nil)
+}
+
+func (r *webRouter) problem(vm *VM, state *webRequest, status int, message string, headers http.Header) (Value, error) {
+	if r.apiErrors {
+		return webProblemResponse(vm, status, state.id, nil, headers)
+	}
+	return httpResponse(vm, int64(status), message, headers)
 }
 
 func callHTTPHandler(vm *VM, handler, request Value) (Value, error) {

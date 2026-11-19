@@ -23,14 +23,14 @@ func httpRequestContext(parent, server context.Context, timeout time.Duration) (
 	}
 }
 
-func writeHTTPStop(w http.ResponseWriter, server context.Context, err error) {
+func writeHTTPStop(w http.ResponseWriter, server context.Context, err error, problems problemWriter) {
 	switch {
 	case server.Err() != nil:
-		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		problems.write(w, http.StatusServiceUnavailable, "server shutting down")
 	case errors.Is(err, context.DeadlineExceeded):
-		http.Error(w, "request deadline exceeded", http.StatusGatewayTimeout)
+		problems.write(w, http.StatusGatewayTimeout, "request deadline exceeded")
 	default:
-		http.Error(w, "request cancelled", statusClientClosedRequest)
+		problems.write(w, statusClientClosedRequest, "request cancelled")
 	}
 }
 

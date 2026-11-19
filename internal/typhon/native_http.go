@@ -216,27 +216,32 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 	// Typhon execution; use independent Engines when parallel CPU work is needed.
 	admission := make(chan struct{}, 16)
 	return http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		webState := newWebRequest(req)
+		problems := problemWriter{id: webState.id, head: req.Method == http.MethodHead}
+		if router, ok := routerValue(handler); ok {
+			problems.enabled = router.apiErrors
+		}
 		select {
 		case admission <- struct{}{}:
 			defer func() { <-admission }()
 		default:
-			http.Error(writer, "server busy", http.StatusServiceUnavailable)
+			problems.write(writer, http.StatusServiceUnavailable, "server busy")
 			return
 		}
 		if !engine.beginExecution() {
-			http.Error(writer, "server shutting down", http.StatusServiceUnavailable)
+			problems.write(writer, http.StatusServiceUnavailable, "server shutting down")
 			return
 		}
 		defer engine.active.Done()
 		ctx, cancel := httpRequestContext(req.Context(), engine.ctx, timeout)
 		defer cancel()
 		if ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, ctx.Err())
+			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
 			return
 		}
 		body, err := readHTTPRequestBody(writer, req, ctx, min(int64(maxHTTPBody), engine.quotas.requestBytes-valueSlotBytes))
 		if ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, ctx.Err())
+			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
 			return
 		}
 		if err != nil {
@@ -248,9 +253,9 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 				}
 			}
 			if errors.As(err, &network) && network.Timeout() {
-				http.Error(writer, "request body timed out", http.StatusRequestTimeout)
+				problems.write(writer, http.StatusRequestTimeout, "request body timed out")
 			} else {
-				http.Error(writer, "request body is too large or unreadable", http.StatusRequestEntityTooLarge)
+				problems.write(writer, http.StatusRequestEntityTooLarge, "request body is too large or unreadable")
 			}
 			return
 		}
@@ -260,7 +265,6 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		typ := httpDriverTypes()["Request"]
 		bodyText := string(body)
 		query := req.URL.Query()
-		webState := newWebRequest(req)
 		attrs := map[string]Value{
 			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(bodyText),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
@@ -318,7 +322,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		var stopped *executionStop
 		if errors.As(runErr, &stopped) && stopped.cancelled {
 			reportCleanupError("HTTP request", cleanupErr)
-			writeHTTPStop(writer, engine.ctx, stopped.cause)
+			writeHTTPStop(writer, engine.ctx, stopped.cause, problems)
 			return
 		}
 		primary := runErr
@@ -326,30 +330,41 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			primary = cleanupErr
 		}
 		if primary != nil {
-			log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
+			if !problems.enabled {
+				log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
+			}
 			var quota *QuotaError
 			if errors.As(primary, &quota) {
-				writeHTTPQuota(writer, engine, quota)
+				if problems.enabled {
+					logWebFailure(problems.id, "", http.StatusUnprocessableEntity, primary)
+				}
+				writeHTTPQuota(writer, engine, quota, problems)
+				return
+			}
+			if problems.enabled {
+				status := webErrorStatus(primary)
+				logWebFailure(problems.id, "", status, primary)
+				problems.write(writer, status, "")
 				return
 			}
 			var ex *Exception
 			if errors.As(primary, &ex) && ex.kind == timeoutKind {
-				http.Error(writer, "upstream operation timed out", http.StatusGatewayTimeout)
+				problems.write(writer, http.StatusGatewayTimeout, "upstream operation timed out")
 				return
 			}
-			http.Error(writer, "internal server error", http.StatusInternalServerError)
+			problems.write(writer, http.StatusInternalServerError, "internal server error")
 			return
 		}
 		if req.Context().Err() != nil || engine.ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, req.Context().Err())
+			writeHTTPStop(writer, engine.ctx, req.Context().Err(), problems)
 			return
 		}
 		if deadline, _ := ctx.Deadline(); time.Now().After(deadline) {
-			writeHTTPStop(writer, engine.ctx, context.DeadlineExceeded)
+			writeHTTPStop(writer, engine.ctx, context.DeadlineExceeded, problems)
 			return
 		}
 		if result.Kind != ValueNativeObject || !result.NativeObject.Type.Equal(httpDriverTypes()["Response"]) {
-			http.Error(writer, "invalid handler response", http.StatusInternalServerError)
+			problems.write(writer, http.StatusInternalServerError, "invalid handler response")
 			return
 		}
 		responseAttrs := result.NativeObject.Attrs
@@ -357,7 +372,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			if err := child.executionBudget().chargeBytes(int64(len(responseAttrs["body"].Str))); err != nil {
 				var quota *QuotaError
 				if errors.As(err, &quota) {
-					writeHTTPQuota(writer, engine, quota)
+					writeHTTPQuota(writer, engine, quota, problems)
 					return
 				}
 			}
@@ -380,11 +395,11 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 	})
 }
 
-func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaError) {
+func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaError, problems problemWriter) {
 	if metrics := engine.httpMetrics.Load(); metrics != nil {
 		metrics.quotaRejected.Add(1)
 	}
-	http.Error(writer, quota.Error(), http.StatusUnprocessableEntity)
+	problems.write(writer, http.StatusUnprocessableEntity, quota.Error())
 }
 
 func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
