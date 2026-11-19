@@ -60,6 +60,8 @@ The Go runtime currently supports:
   field-level diagnostics.
 - [Isolated HTTP workers](docs/http_workers.md) with a bounded queue and
   admission metrics.
+- [Request deadlines](docs/request_context.md) propagate through queued
+  requests, Typhon tasks and native driver operations.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

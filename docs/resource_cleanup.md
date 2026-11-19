@@ -38,7 +38,8 @@ exceção. Quando o contexto cancela ou expira, a VM pula os `except` e
 percorre os `finally` já ativos de dentro para fora. A VM usa um prazo
 compartilhado de 2 segundos e até 10 mil instruções para esse código.
 Nesse modo, as operações nativas de liberação são `close()` e
-`rollback()`. Novos acessos de driver, imports, chamadas à ponte Python
+`rollback()`. `Request.remaining()` e `Request.cancelled()` podem
+inspecionar o contexto original. Novos I/O de driver, imports, chamadas à ponte Python
 e novas esperas ou tarefas são rejeitados. Um desvio em `finally` mantém
 o cancelamento pendente. Limites rígidos da VM encerram bytecode e o
 runtime fecha os registros do escopo ao sair.
@@ -47,8 +48,9 @@ Uma falha em `finally` com outro erro pendente é registrada com traceback e
 o erro original continua a propagação. Falhas do fechamento automático
 incluem o recurso e a operação. A CLI retorna a causa primária seguida
 dos erros de fechamento, quando ambos existem. O handler registra a
-cadeia e responde 500 quando há falha de limpeza. Os detalhes de driver
-continuam sanitizados.
+cadeia. Uma falha de limpeza sem outra causa gera 500. As respostas
+de cancelamento seguem o [contrato HTTP](request_context.md), e os
+detalhes de driver continuam sanitizados.
 
 O prazo de 2 segundos para rollback é compartilhado dentro de cada
 drenagem de escopo. A destruição das conexões pelo `pgxpool` é síncrona

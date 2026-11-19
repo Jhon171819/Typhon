@@ -1,0 +1,9 @@
+import typhon.http as http
+
+def handle(req: http.Request) -> http.Response:
+    if req.path == '/remaining':
+        return http.json(200, {'seconds': req.remaining()})
+    return http.response(200, 'ready')
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', handle, 2, 8, 1.5)

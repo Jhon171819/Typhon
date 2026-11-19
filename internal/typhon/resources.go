@@ -76,6 +76,7 @@ func (s *resourceScope) close(ctx context.Context) error {
 type requestScope struct {
 	resources resourceScope
 	tasks     []*Task // guarded by the Engine's execMu
+	cancel    context.CancelFunc
 }
 
 func (s *requestScope) finish(e *Engine) error {

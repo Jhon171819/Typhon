@@ -29,22 +29,23 @@ func (m *httpPoolMetrics) snapshot() Value {
 }
 
 type httpWorkerPool struct {
-	ctx       context.Context
-	idle      chan http.Handler
-	admission chan struct{}
-	engines   []*Engine
-	metrics   httpPoolMetrics
+	ctx            context.Context
+	idle           chan http.Handler
+	admission      chan struct{}
+	engines        []*Engine
+	metrics        httpPoolMetrics
+	requestTimeout time.Duration
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
 	return &httpWorkerPool{
 		ctx: ctx, idle: make(chan http.Handler, workers),
-		admission: make(chan struct{}, workers+queue),
+		admission: make(chan struct{}, workers+queue), requestTimeout: defaultRequestTimeout,
 	}
 }
 
 func (p *httpWorkerPool) load(vm *VM, handler Value) error {
-	p.idle <- httpVMHandler(vm.engine, handler)
+	p.idle <- httpVMHandlerWithTimeout(vm.engine, handler, p.requestTimeout)
 	for i := 1; i < cap(p.idle); i++ {
 		if err := vm.executionError(); err != nil {
 			return err
@@ -64,7 +65,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
 			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, handler.Function.Name)
 		}
-		p.idle <- httpVMHandler(engine, entry)
+		p.idle <- httpVMHandlerWithTimeout(engine, entry, p.requestTimeout)
 	}
 	return nil
 }
@@ -84,6 +85,8 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 		p.reject(writer, "server shutting down")
 		return
 	}
+	ctx, cancel := httpRequestContext(req.Context(), p.ctx, p.requestTimeout)
+	defer cancel()
 	select {
 	case p.admission <- struct{}{}:
 		defer func() { <-p.admission }()
@@ -96,18 +99,20 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 	select {
 	case worker = <-p.idle:
 	default:
-		worker = p.wait(req.Context())
+		worker = p.wait(ctx)
 	}
 	if worker == nil {
-		p.reject(writer, "request cancelled while waiting for a worker")
+		p.metrics.rejected.Add(1)
+		writeHTTPStop(writer, p.ctx, ctx.Err())
 		return
 	}
 	defer func() { p.idle <- worker }()
-	if req.Context().Err() != nil || p.ctx.Err() != nil {
-		p.reject(writer, "request cancelled before worker execution")
+	if ctx.Err() != nil || p.ctx.Err() != nil {
+		p.metrics.rejected.Add(1)
+		writeHTTPStop(writer, p.ctx, ctx.Err())
 		return
 	}
-	worker.ServeHTTP(writer, req)
+	worker.ServeHTTP(writer, req.WithContext(ctx))
 	p.metrics.completed.Add(1)
 }
 

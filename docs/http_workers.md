@@ -15,7 +15,9 @@ na fila, preservando até 16 admissões simultâneas. Para habilitar
 concorrência, passe `http.serve(address, handler, workers, queue)`.
 O servidor aceita de 1 a 16 workers e de 0 a 256 vagas de fila. Uma
 fila cheia recebe 503 imediatamente. Cancelamento retira uma
-requisição da fila. Encerrar o servidor fecha os workers auxiliares.
+requisição da fila, que consome o [prazo HTTP](request_context.md)
+configurável no quinto argumento. Encerrar o servidor fecha os
+workers auxiliares.
 
 O worker primário usa a Engine atual. Os auxiliares carregam e
 executam uma vez o módulo que define o handler, com `__name__`

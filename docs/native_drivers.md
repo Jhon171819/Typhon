@@ -30,7 +30,7 @@ Implementado com [`net/http`](https://pkg.go.dev/net/http).
 | `client.close()` | `None`; fecha conexões ociosas e impede novas chamadas |
 | `http.response(status, body, headers=[])` | `http.Response`; status de 200 a 599 |
 | `http.json(status, value)` | `http.Response`; [JSON nativo](native_json.md) com Content-Type apropriado |
-| `http.serve(address, handler, workers=1, queue=15)` | `None`; bloqueia até cancelamento/encerramento |
+| `http.serve(address, handler, workers=1, queue=15, request_timeout=10)` | `None`; bloqueia até cancelamento/encerramento |
 | `http.server_stats()` | `dict[str, int]`; métricas de admissão e espera do servidor ativo |
 
 O `=` nas tabelas indica o valor padrão; na chamada Typhon, passe valores
@@ -65,10 +65,13 @@ processamento/fila e retorna 503 quando esse limite é atingido. Cada
 callback tem contexto de 10 segundos, orçamento de 10 milhões de instruções
 e limpeza de recursos próprios ao terminar. Aumente o número de
 [workers isolados](http_workers.md) quando precisar avançar requisições
-simultâneas.
+simultâneas. O [prazo da requisição](request_context.md) começa na
+admissão e cobre fila, leitura e execução. `req.remaining()` e
+`req.cancelled()` inspecionam o contexto original.
 Há prazos de leitura de headers (5s), leitura (10s), escrita (15s) e idle (60s).
-Erros de callback são registrados no stderr e retornam 500; a próxima requisição
-pode ser atendida. Ctrl+C cancela o contexto da CLI e fecha o servidor.
+Falhas de callback são registradas no stderr. A próxima requisição pode
+ser atendida. Ctrl+C e SIGTERM cancelam o contexto da CLI e fecham o
+servidor.
 
 ## PostgreSQL
 

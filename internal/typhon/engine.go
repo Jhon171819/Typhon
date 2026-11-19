@@ -214,10 +214,10 @@ func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule,
 	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
-	return e.loadModuleByNameLocked(module, fromDir)
+	return e.loadModuleByNameLocked(e.ctx, module, fromDir)
 }
 
-func (e *Engine) loadModuleByNameLocked(module string, fromDir string) (*LoadedModule, error) {
+func (e *Engine) loadModuleByNameLocked(ctx context.Context, module string, fromDir string) (*LoadedModule, error) {
 	if module == "typhon.parallel" {
 		return &LoadedModule{
 			Path:     "<typhon.parallel>",
@@ -240,7 +240,7 @@ func (e *Engine) loadModuleByNameLocked(module string, fromDir string) (*LoadedM
 		return nil, err
 	}
 	if !loaded.Executed {
-		if err := e.executeModuleLocked(loaded, false); err != nil {
+		if err := e.executeModuleLocked(ctx, loaded, false); err != nil {
 			return nil, err
 		}
 	}
@@ -399,7 +399,7 @@ func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
 	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
-	err := e.executeModuleLocked(module, main)
+	err := e.executeModuleLocked(e.ctx, module, main)
 	if main {
 		if err != nil {
 			e.stopTasks(err)
@@ -430,7 +430,7 @@ func (e *Engine) stopTasks(err error) {
 	}
 }
 
-func (e *Engine) executeModuleLocked(module *LoadedModule, main bool) error {
+func (e *Engine) executeModuleLocked(ctx context.Context, module *LoadedModule, main bool) error {
 	if module.Executing {
 		return fmt.Errorf("cyclic module execution: %s", module.Path)
 	}
@@ -448,7 +448,7 @@ func (e *Engine) executeModuleLocked(module *LoadedModule, main bool) error {
 	}
 	module.Executing = true
 	defer func() { module.Executing = false }()
-	vm := &VM{engine: e, module: module, depth: 1}
+	vm := &VM{engine: e, module: module, depth: 1, ctx: ctx}
 	_, err := vm.runFunction(module.Program.Module, nil)
 	if err != nil {
 		module.ExecuteErr = err

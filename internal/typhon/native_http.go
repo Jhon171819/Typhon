@@ -22,8 +22,10 @@ func httpDriverTypes() map[string]Type {
 	}}
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
-		"query": nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
-		"json":  nativeFuncType("http.request.json", nil, AnyType(), 0),
+		"query":     nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
+		"json":      nativeFuncType("http.request.json", nil, AnyType(), 0),
+		"remaining": nativeFuncType("http.request.remaining", nil, FloatType(), 0),
+		"cancelled": nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
 	}}
 	headers := listType(listType(StrType()))
 	client := Type{Kind: TypeNative, Name: "typhon.http.Client", Members: map[string]Type{
@@ -36,7 +38,7 @@ func httpDriverTypes() map[string]Type {
 		"client":       nativeFuncType("http.client", []Type{FloatType()}, client, 1),
 		"response":     nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
 		"json":         nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
-		"serve":        nativeFuncType("http.serve", []Type{StrType(), nativeFuncType("http.handler", []Type{request}, response, 0), IntType(), IntType()}, NoneType(), 2),
+		"serve":        nativeFuncType("http.serve", []Type{StrType(), nativeFuncType("http.handler", []Type{request}, response, 0), IntType(), IntType(), FloatType()}, NoneType(), 3),
 		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
 		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
 	}
@@ -186,6 +188,10 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 }
 
 func httpVMHandler(engine *Engine, handler Value) http.Handler {
+	return httpVMHandlerWithTimeout(engine, handler, defaultRequestTimeout)
+}
+
+func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Duration) http.Handler {
 	// ponytail: at most 16 queued/running requests, while the Engine serializes
 	// Typhon execution; use independent Engines when parallel CPU work is needed.
 	admission := make(chan struct{}, 16)
@@ -197,53 +203,97 @@ func httpVMHandler(engine *Engine, handler Value) http.Handler {
 			http.Error(writer, "server busy", http.StatusServiceUnavailable)
 			return
 		}
-		body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, maxHTTPBody))
-		if err != nil {
-			http.Error(writer, "request body is too large or unreadable", http.StatusRequestEntityTooLarge)
-			return
-		}
 		if !engine.beginExecution() {
 			http.Error(writer, "server shutting down", http.StatusServiceUnavailable)
 			return
 		}
 		defer engine.active.Done()
-		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+		ctx, cancel := httpRequestContext(req.Context(), engine.ctx, timeout)
 		defer cancel()
-		stop := context.AfterFunc(engine.ctx, cancel)
-		defer stop()
-		scope := &requestScope{}
+		if ctx.Err() != nil {
+			writeHTTPStop(writer, engine.ctx, ctx.Err())
+			return
+		}
+		body, err := readHTTPRequestBody(writer, req, ctx)
+		if ctx.Err() != nil {
+			writeHTTPStop(writer, engine.ctx, ctx.Err())
+			return
+		}
+		if err != nil {
+			var network net.Error
+			if errors.As(err, &network) && network.Timeout() {
+				http.Error(writer, "request body timed out", http.StatusRequestTimeout)
+			} else {
+				http.Error(writer, "request body is too large or unreadable", http.StatusRequestEntityTooLarge)
+			}
+			return
+		}
+		scope := &requestScope{cancel: cancel}
 		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
 		typ := httpDriverTypes()["Request"]
 		bodyText := string(body)
-		request := scopedNativeObject(child, typ, map[string]Value{
+		attrs := map[string]Value{
 			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(bodyText),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
 			"query":  driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.URL.Query().Get(args[0].Str)), nil }),
 			"json":   driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) { return loadJSON(vm, bodyText) }),
-		})
+			"remaining": driverFunc(typ.Members["remaining"], func(vm *VM, args []Value) (Value, error) {
+				deadline, _ := ctx.Deadline()
+				if ctx.Err() != nil {
+					return FloatValue(0), nil
+				}
+				return FloatValue(max(0, time.Until(deadline).Seconds())), nil
+			}),
+			"cancelled": driverFunc(typ.Members["cancelled"], func(vm *VM, args []Value) (Value, error) {
+				return BoolValue(ctx.Err() != nil), nil
+			}),
+		}
+		attrs["remaining"].Native.cleanup = true
+		attrs["cancelled"].Native.cleanup = true
+		request := scopedNativeObject(child, typ, attrs)
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()
 			defer engine.execMu.Unlock()
 			defer cancel()
 			return child.runFunction(handler.Function, []Value{request})
 		}()
-		runErr = finalizeRun(runErr, scope.finish(engine))
+		cleanupErr := scope.finish(engine)
+		var stopped *executionStop
+		if errors.As(runErr, &stopped) && stopped.cancelled {
+			reportCleanupError("HTTP request", cleanupErr)
+			writeHTTPStop(writer, engine.ctx, stopped.cause)
+			return
+		}
+		runErr = finalizeRun(runErr, cleanupErr)
 		if runErr != nil {
 			log.Printf("Typhon HTTP handler: %v", runErr)
+			var ex *Exception
+			if errors.As(runErr, &ex) && ex.kind == timeoutKind {
+				http.Error(writer, "upstream operation timed out", http.StatusGatewayTimeout)
+				return
+			}
 			http.Error(writer, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		if req.Context().Err() != nil || engine.ctx.Err() != nil {
+			writeHTTPStop(writer, engine.ctx, req.Context().Err())
+			return
+		}
+		if deadline, _ := ctx.Deadline(); time.Now().After(deadline) {
+			writeHTTPStop(writer, engine.ctx, context.DeadlineExceeded)
 			return
 		}
 		if result.Kind != ValueNativeObject || !result.NativeObject.Type.Equal(httpDriverTypes()["Response"]) {
 			http.Error(writer, "invalid handler response", http.StatusInternalServerError)
 			return
 		}
-		attrs := result.NativeObject.Attrs
+		responseAttrs := result.NativeObject.Attrs
 		headers := result.NativeObject.data.(http.Header)
 		for name, values := range headers {
 			writer.Header()[name] = values
 		}
-		writer.WriteHeader(int(attrs["status"].Int))
-		_, _ = io.WriteString(writer, attrs["body"].Str)
+		writer.WriteHeader(int(responseAttrs["status"].Int))
+		_, _ = io.WriteString(writer, responseAttrs["body"].Str)
 	})
 }
 
@@ -266,11 +316,16 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	if workers < 1 || workers > 16 || queue < 0 || queue > 256 {
 		return NoneValue(), fmt.Errorf("HTTP serve requires 1 to 16 workers and a queue size from 0 to 256")
 	}
+	requestTimeout, err := driverTimeout(args, 4)
+	if err != nil {
+		return NoneValue(), err
+	}
 	listener, err := net.Listen("tcp", args[0].Str)
 	if err != nil {
 		return NoneValue(), driverFailure("HTTP", connectionKind, err)
 	}
 	pool := newHTTPWorkerPool(vm.context(), int(workers), int(queue))
+	pool.requestTimeout = requestTimeout
 	vm.engine.httpMetrics = &pool.metrics
 	defer func() {
 		vm.engine.httpMetrics = nil

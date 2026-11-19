@@ -155,7 +155,7 @@ func TestNativeHTTPWorkerBackpressureAndCancellation(t *testing.T) {
 	cancel()
 	select {
 	case status := <-queued:
-		if status != 503 {
+		if status != statusClientClosedRequest {
 			t.Errorf("cancelled wait returned %d", status)
 		}
 	case <-time.After(2 * time.Second):

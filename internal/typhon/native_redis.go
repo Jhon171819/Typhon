@@ -2,8 +2,10 @@ package typhon
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"math"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,9 +53,24 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	options.PoolSize = 16
 	options.MaxRetries = -1 // A failed write is not retried automatically.
 	options.Protocol = 2    // RESP2 arrays fit Typhon lists; maps are not yet supported.
+	var operation atomic.Pointer[context.Context]
+	dial := redis.NewDialer(options)
+	if options.TLSConfig != nil {
+		tlsDial := &tls.Dialer{NetDialer: &net.Dialer{Timeout: timeout}, Config: options.TLSConfig}
+		dial = tlsDial.DialContext
+	}
+	options.Dialer = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &redisContextConn{Conn: conn, operation: &operation}, nil
+	}
 	client := redis.NewClient(options)
 	ctx, cancel := driverContext(vm, timeout)
+	operation.Store(&ctx)
 	err = client.Ping(ctx).Err()
+	operation.Store(nil)
 	cancel()
 	if err != nil {
 		reportCleanupError("Redis client after failed ping", driverFailure("Redis", databaseKind, client.Close()))
@@ -80,6 +97,9 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 			}
 			ctx, cancel := driverContext(vm, timeout)
 			defer cancel()
+			// The owner Engine serializes all commands for this client.
+			operation.Store(&ctx)
+			defer operation.Store(nil)
 			switch name {
 			case "ping":
 				value, err := client.Ping(ctx).Result()
@@ -139,7 +159,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 				if err != nil {
 					return NoneValue(), driverFailure("Redis", databaseKind, err)
 				}
-				return redisValue(value, 0)
+				return redisValue(vm, value, 0)
 			}
 			return NoneValue(), fmt.Errorf("unknown Redis operation")
 		})
@@ -147,7 +167,10 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	return scopedNativeObject(vm, typ, attrs), nil
 }
 
-func redisValue(value any, depth int) (Value, error) {
+func redisValue(vm *VM, value any, depth int) (Value, error) {
+	if err := vm.executionError(); err != nil {
+		return NoneValue(), err
+	}
 	if depth > 64 {
 		return NoneValue(), fmt.Errorf("Redis response depth limit exceeded")
 	}
@@ -165,7 +188,7 @@ func redisValue(value any, depth int) (Value, error) {
 	case []any:
 		items := make([]Value, len(value))
 		for i, item := range value {
-			converted, err := redisValue(item, depth+1)
+			converted, err := redisValue(vm, item, depth+1)
 			if err != nil {
 				return NoneValue(), err
 			}

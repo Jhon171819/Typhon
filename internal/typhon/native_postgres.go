@@ -338,6 +338,9 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 	}
 	var result [][]Value
 	for rows.Next() {
+		if err := vm.executionError(); err != nil {
+			return NoneValue(), err
+		}
 		if len(result) >= 100_000 {
 			return NoneValue(), fmt.Errorf("PostgreSQL row limit exceeded; use LIMIT")
 		}

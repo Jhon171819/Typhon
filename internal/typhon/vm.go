@@ -461,7 +461,7 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 				}
 				continue
 			}
-			imported, err := vm.engine.loadModuleByNameLocked(instr.S, filepathDir(f.module.Path))
+			imported, err := vm.engine.loadModuleByNameLocked(vm.context(), instr.S, filepathDir(f.module.Path))
 			if err != nil {
 				if !errors.Is(err, ErrModuleNotFound) {
 					return completion{}, err
@@ -749,13 +749,18 @@ func nativeJoin(vm *VM, args []Value) (Value, error) {
 	case <-vm.context().Done():
 		waitErr = vm.executionError()
 	case <-timer.C:
-		waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled), cancelled: true}
-		vm.engine.cancel()
-		vm.engine.bridgeMu.Lock()
-		bridge := vm.engine.bridge
-		vm.engine.bridgeMu.Unlock()
-		if bridge != nil {
-			_ = bridge.Close()
+		if vm.request != nil {
+			waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s: %w", timeout, context.DeadlineExceeded), cancelled: true}
+			vm.request.cancel()
+		} else {
+			waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled), cancelled: true}
+			vm.engine.cancel()
+			vm.engine.bridgeMu.Lock()
+			bridge := vm.engine.bridge
+			vm.engine.bridgeMu.Unlock()
+			if bridge != nil {
+				reportCleanupError("Python bridge close", bridge.Close())
+			}
 		}
 	}
 	vm.engine.execMu.Lock()

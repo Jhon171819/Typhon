@@ -597,7 +597,7 @@ def handle(req: http.Request) -> http.Response:
 		case 3:
 			path, expected = "/timeout", 504
 		case 4:
-			path, expected = "/cancel", 500
+			path, expected = "/cancel", statusClientClosedRequest
 		}
 		requestCtx, stop := context.WithCancel(ctx)
 		if path == "/cancel" {

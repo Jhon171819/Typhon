@@ -7,12 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	"typhon/internal/typhon"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := runWithContext(ctx, os.Args[1:]); err != nil && !(ctx.Err() != nil && errors.Is(err, context.Canceled)) {
 		fmt.Fprintln(os.Stderr, err)
