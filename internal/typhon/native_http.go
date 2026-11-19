@@ -45,7 +45,7 @@ func httpDriverTypes() map[string]Type {
 		"request": nativeFuncType("http.request", []Type{StrType(), StrType(), StrType(), headers}, response, 1),
 		"close":   nativeFuncType("http.close", nil, NoneType(), 0),
 	}}
-	return map[string]Type{
+	types := map[string]Type{
 		"Request": request, "Response": response, "Client": client,
 		"client":   nativeFuncType("http.client", []Type{FloatType()}, client, 1),
 		"response": nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
@@ -56,12 +56,16 @@ func httpDriverTypes() map[string]Type {
 		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
 		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
 	}
+	httpSSETypes(types)
+	return types
 }
 
 func httpDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
 	exports["client"] = driverFunc(types["client"], nativeHTTPClient)
 	exports["stream"] = driverFunc(types["stream"], makeHTTPStream)
+	exports["event"] = driverFunc(types["event"], makeSSEEvent)
+	exports["sse"] = driverFunc(types["sse"], makeSSEResponse)
 	exports["response"] = driverFunc(types["response"], func(vm *VM, args []Value) (Value, error) {
 		headers := http.Header{}
 		if len(args) == 3 {
@@ -233,15 +237,31 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		webState := newWebRequest(req)
 		problems := problemWriter{id: webState.id, head: req.Method == http.MethodHead}
 		router, routed := routerValue(handler)
+		var route *webRoute
 		if routed {
 			problems.enabled = router.apiErrors
+			route = router.requestRoute(webState.path, req.Method)
 		}
-		select {
-		case admission <- struct{}{}:
-			defer func() { <-admission }()
-		default:
-			problems.write(writer, http.StatusServiceUnavailable, "server busy")
-			return
+		var sse *httpSSEPolicy
+		lastEvent := ""
+		if route != nil {
+			sse = route.sse
+		}
+		if sse == nil {
+			select {
+			case admission <- struct{}{}:
+				defer func() { <-admission }()
+			default:
+				problems.write(writer, http.StatusServiceUnavailable, "server busy")
+				return
+			}
+		} else {
+			var valid bool
+			lastEvent, valid = lastSSEEvent(req)
+			if !valid || req.ContentLength != 0 {
+				problems.write(writer, 400, "invalid event stream request")
+				return
+			}
 		}
 		if !engine.beginExecution() {
 			problems.write(writer, http.StatusServiceUnavailable, "server shutting down")
@@ -255,8 +275,8 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return
 		}
 		var upload *httpUploadPolicy
-		if routed {
-			upload = router.uploadPolicy(webState.path, req.Method)
+		if route != nil {
+			upload = route.upload
 		}
 		var inbound *httpInboundStream
 		var body []byte
@@ -358,14 +378,36 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		request := scopedNativeObject(child, typ, attrs)
 		request.NativeObject.data = webState
 		var stream *httpStreamingResponse
+		var events *httpSSEResponse
+		var stopEvents context.CancelFunc
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()
 			defer engine.execMu.Unlock()
 			result, err := callHTTPHandler(child, handler, request)
 			if err == nil && result.Kind == ValueNativeObject {
 				stream, _ = result.NativeObject.data.(*httpStreamingResponse)
+				events, _ = result.NativeObject.data.(*httpSSEResponse)
 			}
-			if stream == nil {
+			if events != nil {
+				if sse == nil && req.Method == http.MethodHead && route == nil && routed {
+					if get := router.requestRoute(webState.path, http.MethodGet); get != nil {
+						sse = get.sse
+					}
+				}
+				if sse == nil {
+					cancel()
+					return NoneValue(), errors.New("configure router.enable_sse for an event stream")
+				}
+				if err := child.executionError(); err != nil {
+					cancel()
+					return NoneValue(), err
+				}
+				cancel()
+				if req.Method != http.MethodHead {
+					ctx, stopEvents = newHTTPSSEContext(req, child, webState.principal, sse)
+					child.ctx, scope.cancel = ctx, stopEvents
+				}
+			} else if stream == nil {
 				// Stop request tasks before they can acquire the VM lock.
 				cancel()
 			}
@@ -374,6 +416,18 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		streamStarted := false
 		if stream != nil {
 			streamStarted, runErr = writeHTTPStream(child, writer, req, webState, result, stream)
+		}
+		if events != nil && runErr == nil {
+			if req.Method == http.MethodHead {
+				setHTTPResponseHeaders(writer, webState, sseResponseHeaders())
+				writer.WriteHeader(http.StatusOK)
+				streamStarted = true
+			} else {
+				streamStarted, runErr = writeSSEResponse(child, writer, webState, lastEvent, sse, events, timeout)
+			}
+		}
+		if stopEvents != nil {
+			stopEvents()
 		}
 		cancel()
 		cleanupErr := scope.finish(engine)

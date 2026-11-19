@@ -175,7 +175,7 @@ func (a *jwtAuthenticator) verify(ctx context.Context, token string) (verifiedRe
 		}
 		scopes[scope] = true
 	}
-	return verifiedRequestIdentity{subject: claims.Subject, tenant: extra.Tenant, roles: extra.Roles, scopes: scopes}, nil
+	return verifiedRequestIdentity{subject: claims.Subject, tenant: extra.Tenant, roles: extra.Roles, scopes: scopes, expires: claims.Expiry.Time()}, nil
 }
 
 func (a *jwtAuthenticator) key(ctx context.Context, id string) (*rsa.PublicKey, error) {

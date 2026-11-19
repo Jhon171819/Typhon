@@ -27,6 +27,7 @@ type webRoute struct {
 	rate    *webRouteRate
 	doc     *webRouteDoc
 	upload  *httpUploadPolicy
+	sse     *httpSSEPolicy
 }
 
 type webNode struct {
@@ -45,6 +46,7 @@ type webRouter struct {
 	apiErrors bool
 	browser   webBrowserPolicy
 	docs      webDocsConfig
+	hasSSE    bool
 }
 
 type webRequest struct {
@@ -88,6 +90,7 @@ func webDriverTypes() map[string]Type {
 		[]Type{StrType(), StrType(), StrType(), strings, dictType(IntType(), schema), schema, schema}, NoneType(), 2)
 	router.Members["configure_docs"] = nativeFuncType("web.configure_docs", []Type{StrType(), StrType(), BoolType()}, NoneType(), 1)
 	router.Members["stream_upload"] = nativeFuncType("web.stream_upload", []Type{StrType(), StrType(), IntType(), IntType(), IntType()}, NoneType(), 2)
+	router.Members["enable_sse"] = nativeFuncType("web.enable_sse", []Type{StrType(), IntType(), IntType()}, NoneType(), 2)
 	types := map[string]Type{
 		"Router":         router,
 		"Next":           next,
@@ -259,7 +262,7 @@ func webDriverExports(types map[string]Type) map[string]Value {
 					return NoneValue(), errors.New("router was already started")
 				}
 				route := router.routes[[2]string{args[0].Str, args[1].Str}]
-				if route == nil || route.upload != nil || args[0].Str == "HEAD" {
+				if route == nil || route.upload != nil || route.sse != nil || args[0].Str == "HEAD" {
 					return NoneValue(), errors.New("stream upload requires a registered non-HEAD route without an upload policy")
 				}
 				total, part, parts := args[2].Int, args[2].Int, int64(16)
@@ -273,6 +276,16 @@ func webDriverExports(types map[string]Type) map[string]Value {
 					return NoneValue(), errors.New("invalid HTTP streaming upload limits")
 				}
 				route.upload = &httpUploadPolicy{total: total, part: part, parts: int(parts)}
+				return NoneValue(), nil
+			}),
+			"enable_sse": driverFunc(typ.Members["enable_sse"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen {
+					return NoneValue(), errors.New("router was already started")
+				}
+				if err := configureSSE(router.routes[[2]string{http.MethodGet, args[0].Str}], args); err != nil {
+					return NoneValue(), err
+				}
+				router.hasSSE = true
 				return NoneValue(), nil
 			}),
 		})
@@ -414,13 +427,11 @@ func webRequestSegments(path string) ([]string, error) {
 	return segments, nil
 }
 
-func (r *webRouter) uploadPolicy(path, method string) *httpUploadPolicy {
+func (r *webRouter) requestRoute(path, method string) *webRoute {
 	segments, err := webRequestSegments(path)
 	if err == nil {
 		if node := r.root.match(segments); node != nil {
-			if route := node.methods[method]; route != nil {
-				return route.upload
-			}
+			return node.methods[method]
 		}
 	}
 	return nil

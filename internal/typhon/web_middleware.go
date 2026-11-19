@@ -19,6 +19,7 @@ type verifiedRequestIdentity struct {
 	tenant  string
 	roles   []string
 	scopes  map[string]bool
+	expires time.Time
 }
 
 func newWebRequest(req *http.Request) *webRequest {

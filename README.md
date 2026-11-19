@@ -89,6 +89,8 @@ The Go runtime currently supports:
   bounded pages and opaque cursors for stable SQL ordering.
 - [HTTP streaming](docs/http_streaming.md) handles multipart uploads and
   binary downloads through bounded, cancellable chunks.
+- [Server-Sent Events](docs/http_events.md) support reconnectable notifications
+  with heartbeat, backpressure, and independent connection admission.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

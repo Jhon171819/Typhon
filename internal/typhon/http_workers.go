@@ -14,6 +14,7 @@ type httpPoolMetrics struct {
 	waiting, peak, waitNS               atomic.Int64
 	quotaRejected                       atomic.Int64
 	rateAllowed, rateDenied, rateErrors atomic.Int64
+	eventConnections                    atomic.Int64
 }
 
 func (m *httpPoolMetrics) snapshot() Value {
@@ -26,6 +27,7 @@ func (m *httpPoolMetrics) snapshot() Value {
 		{"queued", &m.waiting}, {"queue_peak", &m.peak}, {"queue_wait_ns", &m.waitNS},
 		{"quota_rejected", &m.quotaRejected},
 		{"rate_allowed", &m.rateAllowed}, {"rate_denied", &m.rateDenied}, {"rate_errors", &m.rateErrors},
+		{"event_connections", &m.eventConnections},
 	} {
 		_ = result.Dict.put(StringValue(metric.name), IntValue(metric.value.Load()))
 	}
@@ -33,15 +35,19 @@ func (m *httpPoolMetrics) snapshot() Value {
 }
 
 type httpWorkerPool struct {
-	ctx            context.Context
-	idle           chan http.Handler
-	admission      chan struct{}
-	engines        []*Engine
-	metrics        httpPoolMetrics
-	requestTimeout time.Duration
-	liveness       string
-	apiErrors      bool
-	browser        webBrowserPolicy
+	ctx             context.Context
+	idle            chan http.Handler
+	admission       chan struct{}
+	engines         []*Engine
+	metrics         httpPoolMetrics
+	requestTimeout  time.Duration
+	liveness        string
+	apiErrors       bool
+	browser         webBrowserPolicy
+	eventRouter     *webRouter
+	eventHandlers   []http.Handler
+	eventSlots      chan struct{}
+	eventRoundRobin atomic.Uint64
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
@@ -57,8 +63,19 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		router.frozen = true
 		p.apiErrors = router.apiErrors
 		p.browser = router.browser
+		if router.hasSSE {
+			p.eventRouter = router
+			p.eventSlots = make(chan struct{}, maxSSEConnections)
+		}
 	}
-	p.idle <- httpVMHandlerWithTimeout(vm.engine, handler, p.requestTimeout)
+	addWorker := func(engine *Engine, entry Value) {
+		server := httpVMHandlerWithTimeout(engine, entry, p.requestTimeout)
+		p.idle <- server
+		if p.eventRouter != nil {
+			p.eventHandlers = append(p.eventHandlers, server)
+		}
+	}
+	addWorker(vm.engine, handler)
 	if cap(p.idle) == 1 {
 		return nil
 	}
@@ -92,7 +109,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		} else if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
 			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, binding)
 		}
-		p.idle <- httpVMHandlerWithTimeout(engine, entry, p.requestTimeout)
+		addWorker(engine, entry)
 	}
 	return nil
 }
@@ -140,6 +157,12 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 		p.reject(writer, "server shutting down", problems)
 		return
 	}
+	if p.eventRouter != nil && req.Method == http.MethodGet {
+		if route := p.eventRouter.requestRoute(req.URL.EscapedPath(), req.Method); route != nil && route.sse != nil {
+			p.serveEvent(writer, req, problems)
+			return
+		}
+	}
 	ctx, cancel := httpRequestContext(req.Context(), p.ctx, p.requestTimeout)
 	defer cancel()
 	select {
@@ -169,6 +192,24 @@ func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request
 	}
 	worker.ServeHTTP(writer, req.WithContext(ctx))
 	p.metrics.completed.Add(1)
+}
+
+func (p *httpWorkerPool) serveEvent(writer http.ResponseWriter, req *http.Request, problems problemWriter) {
+	select {
+	case p.eventSlots <- struct{}{}:
+		defer func() { <-p.eventSlots }()
+	default:
+		p.reject(writer, "too many event streams", problems)
+		return
+	}
+	p.metrics.eventConnections.Add(1)
+	defer p.metrics.eventConnections.Add(-1)
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(p.ctx, cancel)
+	defer cancel()
+	defer stop()
+	index := (p.eventRoundRobin.Add(1) - 1) % uint64(len(p.eventHandlers))
+	p.eventHandlers[index].ServeHTTP(writer, req.WithContext(ctx))
 }
 
 func (p *httpWorkerPool) wait(ctx context.Context) http.Handler {
