@@ -30,6 +30,10 @@ type webRejection struct{ status int }
 
 func (r *webRejection) Error() string { return webStatuses[r.status].message }
 
+func (r *webRejection) exception() *Exception {
+	return &Exception{kind: errorKind, message: r.Error(), cause: r}
+}
+
 func webProblemPayload(status int, id string, details []Value) Value {
 	p := webStatuses[status]
 	body := DictValue()

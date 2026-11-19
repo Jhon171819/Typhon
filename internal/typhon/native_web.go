@@ -48,6 +48,7 @@ type webRouter struct {
 
 type webRequest struct {
 	path        string
+	rawQuery    string
 	params      map[string]string
 	id          string
 	sendID      bool
@@ -85,7 +86,7 @@ func webDriverTypes() map[string]Type {
 	router.Members["document"] = nativeFuncType("web.document",
 		[]Type{StrType(), StrType(), StrType(), strings, dictType(IntType(), schema), schema, schema}, NoneType(), 2)
 	router.Members["configure_docs"] = nativeFuncType("web.configure_docs", []Type{StrType(), StrType(), BoolType()}, NoneType(), 1)
-	return map[string]Type{
+	types := map[string]Type{
 		"Router":         router,
 		"Next":           next,
 		"router":         nativeFuncType("web.router", nil, router, 0),
@@ -97,10 +98,13 @@ func webDriverTypes() map[string]Type {
 		"rate_limiter": nativeFuncType("web.rate_limiter",
 			[]Type{redisDriverTypes()["Connection"], StrType(), IntType(), IntType(), BoolType(), dictType(StrType(), IntType())}, webRateLimiterType(), 2),
 	}
+	webPaginationTypes(types)
+	return types
 }
 
 func webDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	exports["paginator"] = makeWebPaginator(types)
 	exports["rate_limiter"] = driverFunc(types["rate_limiter"], makeWebRateLimiter)
 	exports["session_cookie"] = driverFunc(types["session_cookie"], func(vm *VM, args []Value) (Value, error) {
 		return webSessionCookie(args)
@@ -118,7 +122,7 @@ func webDriverExports(types map[string]Type) map[string]Value {
 			return NoneValue(), errors.New("unsupported HTTP rejection status")
 		}
 		rejection := &webRejection{status: status}
-		return Value{Kind: ValueException, Exception: &Exception{kind: errorKind, message: rejection.Error(), cause: rejection}}, nil
+		return Value{Kind: ValueException, Exception: rejection.exception()}, nil
 	})
 	exports["validate"] = driverFunc(types["validate"], func(vm *VM, args []Value) (Value, error) {
 		schema, err := validationSchemaFrom(vm, args[1])

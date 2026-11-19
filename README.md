@@ -85,6 +85,8 @@ The Go runtime currently supports:
   quotas across API replicas through Redis.
 - [OpenAPI generation](docs/http_openapi.md) exports documented routes and
   their validation schemas, with an opt-in documentation page.
+- [REST pagination](docs/http_pagination.md) provides typed filters,
+  bounded pages and opaque cursors for stable SQL ordering.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

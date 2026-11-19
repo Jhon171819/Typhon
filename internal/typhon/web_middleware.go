@@ -27,7 +27,7 @@ func newWebRequest(req *http.Request) *webRequest {
 		!utf8.ValidString(principal.subject) || !utf8.ValidString(principal.tenant) {
 		principal = verifiedRequestIdentity{}
 	}
-	return &webRequest{path: req.URL.EscapedPath(), id: rand.Text(), principal: principal, bearer: bearerToken(req.Header.Values("Authorization"))}
+	return &webRequest{path: req.URL.EscapedPath(), rawQuery: req.URL.RawQuery, id: rand.Text(), principal: principal, bearer: bearerToken(req.Header.Values("Authorization"))}
 }
 
 func webNextType() Type {
