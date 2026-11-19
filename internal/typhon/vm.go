@@ -578,6 +578,26 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 				return IntValue(syntax.Offset), nil
 			}
 			return NoneValue(), nil
+		case "sqlstate", "constraint", "table", "column":
+			var cause *NativeCause
+			if !errors.As(value.Exception, &cause) || cause.Driver() != "PostgreSQL" {
+				return NoneValue(), nil
+			}
+			var text string
+			switch name {
+			case "sqlstate":
+				text = cause.Code()
+			case "constraint":
+				text = cause.Constraint()
+			case "table":
+				text = cause.Table()
+			case "column":
+				text = cause.Column()
+			}
+			if text == "" {
+				return NoneValue(), nil
+			}
+			return StringValue(text), nil
 		}
 	case ValueNativeObject:
 		if err := vm.checkNativeOwner(value.NativeObject); err != nil {

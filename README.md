@@ -91,6 +91,8 @@ The Go runtime currently supports:
   binary downloads through bounded, cancellable chunks.
 - [Server-Sent Events](docs/http_events.md) support reconnectable notifications
   with heartbeat, backpressure, and independent connection admission.
+- [Complex PostgreSQL parameters](docs/postgres_parameters.md) support SQL
+  arrays, JSONB, typed nulls and structured SQLSTATE diagnostics.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

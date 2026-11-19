@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -181,15 +182,19 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 // NativeCause keeps only structured diagnostics safe to pass across the
 // driver boundary. Raw third-party errors may contain credentials or data.
 type NativeCause struct {
-	driver string
-	code   string
-	detail string
-	marker error
+	driver                    string
+	code                      string
+	detail                    string
+	marker                    error
+	constraint, table, column string
 }
 
-func (e *NativeCause) Driver() string { return e.driver }
-func (e *NativeCause) Code() string   { return e.code }
-func (e *NativeCause) Unwrap() error  { return e.marker }
+func (e *NativeCause) Driver() string     { return e.driver }
+func (e *NativeCause) Code() string       { return e.code }
+func (e *NativeCause) Constraint() string { return e.constraint }
+func (e *NativeCause) Table() string      { return e.table }
+func (e *NativeCause) Column() string     { return e.column }
+func (e *NativeCause) Unwrap() error      { return e.marker }
 func (e *NativeCause) Error() string {
 	if e.code != "" {
 		return e.driver + ": " + e.detail + " (SQLSTATE " + e.code + ")"
@@ -210,9 +215,9 @@ func driverFailure(driver, kind string, err error) error {
 		return quotaStop("PostgreSQL message byte", int64(oversized.MaxExpectedBodyLen))
 	}
 	code := ""
+	var postgres *pgconn.PgError
 	if kind != validationKind {
 		var network net.Error
-		var postgres *pgconn.PgError
 		var connect *pgconn.ConnectError
 		switch {
 		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, redis.ErrPoolTimeout),
@@ -223,6 +228,9 @@ func driverFailure(driver, kind string, err error) error {
 			code = postgres.Code
 			if len(code) != 5 || !validSQLState(code) {
 				code = ""
+			}
+			if code == "57014" {
+				kind = timeoutKind
 			}
 		case errors.As(err, &network), errors.As(err, &connect),
 			errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, net.ErrClosed):
@@ -241,6 +249,11 @@ func driverFailure(driver, kind string, err error) error {
 		detail = "invalid request or connection configuration"
 	}
 	cause := &NativeCause{driver: driver, code: code, detail: detail}
+	if postgres != nil && strings.HasPrefix(code, "23") {
+		cause.constraint = safePostgresIdentifier(postgres.ConstraintName)
+		cause.table = safePostgresIdentifier(postgres.TableName)
+		cause.column = safePostgresIdentifier(postgres.ColumnName)
+	}
 	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
 		if errors.Is(err, sentinel) {
 			cause.marker = sentinel
@@ -248,6 +261,18 @@ func driverFailure(driver, kind string, err error) error {
 		}
 	}
 	return &Exception{kind: kind, message: cause.Error(), cause: cause}
+}
+
+func safePostgresIdentifier(name string) string {
+	if len(name) > 63 || !validImportIdentifier(name) {
+		return ""
+	}
+	for _, ch := range name {
+		if ch > 127 {
+			return ""
+		}
+	}
+	return name
 }
 
 func validSQLState(code string) bool {

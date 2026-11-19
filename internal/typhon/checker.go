@@ -676,11 +676,15 @@ func (c *checker) inferExpr(expr Expr, scope *scope, classInfo *ClassInfo) Type 
 
 func (c *checker) inferAttr(expr *AttrExpr, scope *scope, classInfo *ClassInfo) Type {
 	objType := c.inferExpr(expr.Object, scope, classInfo)
-	if objType.Kind == TypeException && (expr.Name == "kind" || expr.Name == "message") {
-		return StrType()
-	}
-	if objType.Kind == TypeException && expr.Name == "offset" {
-		return unionType(IntType(), NoneType())
+	if objType.Kind == TypeException {
+		switch expr.Name {
+		case "kind", "message":
+			return StrType()
+		case "offset":
+			return unionType(IntType(), NoneType())
+		case "sqlstate", "constraint", "table", "column":
+			return unionType(StrType(), NoneType())
+		}
 	}
 	if objType.Kind == TypeNative || objType.Kind == TypeModule || objType.Kind == TypeException {
 		if typ, ok := objType.Members[expr.Name]; ok {

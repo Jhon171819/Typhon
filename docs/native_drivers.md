@@ -121,7 +121,8 @@ tornam-se seus tipos Typhon; datas/timestamps tornam-se strings RFC3339Nano,
 UUID torna-se string e arrays tornam-se listas. `bytea` torna-se `str` com os bytes
 originais. Objetos JSON retornados pelo PostgreSQL tornam-se dicionários,
 com chaves ordenadas; arrays JSON tornam-se listas. Para outros tipos sem
-representação, use cast SQL para `text`. Arrays como parâmetros ainda não são suportados.
+representação, use cast SQL para `text`. Consulte [parâmetros PostgreSQL
+e SQLSTATE](postgres_parameters.md) para arrays, JSONB e nulls explícitos.
 
 `commit` confirma apenas quando chamado explicitamente. Transações abandonadas
 fazem rollback ao encerrar a Engine; as abertas dentro de handlers HTTP fazem

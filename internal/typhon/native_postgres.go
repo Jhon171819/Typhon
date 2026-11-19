@@ -36,16 +36,19 @@ func postgresDriverTypes() map[string]Type {
 	connection := Type{Kind: TypeNative, Name: "typhon.postgres.Connection", Members: methods()}
 	connection.Members["begin"] = nativeFuncType("postgres.begin", nil, tx, 0)
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
-	return map[string]Type{
+	types := map[string]Type{
 		"Rows": rows, "Transaction": tx, "Connection": connection,
 		"connect":       nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
 		"connect_typed": nativeFuncType("postgres.connect_typed", []Type{StrType(), FloatType()}, connection, 1),
 		"env":           nativeFuncType("postgres.env", []Type{StrType()}, StrType(), 0),
 	}
+	postgresParamTypes(types)
+	return types
 }
 
 func postgresDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	postgresParamExports(exports, types)
 	exports["connect"] = driverFunc(types["connect"], func(vm *VM, args []Value) (Value, error) {
 		return nativePostgresConnect(vm, args, false)
 	})
@@ -262,30 +265,53 @@ func postgresParams(vm *VM, args []Value) ([]any, error) {
 			params = append(params, value.Str)
 		case ValueBool:
 			params = append(params, value.Bool)
-		case ValueNativeObject:
-			if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+		case ValueDict:
+			data, err := postgresJSONParam(vm, value)
+			if err != nil {
 				return nil, err
 			}
-			scalar, ok := scalarData(value)
-			if !ok {
-				return nil, fmt.Errorf("unsupported native SQL parameter")
-			}
-			switch data := scalar.sql.(type) {
-			case pgtype.Timestamp:
-				if data.Time.Nanosecond()%1000 != 0 {
-					return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
+			params = append(params, data)
+		case ValueNativeObject:
+			if binding, ok := value.NativeObject.data.(*postgresParameter); ok {
+				if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+					return nil, err
 				}
-			case pgtype.Timestamptz:
-				if data.Time.Nanosecond()%1000 != 0 {
-					return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
-				}
+				params = append(params, binding.data)
+				continue
 			}
-			params = append(params, scalar.sql)
+			scalar, err := postgresScalarParam(vm, value)
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, scalar)
+		case ValueList:
+			return nil, fmt.Errorf("use postgres.array or postgres.jsonb for a list parameter")
 		default:
 			return nil, fmt.Errorf("unsupported SQL parameter: %s", value.Kind)
 		}
 	}
 	return params, nil
+}
+
+func postgresScalarParam(vm *VM, value Value) (any, error) {
+	if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+		return nil, err
+	}
+	scalar, ok := scalarData(value)
+	if !ok {
+		return nil, fmt.Errorf("unsupported native SQL parameter")
+	}
+	switch data := scalar.sql.(type) {
+	case pgtype.Timestamp:
+		if data.Time.Nanosecond()%1000 != 0 {
+			return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
+		}
+	case pgtype.Timestamptz:
+		if data.Time.Nanosecond()%1000 != 0 {
+			return nil, fmt.Errorf("PostgreSQL timestamp requires microsecond precision")
+		}
+	}
+	return scalar.sql, nil
 }
 
 func postgresValue(value any, depth int) (Value, error) {
