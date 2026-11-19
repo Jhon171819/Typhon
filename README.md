@@ -73,6 +73,8 @@ The Go runtime currently supports:
   keeps request state isolated.
 - [Structured HTTP errors](docs/http_problems.md) provide stable public
   codes, validation details and correlation IDs.
+- [HTTP authentication](docs/http_auth.md) verifies access tokens and
+  exposes a request-scoped principal in protected routes.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
