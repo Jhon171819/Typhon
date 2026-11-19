@@ -11,9 +11,9 @@ registrar e executar limpeza.
 | Escopo | Encerramento |
 | --- | --- |
 | Engine | `Engine.Close()` cancela e aguarda as execuções e tarefas ativas, depois fecha os recursos da Engine. A CLI faz isso ao sair, inclusive em erro. |
-| Requisição HTTP | Na saída do handler, o runtime cancela e aguarda as tarefas da requisição. O fechamento termina antes de enviar a resposta. |
+| Requisição HTTP | O fechamento de respostas em memória termina antes do envio. Respostas em streaming mantêm o escopo até o fim do fluxo ou cancelamento. O runtime cancela e aguarda as tarefas antes de encerrar o escopo. |
 | Pool PostgreSQL | O fechamento encerra transações abertas antes de fechar conexões. Um pool criado na Engine pode servir a vários requests, cada um com suas próprias transações. |
-| Cursor e corpo HTTP | A consulta PostgreSQL materializa `Rows` e fecha o cursor ao sair da operação. O cliente HTTP lê e fecha o corpo antes de devolver a resposta. |
+| Cursor e corpo HTTP | `query` materializa `Rows` e libera a leitura ao sair. Um [cursor streaming](postgres_cursor.md) conserva a conexão até EOF, fechamento ou cancelamento. O cliente HTTP lê e fecha o corpo antes de devolver a resposta. |
 
 O runtime fecha recursos ativos na ordem inversa da aquisição dentro de
 cada escopo. `close()` e `rollback()` explícitos retiram o registro e são
@@ -37,8 +37,9 @@ voltam a ficar disponíveis ao terminar o request.
 exceção. Quando o contexto cancela ou expira, a VM pula os `except` e
 percorre os `finally` já ativos de dentro para fora. A VM usa um prazo
 compartilhado de 2 segundos e até 10 mil instruções para esse código.
-Nesse modo, as operações nativas de liberação são `close()` e
-`rollback()`. `Request.remaining()` e `Request.cancelled()` podem
+Nesse modo, o runtime permite métodos nativos de liberação, como
+`close()`, `rollback()` e a liberação de um lock Redis com `release()`.
+`Request.remaining()` e `Request.cancelled()` podem
 inspecionar o contexto original. Novos I/O de driver, imports, chamadas à ponte Python
 e novas esperas ou tarefas são rejeitados. Um desvio em `finally` mantém
 o cancelamento pendente. Limites rígidos da VM encerram bytecode e o
@@ -54,9 +55,10 @@ detalhes de driver continuam sanitizados.
 
 O prazo de 2 segundos para rollback é compartilhado dentro de cada
 drenagem de escopo. A destruição das conexões pelo `pgxpool` é síncrona
-e usa o prazo interno do driver, de até 15 segundos por conexão. O
-servidor HTTP usa até 5 segundos para shutdown gracioso antes de fechar
-sockets ativos. Esses prazos se aplicam às respectivas fases. A VM
+e usa o prazo interno do driver, de até 15 segundos por conexão.
+O servidor HTTP usa um [prazo configurável de drain](http_shutdown.md),
+de 5 segundos por padrão, antes de cancelar pendências. Esses prazos se
+aplicam às respectivas fases. A VM
 depende de operações do host retornarem, inclusive escrita em stdout.
 
 ## Uso
