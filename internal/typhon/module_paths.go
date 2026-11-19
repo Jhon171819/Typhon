@@ -22,7 +22,7 @@ func (e *Engine) initializeModuleRoot(dir string) error {
 	if err != nil {
 		return err
 	}
-	directory, err := os.Stat(root)
+	directory, err := os.Stat(root) // #nosec G703 -- The Go host selects this import root. Dynamic imports use os.Root below.
 	if err != nil {
 		return err
 	}

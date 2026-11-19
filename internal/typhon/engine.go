@@ -172,7 +172,7 @@ func (e *Engine) loadModule(path string, imported bool) (*LoadedModule, error) {
 	if imported {
 		source, err = e.readImportedSource(abs)
 	} else {
-		source, err = os.ReadFile(abs)
+		source, err = os.ReadFile(abs) // #nosec G703 -- The host explicitly selects the entry point. Imports use readImportedSource.
 	}
 	if err != nil {
 		return nil, err
@@ -527,7 +527,7 @@ func projectRoot(start string) string {
 		return start
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil {
+		if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil { // #nosec G703 -- Search parent directories for the fixed module marker.
 			return abs
 		}
 		parent := filepath.Dir(abs)

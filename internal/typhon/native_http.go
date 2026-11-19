@@ -180,7 +180,7 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		}
 		ctx, cancel := driverContext(vm, timeout)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, args[0].Str, args[1].Str, strings.NewReader(args[2].Str))
+		req, err := http.NewRequestWithContext(ctx, args[0].Str, args[1].Str, strings.NewReader(args[2].Str)) // #nosec G704 -- The trusted Typhon application chooses its upstream URL.
 		if err != nil {
 			return NoneValue(), driverFailure("HTTP", validationKind, err)
 		}
@@ -194,7 +194,7 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 			}
 		}
 		injectHTTPTrace(req)
-		resp, err := client.Do(req)
+		resp, err := client.Do(req) // #nosec G704 -- The trusted Typhon application chooses its upstream URL.
 		if err != nil {
 			return NoneValue(), driverFailure("HTTP", connectionKind, err)
 		}

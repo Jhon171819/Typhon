@@ -290,7 +290,7 @@ func (p *webPaginator) makeCursor(after int64, binding []byte) string {
 	var seed [16]byte
 	binary.BigEndian.PutUint64(seed[:8], uint64(after))
 	binary.BigEndian.PutUint64(seed[8:], uint64(p.now().Add(p.lifetime).Unix()))
-	return base64.RawURLEncoding.EncodeToString(p.cipher.Seal(nil, nil, seed[:], binding))
+	return base64.RawURLEncoding.EncodeToString(p.cipher.Seal(nil, nil, seed[:], binding)) // #nosec G407 -- GCMWithRandomNonce requires nil and generates its own cryptographic nonce.
 }
 
 func (p *webPaginator) openCursor(token string, binding []byte) (int64, error) {
