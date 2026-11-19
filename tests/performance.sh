@@ -60,6 +60,7 @@ sample() {
   uname -srmo
   go version
   printf 'Available CPUs: %s\n' "$(nproc)"
+  printf 'CPU clock ticks per second: %s\n' "$(getconf CLK_TCK)"
   awk '/model name/ {print; exit}' /proc/cpuinfo
   docker version --format 'Docker Server {{.Server.Version}}'
   git rev-parse HEAD
@@ -151,6 +152,6 @@ sample | tee -a "$output/resources.txt"
 echo 'Redis and PostgreSQL outage/recovery, disconnect, timeout and container stop passed'
 
 go test ./internal/typhon -run '^$' \
-  -bench '^(BenchmarkTypedIntegerLoop|BenchmarkBytecodeCompileUserService|BenchmarkHTTPJSONReference)$' \
+  -bench '^(BenchmarkWarmedTypedIntegerLoop|BenchmarkTypedIntegerLoop|BenchmarkBytecodeCompileUserService|BenchmarkHTTPJSONReference)$' \
   -benchmem -benchtime=300ms -cpuprofile "$output/http-vm.pprof" -o "$work/bench.test" | tee "$output/go-benchmarks.txt"
 go tool pprof -top -nodecount=12 "$work/bench.test" "$output/http-vm.pprof" | tee "$output/pprof-top.txt"
