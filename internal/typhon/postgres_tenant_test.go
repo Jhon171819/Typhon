@@ -199,7 +199,7 @@ func TestNativePostgresTenantIsolationIntegration(t *testing.T) {
 	send(handler, "DELETE", "/records/shared", "a", "", 204, "")
 	send(handler, "GET", "/records/shared", "a", "", 404, "")
 	send(handler, "GET", "/records/shared", "b", "", 200, "beta")
-	send(handler, "POST", "/retry", "a", "", 200, `["`+tenantA+`",2]`)
+	send(handler, "POST", "/retry", "a", "", 200, `["`+tenantA+`", 2]`)
 	send(handler, "GET", "/records/retried", "b", "", 404, "")
 	send(handler, "GET", "/records/retried", "a", "", 200, "after retry")
 	checkScope(pid)
