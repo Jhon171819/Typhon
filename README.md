@@ -69,6 +69,8 @@ The Go runtime currently supports:
   decimals, UUIDs and dates with PostgreSQL and JSON codecs.
 - [HTTP routing](docs/http_router.md) supports method dispatch, path
   parameters and versioned resource routes.
+- [HTTP middleware](docs/http_middleware.md) composes route handlers and
+  keeps request state isolated.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

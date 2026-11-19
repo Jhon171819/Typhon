@@ -23,12 +23,17 @@ func httpDriverTypes() map[string]Type {
 	}}
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
-		"query":     nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
-		"query_all": nativeFuncType("http.query_all", []Type{StrType()}, listType(StrType()), 0),
-		"param":     nativeFuncType("http.param", []Type{StrType()}, StrType(), 0),
-		"json":      nativeFuncType("http.request.json", nil, AnyType(), 0),
-		"remaining": nativeFuncType("http.request.remaining", nil, FloatType(), 0),
-		"cancelled": nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
+		"query":      nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
+		"query_all":  nativeFuncType("http.query_all", []Type{StrType()}, listType(StrType()), 0),
+		"param":      nativeFuncType("http.param", []Type{StrType()}, StrType(), 0),
+		"json":       nativeFuncType("http.request.json", nil, AnyType(), 0),
+		"remaining":  nativeFuncType("http.request.remaining", nil, FloatType(), 0),
+		"cancelled":  nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
+		"request_id": StrType(),
+		"identity":   unionType(StrType(), NoneType()),
+		"tenant":     unionType(StrType(), NoneType()),
+		"state":      nativeFuncType("http.request.state", []Type{StrType()}, unionType(StrType(), NoneType()), 0),
+		"set_state":  nativeFuncType("http.request.set_state", []Type{StrType(), StrType()}, NoneType(), 0),
 	}}
 	headers := listType(listType(StrType()))
 	client := Type{Kind: TypeNative, Name: "typhon.http.Client", Members: map[string]Type{
@@ -255,7 +260,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		typ := httpDriverTypes()["Request"]
 		bodyText := string(body)
 		query := req.URL.Query()
-		webState := &webRequest{path: req.URL.EscapedPath()}
+		webState := newWebRequest(req)
 		attrs := map[string]Value{
 			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(bodyText),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
@@ -288,6 +293,16 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		}
 		attrs["remaining"].Native.cleanup = true
 		attrs["cancelled"].Native.cleanup = true
+		attrs["request_id"] = StringValue(webState.id)
+		attrs["identity"] = optionalWebString(webState.principal.subject, webState.principal.subject != "")
+		attrs["tenant"] = optionalWebString(webState.principal.tenant, webState.principal.tenant != "")
+		attrs["state"] = driverFunc(typ.Members["state"], func(vm *VM, args []Value) (Value, error) {
+			value, exists := webState.state[args[0].Str]
+			return optionalWebString(value, exists), nil
+		})
+		attrs["set_state"] = driverFunc(typ.Members["set_state"], func(vm *VM, args []Value) (Value, error) {
+			return NoneValue(), webState.setState(vm, args[0].Str, args[1].Str)
+		})
 		request := scopedNativeObject(child, typ, attrs)
 		request.NativeObject.data = webState
 		result, runErr := func() (Value, error) {
@@ -297,6 +312,9 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return callHTTPHandler(child, handler, request)
 		}()
 		cleanupErr := scope.finish(engine)
+		if webState.sendID {
+			writer.Header().Set("X-Request-ID", webState.id)
+		}
 		var stopped *executionStop
 		if errors.As(runErr, &stopped) && stopped.cancelled {
 			reportCleanupError("HTTP request", cleanupErr)
@@ -347,6 +365,9 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		headers := result.NativeObject.data.(http.Header)
 		for name, values := range headers {
 			writer.Header()[name] = values
+		}
+		if webState.sendID {
+			writer.Header().Set("X-Request-ID", webState.id)
 		}
 		status := int(responseAttrs["status"].Int)
 		if req.Method == http.MethodHead && writer.Header().Get("Content-Length") == "" && status != 204 && status != 304 {

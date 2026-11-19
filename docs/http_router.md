@@ -26,6 +26,8 @@ de até 4096 bytes e até 32 segmentos. Padrões com mesma forma
 estrutural e método conflitam, mesmo se o nome de parâmetro mudar.
 A tabela fica imutável ao começar a servir. Para usar a tabela em
 uma função existente, chame `routes.dispatch(req)`.
+[Middlewares](http_middleware.md) podem envolver o handler globalmente
+ou por rota registrada.
 
 O trie prioriza o caminho literal que tiver correspondência completa.
 Se o ramo literal acabar sem rota, tenta o parâmetro. O router

@@ -19,12 +19,14 @@ const maxWebSegments = 32
 type webRoute struct {
 	handler Value
 	names   []string
+	pattern string
+	steps   []webStep
 }
 
 type webNode struct {
 	literal map[string]*webNode
 	param   *webNode
-	methods map[string]webRoute
+	methods map[string]*webRoute
 }
 
 type webRouter struct {
@@ -32,11 +34,17 @@ type webRouter struct {
 	module *LoadedModule
 	size   int
 	frozen bool
+	routes map[[2]string]*webRoute
+	steps  []webStep
 }
 
 type webRequest struct {
-	path   string
-	params map[string]string
+	path      string
+	params    map[string]string
+	id        string
+	sendID    bool
+	state     map[string]string
+	principal verifiedRequestIdentity
 }
 
 func httpHandlerType() Type {
@@ -50,8 +58,15 @@ func webDriverTypes() map[string]Type {
 		"add":      nativeFuncType("web.add", []Type{StrType(), StrType(), httpHandlerType()}, NoneType(), 0),
 		"dispatch": nativeFuncType("web.dispatch", []Type{httpTypes["Request"]}, httpTypes["Response"], 0),
 	}}
+	next := webNextType()
+	middleware := nativeFuncType("web.middleware", []Type{httpTypes["Request"], next}, httpTypes["Response"], 0)
+	router.Members["use"] = nativeFuncType("web.use", []Type{middleware}, NoneType(), 0)
+	router.Members["use_on"] = nativeFuncType("web.use_on", []Type{StrType(), StrType(), middleware}, NoneType(), 0)
+	router.Members["use_request_id"] = nativeFuncType("web.use_request_id", nil, NoneType(), 0)
+	router.Members["use_logging"] = nativeFuncType("web.use_logging", nil, NoneType(), 0)
 	return map[string]Type{
 		"Router": router,
+		"Next":   next,
 		"router": nativeFuncType("web.router", nil, router, 0),
 	}
 }
@@ -59,7 +74,7 @@ func webDriverTypes() map[string]Type {
 func webDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
 	exports["router"] = driverFunc(types["router"], func(vm *VM, args []Value) (Value, error) {
-		router := &webRouter{module: vm.module}
+		router := &webRouter{module: vm.module, routes: map[[2]string]*webRoute{}}
 		typ := types["Router"]
 		value := nativeObject(vm, typ, map[string]Value{
 			"add": driverFunc(typ.Members["add"], func(vm *VM, args []Value) (Value, error) {
@@ -71,6 +86,22 @@ func webDriverExports(types map[string]Type) map[string]Value {
 			}),
 			"dispatch": driverFunc(typ.Members["dispatch"], func(vm *VM, args []Value) (Value, error) {
 				return router.dispatch(vm, args[0])
+			}),
+			"use": driverFunc(typ.Members["use"], func(vm *VM, args []Value) (Value, error) {
+				return NoneValue(), router.appendStep(&router.steps, webStep{handler: args[0]})
+			}),
+			"use_on": driverFunc(typ.Members["use_on"], func(vm *VM, args []Value) (Value, error) {
+				route := router.routes[[2]string{args[0].Str, args[1].Str}]
+				if route == nil {
+					return NoneValue(), errors.New("middleware requires an already registered route")
+				}
+				return NoneValue(), router.appendStep(&route.steps, webStep{handler: args[2]})
+			}),
+			"use_request_id": driverFunc(typ.Members["use_request_id"], func(vm *VM, args []Value) (Value, error) {
+				return NoneValue(), router.appendStep(&router.steps, webStep{native: webRequestID})
+			}),
+			"use_logging": driverFunc(typ.Members["use_logging"], func(vm *VM, args []Value) (Value, error) {
+				return NoneValue(), router.appendStep(&router.steps, webStep{native: webLogging})
 			}),
 		})
 		value.NativeObject.data = router
@@ -151,9 +182,14 @@ func (r *webRouter) add(method, pattern string, handler Value) error {
 		return fmt.Errorf("conflicting %s route", method)
 	}
 	if node.methods == nil {
-		node.methods = map[string]webRoute{}
+		node.methods = map[string]*webRoute{}
 	}
-	node.methods[method] = webRoute{handler: handler, names: names}
+	route := &webRoute{handler: handler, names: names, pattern: pattern}
+	node.methods[method] = route
+	if r.routes == nil {
+		r.routes = map[[2]string]*webRoute{}
+	}
+	r.routes[[2]string{method, pattern}] = route
 	r.size++
 	return nil
 }
@@ -232,7 +268,8 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 			state.params[name] = segments[i]
 		}
 	}
-	return vm.callValue(route.handler, []Value{request}, nil)
+	pipeline := webPipeline{route: route, routerSteps: r.steps, request: request, state: state}
+	return pipeline.run(vm, 0)
 }
 
 func callHTTPHandler(vm *VM, handler, request Value) (Value, error) {
