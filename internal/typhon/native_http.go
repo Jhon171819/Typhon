@@ -33,11 +33,12 @@ func httpDriverTypes() map[string]Type {
 	}}
 	return map[string]Type{
 		"Request": request, "Response": response, "Client": client,
-		"client":   nativeFuncType("http.client", []Type{FloatType()}, client, 1),
-		"response": nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
-		"json":     nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
-		"serve":    nativeFuncType("http.serve", []Type{StrType(), nativeFuncType("http.handler", []Type{request}, response, 0)}, NoneType(), 0),
-		"env":      nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
+		"client":       nativeFuncType("http.client", []Type{FloatType()}, client, 1),
+		"response":     nativeFuncType("http.response", []Type{IntType(), StrType(), headers}, response, 1),
+		"json":         nativeFuncType("http.json", []Type{IntType(), AnyType()}, response, 0),
+		"serve":        nativeFuncType("http.serve", []Type{StrType(), nativeFuncType("http.handler", []Type{request}, response, 0), IntType(), IntType()}, NoneType(), 2),
+		"server_stats": nativeFuncType("http.server_stats", nil, dictType(StrType(), IntType()), 0),
+		"env":          nativeFuncType("http.env", []Type{StrType()}, StrType(), 0),
 	}
 }
 
@@ -63,6 +64,12 @@ func httpDriverExports(types map[string]Type) map[string]Value {
 		return httpResponse(vm, args[0].Int, body, http.Header{"Content-Type": {"application/json; charset=utf-8"}})
 	})
 	exports["serve"] = driverFunc(types["serve"], nativeHTTPServe)
+	exports["server_stats"] = driverFunc(types["server_stats"], func(vm *VM, args []Value) (Value, error) {
+		if vm.engine.httpMetrics == nil {
+			return DictValue(), nil
+		}
+		return vm.engine.httpMetrics.snapshot(), nil
+	})
 	exports["env"] = driverFunc(types["env"], driverEnv)
 	return exports
 }
@@ -240,17 +247,44 @@ func httpVMHandler(engine *Engine, handler Value) http.Handler {
 	})
 }
 
-func nativeHTTPServe(vm *VM, args []Value) (Value, error) {
+func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	handler := args[1]
 	types := httpDriverTypes()
 	if handler.Kind != ValueFunction || len(handler.Function.Signature.Params) != 1 || !handler.Function.Signature.Params[0].Equal(types["Request"]) || handler.Function.Signature.Return == nil || !handler.Function.Signature.Return.Equal(types["Response"]) {
 		return NoneValue(), fmt.Errorf("handler must have signature (Request) -> Response")
 	}
+	if vm.engine.httpWorker || vm.engine.httpMetrics != nil {
+		return NoneValue(), fmt.Errorf("HTTP serve is unavailable during worker initialization or a running server")
+	}
+	workers, queue := int64(1), int64(15)
+	if len(args) > 2 {
+		workers = args[2].Int
+	}
+	if len(args) > 3 {
+		queue = args[3].Int
+	}
+	if workers < 1 || workers > 16 || queue < 0 || queue > 256 {
+		return NoneValue(), fmt.Errorf("HTTP serve requires 1 to 16 workers and a queue size from 0 to 256")
+	}
 	listener, err := net.Listen("tcp", args[0].Str)
 	if err != nil {
 		return NoneValue(), driverFailure("HTTP", connectionKind, err)
 	}
-	server := &http.Server{Handler: httpVMHandler(vm.engine, handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	pool := newHTTPWorkerPool(vm.context(), int(workers), int(queue))
+	vm.engine.httpMetrics = &pool.metrics
+	defer func() {
+		vm.engine.httpMetrics = nil
+		cleanupErr := pool.close()
+		if vm.context().Err() != nil {
+			reportCleanupError("HTTP workers", cleanupErr)
+		}
+		runErr = finalizeRun(runErr, cleanupErr)
+	}()
+	if err := pool.load(vm, handler); err != nil {
+		reportCleanupError("HTTP listener after worker startup failure", driverFailure("HTTP", connectionKind, listener.Close()))
+		return NoneValue(), err
+	}
+	server := &http.Server{Handler: pool, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	vm.engine.execMu.Unlock()

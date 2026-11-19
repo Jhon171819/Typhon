@@ -34,6 +34,8 @@ type Engine struct {
 	bridgeMu     sync.Mutex
 	warmPython   bool
 	sharedPython bool
+	httpWorker   bool
+	httpMetrics  *httpPoolMetrics
 }
 
 type LoadedModule struct {

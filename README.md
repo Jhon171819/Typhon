@@ -58,6 +58,8 @@ The Go runtime currently supports:
   parsing and bounded conversion.
 - [Payload schemas](docs/payload_validation.md) for typed validation and
   field-level diagnostics.
+- [Isolated HTTP workers](docs/http_workers.md) with a bounded queue and
+  admission metrics.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

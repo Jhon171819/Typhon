@@ -1,0 +1,12 @@
+import typhon.http as http
+
+visits: list[int] = []
+
+def handle(req: http.Request) -> http.Response:
+    if req.path == '/stats':
+        return http.json(200, http.server_stats())
+    visits.append(1)
+    return http.json(200, {'worker_visits': len(visits)})
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', handle, 4, 16)
