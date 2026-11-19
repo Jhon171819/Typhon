@@ -75,6 +75,8 @@ The Go runtime currently supports:
   codes, validation details and correlation IDs.
 - [HTTP authentication](docs/http_auth.md) verifies access tokens and
   exposes a request-scoped principal in protected routes.
+- [Tenant authorization](docs/http_authorization.md) enforces route
+  permissions and demonstrates ownership filters in PostgreSQL.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

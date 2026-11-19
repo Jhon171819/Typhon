@@ -17,6 +17,8 @@ type verifiedIdentityKey struct{}
 type verifiedRequestIdentity struct {
 	subject string
 	tenant  string
+	roles   []string
+	scopes  map[string]bool
 }
 
 func newWebRequest(req *http.Request) *webRequest {

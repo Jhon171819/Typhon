@@ -22,6 +22,8 @@ type webRoute struct {
 	pattern string
 	steps   []webStep
 	auth    webAuthenticator
+	policy  *webPolicy
+	action  string
 }
 
 type webNode struct {
@@ -69,6 +71,7 @@ func webDriverTypes() map[string]Type {
 	router.Members["use_logging"] = nativeFuncType("web.use_logging", nil, NoneType(), 0)
 	router.Members["use_errors"] = nativeFuncType("web.use_errors", nil, NoneType(), 0)
 	router.Members["require_auth"] = nativeFuncType("web.require_auth", []Type{StrType(), StrType(), authDriverTypes()["Authenticator"]}, NoneType(), 0)
+	router.Members["authorize"] = nativeFuncType("web.authorize", []Type{StrType(), StrType(), authorizationPolicyType(), StrType()}, NoneType(), 0)
 	return map[string]Type{
 		"Router":   router,
 		"Next":     next,
@@ -163,6 +166,24 @@ func webDriverExports(types map[string]Type) map[string]Value {
 					return NoneValue(), errors.New("invalid route authenticator")
 				}
 				route.auth = auth
+				return NoneValue(), nil
+			}),
+			"authorize": driverFunc(typ.Members["authorize"], func(vm *VM, args []Value) (Value, error) {
+				if router.frozen {
+					return NoneValue(), errors.New("router was already started")
+				}
+				route := router.routes[[2]string{args[0].Str, args[1].Str}]
+				if route == nil || route.auth == nil || route.policy != nil {
+					return NoneValue(), errors.New("authorization requires a registered authenticated route without a policy")
+				}
+				if err := vm.checkNativeOwner(args[2].NativeObject); err != nil {
+					return NoneValue(), err
+				}
+				policy, ok := args[2].NativeObject.data.(*webPolicy)
+				if !ok || !policy.actions[args[3].Str] {
+					return NoneValue(), errors.New("route action must be defined in the authorization policy")
+				}
+				route.policy, route.action = policy, args[3].Str
 				return NoneValue(), nil
 			}),
 		})
@@ -327,7 +348,9 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 		if stop := vm.executionError(); stop != nil {
 			return NoneValue(), stop
 		}
-		if errors.Is(err, errInvalidBearer) || err == nil && state.principal.subject != "" && state.principal != principal {
+		conflictingIdentity := state.principal.subject != "" &&
+			(state.principal.subject != principal.subject || state.principal.tenant != principal.tenant)
+		if errors.Is(err, errInvalidBearer) || err == nil && conflictingIdentity {
 			headers := http.Header{"Www-Authenticate": []string{"Bearer"}, "Cache-Control": []string{"no-store"}}
 			return r.problem(vm, state, 401, "authentication is required", headers)
 		}
@@ -338,6 +361,13 @@ func (r *webRouter) dispatch(vm *VM, request Value) (Value, error) {
 		state.principal = principal
 		request.NativeObject.Attrs["identity"] = StringValue(principal.subject)
 		request.NativeObject.Attrs["tenant"] = optionalWebString(principal.tenant, principal.tenant != "")
+		if route.policy != nil {
+			allowed := route.policy.allows(principal, route.action)
+			logWebAuthorization(state.id, route.pattern, route.action, allowed)
+			if !allowed {
+				return r.problem(vm, state, 403, "permission denied", http.Header{"Cache-Control": {"no-store"}})
+			}
+		}
 	}
 	old := state.params
 	state.params = map[string]string{}

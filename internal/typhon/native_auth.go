@@ -46,11 +46,22 @@ func authDriverTypes() map[string]Type {
 	return map[string]Type{
 		"Authenticator": auth,
 		"jwt":           nativeFuncType("auth.jwt", []Type{StrType(), StrType(), StrType(), IntType()}, auth, 1),
+		"Policy":        authorizationPolicyType(),
+		"policy":        nativeFuncType("auth.policy", []Type{dictType(StrType(), listType(StrType())), dictType(StrType(), StrType())}, authorizationPolicyType(), 1),
 	}
 }
 
 func authDriverExports(types map[string]Type) map[string]Value {
 	exports := driverTypeSymbols(types)
+	exports["policy"] = driverFunc(types["policy"], func(vm *VM, args []Value) (Value, error) {
+		policy, err := newWebPolicy(args)
+		if err != nil {
+			return NoneValue(), err
+		}
+		value := nativeObject(vm, types["Policy"], nil)
+		value.NativeObject.data = policy
+		return value, nil
+	})
 	exports["jwt"] = driverFunc(types["jwt"], func(vm *VM, args []Value) (Value, error) {
 		if vm.request != nil {
 			return NoneValue(), errors.New("configure JWT authentication during Engine initialization")
@@ -135,7 +146,9 @@ func (a *jwtAuthenticator) verify(ctx context.Context, token string) (verifiedRe
 	}
 	var claims jwt.Claims
 	var extra struct {
-		Tenant string `json:"tenant"`
+		Tenant string   `json:"tenant"`
+		Roles  []string `json:"roles"`
+		Scope  string   `json:"scope"`
 	}
 	if err := parsed.Claims(key, &claims, &extra); err != nil {
 		return empty, errInvalidBearer
@@ -146,7 +159,23 @@ func (a *jwtAuthenticator) verify(ctx context.Context, token string) (verifiedRe
 		!validAuthText(claims.Subject, 256) || extra.Tenant != "" && !validAuthText(extra.Tenant, 256) {
 		return empty, errInvalidBearer
 	}
-	return verifiedRequestIdentity{subject: claims.Subject, tenant: extra.Tenant}, nil
+	scopeNames := strings.Fields(extra.Scope)
+	if len(extra.Roles) > 64 || len(scopeNames) > 64 {
+		return empty, errInvalidBearer
+	}
+	for _, role := range extra.Roles {
+		if !validPermissionName(role) {
+			return empty, errInvalidBearer
+		}
+	}
+	scopes := make(map[string]bool, len(scopeNames))
+	for _, scope := range scopeNames {
+		if !validPermissionName(scope) {
+			return empty, errInvalidBearer
+		}
+		scopes[scope] = true
+	}
+	return verifiedRequestIdentity{subject: claims.Subject, tenant: extra.Tenant, roles: extra.Roles, scopes: scopes}, nil
 }
 
 func (a *jwtAuthenticator) key(ctx context.Context, id string) (*rsa.PublicKey, error) {
