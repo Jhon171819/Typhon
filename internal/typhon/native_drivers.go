@@ -37,6 +37,8 @@ func listType(elem Type) Type { return Type{Kind: TypeList, Name: "list", Elem: 
 func nativeDriverInfo(name string) (*ModuleInfo, bool) {
 	var exports map[string]Type
 	switch name {
+	case "json", "py.json":
+		exports = jsonDriverTypes()
 	case "typhon.http":
 		exports = httpDriverTypes()
 	case "typhon.postgres":
@@ -56,6 +58,8 @@ func nativeDriverModule(name string) (Value, bool) {
 	}
 	var exports map[string]Value
 	switch name {
+	case "json", "py.json":
+		exports = jsonDriverExports(info.Exports)
 	case "typhon.http":
 		exports = httpDriverExports(info.Exports)
 	case "typhon.postgres":
@@ -137,6 +141,10 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 		return NoneValue(), stop
 	}
 	if err != nil {
+		var stop *executionStop
+		if errors.As(err, &stop) {
+			return NoneValue(), err
+		}
 		var exception *Exception
 		if errors.As(err, &exception) {
 			return NoneValue(), fmt.Errorf("%s: %w", fn.Name, err)

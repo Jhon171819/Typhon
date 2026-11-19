@@ -589,6 +589,12 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 			return StringValue(value.Exception.Kind()), nil
 		case "message":
 			return StringValue(value.Exception.Message()), nil
+		case "offset":
+			var syntax *JSONError
+			if errors.As(value.Exception, &syntax) && syntax.Offset > 0 {
+				return IntValue(syntax.Offset), nil
+			}
+			return NoneValue(), nil
 		}
 	case ValueNativeObject:
 		if err := vm.checkNativeOwner(value.NativeObject); err != nil {

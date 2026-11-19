@@ -55,6 +55,9 @@ jobs:
       - run: go vet ./...
       - run: python -m unittest discover -s tests
       - run: go build ./...
+      - name: JSON fuzz smoke
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: go test ./internal/typhon -run '^$' -fuzz '^FuzzNativeJSON$' -fuzztime 5s -parallel 2
       - name: Race detector
         if: runner.os == 'Linux'
         env:

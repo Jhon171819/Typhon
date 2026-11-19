@@ -54,6 +54,8 @@ The Go runtime currently supports:
   application errors and failures from HTTP, PostgreSQL, and Redis.
 - [Deterministic native resource cleanup](docs/resource_cleanup.md), with
   bounded cancellation cleanup and automatic rollback of open transactions.
+- [Native JSON](docs/native_json.md) for modules and HTTP, with exact int64
+  parsing and bounded conversion.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

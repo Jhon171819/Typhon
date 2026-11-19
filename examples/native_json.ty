@@ -1,0 +1,9 @@
+import json
+
+payload: dict[str, Any] = json.loads('{"id":9007199254740993,"active":true}')
+print(json.dumps(payload))
+
+try:
+    json.loads('{"id":1,"id":2}')
+except ValidationError as err:
+    print(err.kind, err.offset)

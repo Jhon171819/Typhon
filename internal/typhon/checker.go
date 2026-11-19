@@ -684,6 +684,9 @@ func (c *checker) inferAttr(expr *AttrExpr, scope *scope, classInfo *ClassInfo) 
 	if objType.Kind == TypeException && (expr.Name == "kind" || expr.Name == "message") {
 		return StrType()
 	}
+	if objType.Kind == TypeException && expr.Name == "offset" {
+		return unionType(IntType(), NoneType())
+	}
 	if objType.Kind == TypeNative || objType.Kind == TypeModule || objType.Kind == TypeException {
 		if typ, ok := objType.Members[expr.Name]; ok {
 			return typ

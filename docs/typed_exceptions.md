@@ -32,6 +32,7 @@ fora dos `except`. Consulte os prazos e o fechamento nativo no
 construtores aceitam uma `str` posicional. Os valores expõem `kind` e `message`,
 ambos `str`, e podem passar por `Any` e por contratos que aceitem seu tipo ou
 `Error`. `raise valor` valida o tipo em tempo de execução se ele for dinâmico.
+`offset` contém a posição em bytes de um erro de entrada JSON ou `None`.
 `raise` sem argumento, dentro de um `except`, propaga o erro capturado com o
 traceback original. `raise valor` inicia um traceback naquele ponto e preserva
 a causa nativa do valor, quando houver.

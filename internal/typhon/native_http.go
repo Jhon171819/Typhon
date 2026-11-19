@@ -23,6 +23,7 @@ func httpDriverTypes() map[string]Type {
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
 		"query": nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
+		"json":  nativeFuncType("http.request.json", nil, AnyType(), 0),
 	}}
 	headers := listType(listType(StrType()))
 	client := Type{Kind: TypeNative, Name: "typhon.http.Client", Members: map[string]Type{
@@ -55,7 +56,7 @@ func httpDriverExports(types map[string]Type) map[string]Value {
 		return httpResponse(vm, args[0].Int, args[1].Str, headers)
 	})
 	exports["json"] = driverFunc(types["json"], func(vm *VM, args []Value) (Value, error) {
-		body, err := renderPythonJSON(args[1])
+		body, err := dumpJSON(vm, args[1])
 		if err != nil {
 			return NoneValue(), err
 		}
@@ -206,10 +207,12 @@ func httpVMHandler(engine *Engine, handler Value) http.Handler {
 		scope := &requestScope{}
 		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
 		typ := httpDriverTypes()["Request"]
+		bodyText := string(body)
 		request := scopedNativeObject(child, typ, map[string]Value{
-			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(string(body)),
+			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(bodyText),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
 			"query":  driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.URL.Query().Get(args[0].Str)), nil }),
+			"json":   driverFunc(typ.Members["json"], func(vm *VM, args []Value) (Value, error) { return loadJSON(vm, bodyText) }),
 		})
 		result, runErr := func() (Value, error) {
 			engine.execMu.Lock()

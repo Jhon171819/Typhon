@@ -29,7 +29,7 @@ Implementado com [`net/http`](https://pkg.go.dev/net/http).
 | `client.request(method, url, body, headers=[])` | `http.Response`; corpo `str`, headers `list[list[str]]` |
 | `client.close()` | `None`; fecha conexões ociosas e impede novas chamadas |
 | `http.response(status, body, headers=[])` | `http.Response`; status de 200 a 599 |
-| `http.json(status, value)` | `http.Response`; JSON de escalares, listas e dicionários com Content-Type apropriado |
+| `http.json(status, value)` | `http.Response`; [JSON nativo](native_json.md) com Content-Type apropriado |
 | `http.serve(address, handler)` | `None`; bloqueia até cancelamento/encerramento |
 
 O `=` nas tabelas indica o valor padrão; na chamada Typhon, passe valores
@@ -57,6 +57,7 @@ http.serve('127.0.0.1:8080', handle)
 WebSocket ou upload multipart nesta API; o corpo completo fica em memória,
 com limite de 8 MiB para requests e responses. Headers fornecidos são pares
 `[nome, valor]`; nomes inválidos e quebras de linha são rejeitados.
+`req.json()` decodifica o corpo com o mesmo codec de `json.loads`.
 
 O servidor recebe até 16 requisições em processamento/fila e retorna 503 quando
 esse limite é atingido. Cada callback tem contexto de 10 segundos, orçamento de

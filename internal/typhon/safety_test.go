@@ -275,7 +275,7 @@ func TestCyclesDoNotEscapeHost(t *testing.T) {
 	if value.String() != "[[...]]" {
 		t.Fatal(value.String())
 	}
-	if _, err := renderPythonJSON(value); err == nil {
+	if _, err := dumpJSON(nil, value); err == nil {
 		t.Fatal("circular JSON accepted")
 	}
 	b := &PythonBridge{}
