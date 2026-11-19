@@ -1,6 +1,7 @@
 package typhon
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -55,23 +56,23 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 	err = client.Ping(ctx).Err()
 	cancel()
 	if err != nil {
-		_ = client.Close()
+		reportCleanupError("Redis client after failed ping", driverFailure("Redis", databaseKind, client.Close()))
 		return NoneValue(), driverFailure("Redis", databaseKind, err)
 	}
 	var closed atomic.Bool
 	scope := vm.resourceScope()
-	close := func() error {
+	close := func(context.Context) error {
 		if closed.Swap(true) {
 			return nil
 		}
 		scope.remove(&closed)
 		return driverFailure("Redis", databaseKind, client.Close())
 	}
-	if err := scope.add(&closed, close); err != nil {
+	if err := scope.add(vm.context(), &closed, "Redis client close", close); err != nil {
 		return NoneValue(), err
 	}
 	typ := redisDriverTypes()["Connection"]
-	attrs := map[string]Value{"close": driverFunc(typ.Members["close"], func(vm *VM, args []Value) (Value, error) { return NoneValue(), close() })}
+	attrs := map[string]Value{"close": driverCloser(typ.Members["close"], close)}
 	for _, name := range []string{"ping", "get", "set", "delete", "exists", "incr", "ttl", "command"} {
 		attrs[name] = driverFunc(typ.Members[name], func(vm *VM, args []Value) (Value, error) {
 			if closed.Load() {
@@ -143,7 +144,7 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 			return NoneValue(), fmt.Errorf("unknown Redis operation")
 		})
 	}
-	return nativeObject(vm, typ, attrs), nil
+	return scopedNativeObject(vm, typ, attrs), nil
 }
 
 func redisValue(value any, depth int) (Value, error) {

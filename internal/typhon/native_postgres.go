@@ -3,6 +3,7 @@ package typhon
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -52,8 +53,7 @@ type postgresConnection struct {
 	pool    *pgxpool.Pool
 	timeout time.Duration
 	closed  atomic.Bool
-	mu      sync.Mutex
-	txs     map[*postgresTransaction]bool
+	txs     resourceScope
 }
 
 type postgresTransaction struct {
@@ -64,25 +64,17 @@ type postgresTransaction struct {
 	ended  bool
 }
 
-func (db *postgresConnection) close() error {
+func (db *postgresConnection) close(ctx context.Context) error {
 	if db.closed.Swap(true) {
 		return nil
 	}
 	db.scope.remove(db)
-	db.mu.Lock()
-	var transactions []*postgresTransaction
-	for tx := range db.txs {
-		transactions = append(transactions, tx)
-	}
-	db.mu.Unlock()
-	for _, tx := range transactions {
-		_ = tx.rollback()
-	}
+	err := db.txs.close(ctx)
 	db.pool.Close()
-	return nil
+	return err
 }
 
-func (tx *postgresTransaction) rollback() error {
+func (tx *postgresTransaction) rollback(ctx context.Context) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 	if tx.ended {
@@ -90,13 +82,9 @@ func (tx *postgresTransaction) rollback() error {
 	}
 	tx.ended = true
 	tx.scope.remove(tx)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	tx.parent.txs.remove(tx)
 	err := tx.tx.Rollback(ctx)
-	tx.parent.mu.Lock()
-	delete(tx.parent.txs, tx)
-	tx.parent.mu.Unlock()
-	if err == pgx.ErrTxClosed {
+	if errors.Is(err, pgx.ErrTxClosed) {
 		return nil
 	}
 	return driverFailure("PostgreSQL", databaseKind, err)
@@ -126,13 +114,13 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 		pool.Close()
 		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
 	}
-	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout, txs: map[*postgresTransaction]bool{}}
-	if err := db.scope.add(db, db.close); err != nil {
+	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout}
+	if err := db.scope.add(vm.context(), db, "PostgreSQL pool close", db.close); err != nil {
 		return NoneValue(), err
 	}
 	typ := postgresDriverTypes()["Connection"]
 	attrs := map[string]Value{
-		"close": driverFunc(typ.Members["close"], func(vm *VM, args []Value) (Value, error) { return NoneValue(), db.close() }),
+		"close": driverCloser(typ.Members["close"], db.close),
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
@@ -173,26 +161,21 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
 			tx := &postgresTransaction{scope: vm.resourceScope(), parent: db, tx: raw}
-			db.mu.Lock()
-			if db.closed.Load() {
-				db.mu.Unlock()
-				_ = tx.rollback()
-				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
+			if err := tx.scope.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
+				return NoneValue(), err
 			}
-			db.txs[tx] = true
-			db.mu.Unlock()
-			if err := tx.scope.add(tx, tx.rollback); err != nil {
+			if err := db.txs.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
 				return NoneValue(), err
 			}
 			return postgresTxValue(vm, tx), nil
 		}),
 	}
-	return nativeObject(vm, typ, attrs), nil
+	return scopedNativeObject(vm, typ, attrs), nil
 }
 
 func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 	typ := postgresDriverTypes()["Transaction"]
-	return nativeObject(vm, typ, map[string]Value{
+	return scopedNativeObject(vm, typ, map[string]Value{
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
@@ -237,12 +220,10 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			err := tx.tx.Commit(ctx)
 			tx.ended = true
 			tx.scope.remove(tx)
-			tx.parent.mu.Lock()
-			delete(tx.parent.txs, tx)
-			tx.parent.mu.Unlock()
+			tx.parent.txs.remove(tx)
 			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}),
-		"rollback": driverFunc(typ.Members["rollback"], func(vm *VM, args []Value) (Value, error) { return NoneValue(), tx.rollback() }),
+		"rollback": driverCloser(typ.Members["rollback"], tx.rollback),
 	})
 }
 

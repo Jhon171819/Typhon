@@ -10,12 +10,16 @@ import (
 )
 
 type VM struct {
-	resources    *resourceScope
-	ctx          context.Context
-	depth        int
-	instructions int
-	engine       *Engine
-	module       *LoadedModule
+	request       *requestScope
+	running       bool
+	cleanupCtx    context.Context
+	cleanupCancel context.CancelFunc
+	cleanupSteps  int
+	ctx           context.Context
+	depth         int
+	instructions  int
+	engine        *Engine
+	module        *LoadedModule
 }
 
 type frame struct {
@@ -55,9 +59,22 @@ func nativeValue(name string, fn func(*VM, []Value) (Value, error)) Value {
 }
 
 func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
+	if fn.Module != nil && fn.Module.Engine != vm.engine {
+		return NoneValue(), &Exception{kind: validationKind, message: "function belongs to another Engine"}
+	}
 	if vm.depth == 0 {
 		vm.engine.execMu.Lock()
 		defer vm.engine.execMu.Unlock()
+	}
+	if !vm.running {
+		vm.running = true
+		defer func() {
+			vm.running = false
+			if vm.cleanupCancel != nil {
+				vm.cleanupCancel()
+				vm.cleanupCtx, vm.cleanupCancel = nil, nil
+			}
+		}()
 	}
 	vm.depth++
 	defer func() { vm.depth-- }()
@@ -92,13 +109,18 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 		if stop := vm.executionError(); stop != nil {
 			var stopped *executionStop
 			if !errors.As(err, &stopped) {
+				if errors.As(exit.err, &stopped) && stopped.cancelled {
+					reportCleanupError("finally", stop)
+					return NoneValue(), exit.err
+				}
+				reportCleanupError("error pending before execution stopped", exit.err)
 				err = stop
 			}
 		}
 		if err != nil {
 			exit = completion{target: -1, err: traceFrame(fn, f.line, err)}
 		}
-		if f.unwind(exit) {
+		if vm.unwind(f, &exit) {
 			continue
 		}
 		if exit.err != nil {
@@ -121,8 +143,15 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		if err := vm.executionError(); err != nil {
 			return completion{}, err
 		}
-		vm.instructions++
-		if vm.instructions > 10_000_000 {
+		if vm.cleanupCtx != nil {
+			if vm.cleanupSteps <= 0 {
+				return completion{}, &executionStop{cause: errors.New("cancellation finally instruction budget exceeded")}
+			}
+			vm.cleanupSteps--
+		} else {
+			vm.instructions++
+		}
+		if vm.cleanupCtx == nil && vm.instructions > 10_000_000 {
 			return completion{}, &executionStop{cause: errors.New("instruction budget exceeded")}
 		}
 		instr := fn.Code[f.pc]
@@ -134,7 +163,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		case OpLeave:
 			return completion{target: instr.A, depth: instr.Depth}, nil
 		case OpEndFinally:
-			return f.regions[len(f.regions)-1].pending, nil
+			pending := f.regions[len(f.regions)-1].pending
+			f.popRegion()
+			return pending, nil
 		case OpRaise:
 			value := f.pop()
 			if value.Kind != ValueException || value.Exception == nil {
@@ -381,6 +412,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 			class := runtimeClass(instr.Class, f.module)
 			f.module.Globals[instr.Class.Name] = Value{Kind: ValueClass, Class: class}
 		case OpImportModule:
+			if vm.cleanupCtx != nil {
+				return completion{}, errCancellationIO
+			}
 			if module, ok := nativePythonModule(instr.S); ok {
 				f.module.Globals[instr.Names[0]] = module
 				continue
@@ -395,6 +429,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 			}
 			f.module.Globals[instr.Names[0]] = module
 		case OpImportFrom:
+			if vm.cleanupCtx != nil {
+				return completion{}, errCancellationIO
+			}
 			if module, ok := nativePythonModule(instr.S); ok {
 				for _, name := range instr.Names {
 					value, ok := module.Module.Exports[name]
@@ -495,6 +532,9 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 		}
 		return vm.runFunction(callee.Function, args)
 	case ValueNative:
+		if vm.cleanupCtx != nil && callee.Native.Name == "python.release" {
+			return NoneValue(), errCancellationIO
+		}
 		if len(kwargs) > 0 {
 			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Native.Name)
 		}
@@ -520,6 +560,9 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 		methodArgs := append([]Value{callee.Bound.Receiver}, args...)
 		return vm.runFunction(callee.Bound.Function, methodArgs)
 	case ValuePyObject:
+		if vm.cleanupCtx != nil {
+			return NoneValue(), errCancellationIO
+		}
 		return callee.PyObject.Bridge.Call(callee.PyObject, args, kwargs)
 	default:
 		return NoneValue(), fmt.Errorf("%s is not callable", callee.String())
@@ -548,8 +591,8 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 			return StringValue(value.Exception.Message()), nil
 		}
 	case ValueNativeObject:
-		if value.NativeObject.Owner != nil && value.NativeObject.Owner != vm.engine {
-			return NoneValue(), fmt.Errorf("native object belongs to another Engine")
+		if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+			return NoneValue(), err
 		}
 		if attr, ok := value.NativeObject.Attrs[name]; ok {
 			return attr, nil
@@ -589,6 +632,9 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 		}
 		return NoneValue(), fmt.Errorf("module %q has no attribute %q", value.Module.Name, name)
 	case ValuePyObject:
+		if vm.cleanupCtx != nil {
+			return NoneValue(), errCancellationIO
+		}
 		return value.PyObject.Bridge.GetAttr(value.PyObject, name)
 	}
 	return NoneValue(), fmt.Errorf("%s has no attribute %q", value.String(), name)
@@ -628,23 +674,37 @@ func nativePrint(vm *VM, args []Value) (Value, error) {
 }
 
 func nativeSpawn(vm *VM, args []Value) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
 	if len(args) == 0 {
 		return NoneValue(), fmt.Errorf("spawn expected a function")
 	}
-	if len(vm.engine.tasks) >= 256 {
+	if len(vm.engine.tasks)+vm.engine.requestTasks >= 256 {
 		return NoneValue(), fmt.Errorf("task quota exceeded")
+	}
+	if err := vm.executionError(); err != nil {
+		return NoneValue(), err
+	}
+	if !vm.engine.beginExecution() {
+		return NoneValue(), vm.executionError()
 	}
 	callee := args[0]
 	module := vm.module
 	callArgs := append([]Value(nil), args[1:]...)
 	ctx, cancel := context.WithCancel(vm.context())
-	task := &Task{done: make(chan struct{}), cancel: cancel}
-	vm.engine.tasks = append(vm.engine.tasks, task)
+	task := &Task{done: make(chan struct{}), cancel: cancel, engine: vm.engine, request: vm.request}
+	tasks := vm.taskList()
+	*tasks = append(*tasks, task)
+	if vm.request != nil {
+		vm.engine.requestTasks++
+	}
 	go func() {
+		defer vm.engine.active.Done()
 		defer cancel()
 		vm.engine.execMu.Lock()
 		defer vm.engine.execMu.Unlock()
-		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, resources: vm.resources}
+		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, request: vm.request}
 		value, err := child.callValue(callee, callArgs, nil)
 		task.result = taskResult{value: value, err: err}
 		close(task.done)
@@ -653,8 +713,15 @@ func nativeSpawn(vm *VM, args []Value) (Value, error) {
 }
 
 func nativeJoin(vm *VM, args []Value) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
 	if len(args) < 1 || len(args) > 2 || args[0].Kind != ValueTask || args[0].Task == nil {
 		return NoneValue(), fmt.Errorf("join expected a task")
+	}
+	task := args[0].Task
+	if task.engine != vm.engine || task.request != vm.request {
+		return NoneValue(), &Exception{kind: validationKind, message: "task belongs to another execution scope"}
 	}
 	timeout := 30 * time.Second
 	if len(args) == 2 {
@@ -672,11 +739,11 @@ func nativeJoin(vm *VM, args []Value) (Value, error) {
 	vm.engine.execMu.Unlock()
 	var waitErr error
 	select {
-	case <-args[0].Task.done:
+	case <-task.done:
 	case <-vm.context().Done():
 		waitErr = vm.executionError()
 	case <-timer.C:
-		waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled)}
+		waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled), cancelled: true}
 		vm.engine.cancel()
 		vm.engine.bridgeMu.Lock()
 		bridge := vm.engine.bridge
@@ -689,12 +756,15 @@ func nativeJoin(vm *VM, args []Value) (Value, error) {
 	if waitErr != nil {
 		return NoneValue(), waitErr
 	}
-	args[0].Task.observed = true
-	result := args[0].Task.result
+	task.observed = true
+	result := task.result
 	return result.value, result.err
 }
 
 func (vm *VM) context() context.Context {
+	if vm.cleanupCtx != nil {
+		return vm.cleanupCtx
+	}
 	if vm.ctx != nil {
 		return vm.ctx
 	}
@@ -706,6 +776,9 @@ func nativeCancel(vm *VM, args []Value) (Value, error) {
 		return NoneValue(), fmt.Errorf("cancel expected a task")
 	}
 	task := args[0].Task
+	if task.engine != vm.engine || task.request != vm.request {
+		return NoneValue(), &Exception{kind: validationKind, message: "task belongs to another execution scope"}
+	}
 	task.cancelled = true
 	if task.cancel != nil {
 		task.cancel()

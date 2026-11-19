@@ -56,13 +56,16 @@ type NativeFunc struct {
 	Name      string
 	Receiver  *Value
 	Fn        func(*VM, []Value) (Value, error)
+	owner     *NativeObject
+	cleanup   bool
 }
 
 type NativeObject struct {
-	data  any
-	Type  Type
-	Owner *Engine
-	Attrs map[string]Value
+	data    any
+	Type    Type
+	Owner   *Engine
+	Attrs   map[string]Value
+	request *requestScope
 }
 
 type NativeModule struct {
@@ -92,6 +95,8 @@ type Task struct {
 	observed  bool
 	done      chan struct{}
 	result    taskResult
+	request   *requestScope
+	engine    *Engine
 }
 
 type listGuard struct{ elem *Type }

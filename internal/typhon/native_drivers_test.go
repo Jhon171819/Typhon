@@ -522,3 +522,96 @@ def handle(req: Request) -> Response:
 		t.Fatal("pool exhausted after handler errors:", err)
 	}
 }
+
+func TestNativePostgresResourceCleanupIntegration(t *testing.T) {
+	dsn := os.Getenv("TYPHON_TEST_POSTGRES_URL")
+	if dsn == "" {
+		t.Skip("set TYPHON_TEST_POSTGRES_URL for a dedicated test PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(driverFailure("PostgreSQL", connectionKind, err))
+	}
+	table := pgx.Identifier{fmt.Sprintf("typhon_cleanup_%d", time.Now().UnixNano())}.Sanitize()
+	t.Cleanup(func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer stop()
+		if _, err := admin.Exec(cleanupCtx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Error(driverFailure("PostgreSQL", databaseKind, err))
+		}
+		if err := admin.Close(cleanupCtx); err != nil {
+			t.Error(driverFailure("PostgreSQL", connectionKind, err))
+		}
+	})
+	if _, err := admin.Exec(ctx, "CREATE TABLE "+table+" (id int)"); err != nil {
+		t.Fatal(driverFailure("PostgreSQL", databaseKind, err))
+	}
+	cancelRequest := make(chan context.CancelFunc, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cancel" {
+			(<-cancelRequest)()
+		}
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	engine := NewEngine()
+	defer engine.Close()
+	module, err := engine.LoadModule(sourceFile(t, fmt.Sprintf(`import typhon.http as http
+import typhon.postgres as pg
+db: pg.Connection = pg.connect(%q, 2)
+upstream: http.Client = http.client(0.08)
+def handle(req: http.Request) -> http.Response:
+    tx: pg.Transaction = db.begin()
+    tx.exec(%q, [123])
+    if req.path == '/caught':
+        try:
+            raise ValidationError('caught')
+        except ValidationError:
+            return http.response(202, 'caught')
+    if req.path == '/error':
+        raise ValidationError('uncaught')
+    if req.path == '/timeout' or req.path == '/cancel':
+        try:
+            upstream.get(%q + req.path)
+        except TimeoutError:
+            return http.response(504, 'timeout')
+    return http.response(200, 'abandoned')
+`, dsn, "INSERT INTO "+table+" (id) VALUES ($1)", upstream.URL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ExecuteModule(module, false); err != nil {
+		t.Fatal(err)
+	}
+	handler := httpVMHandler(engine, module.Globals["handle"])
+	for i := range 30 {
+		path := "/"
+		expected := 200
+		switch i % 5 {
+		case 1:
+			path, expected = "/caught", 202
+		case 2:
+			path, expected = "/error", 500
+		case 3:
+			path, expected = "/timeout", 504
+		case 4:
+			path, expected = "/cancel", 500
+		}
+		requestCtx, stop := context.WithCancel(ctx)
+		if path == "/cancel" {
+			cancelRequest <- stop
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil).WithContext(requestCtx))
+		stop()
+		if recorder.Code != expected {
+			t.Fatalf("request %d (%s): got %d, expected %d", i, path, recorder.Code, expected)
+		}
+	}
+	var count int
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("abandoned transactions left %d rows: %v", count, driverFailure("PostgreSQL", databaseKind, err))
+	}
+}

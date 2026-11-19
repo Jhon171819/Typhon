@@ -120,14 +120,14 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 	client := &http.Client{Transport: transport, Timeout: timeout}
 	var closed atomic.Bool
 	scope := vm.resourceScope()
-	close := func() error {
+	close := func(context.Context) error {
 		if !closed.Swap(true) {
 			scope.remove(&closed)
 			transport.CloseIdleConnections()
 		}
 		return nil
 	}
-	if err := scope.add(&closed, close); err != nil {
+	if err := scope.add(vm.context(), &closed, "HTTP client close", close); err != nil {
 		return NoneValue(), err
 	}
 	typ := httpDriverTypes()["Client"]
@@ -157,19 +157,23 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		if err != nil {
 			return NoneValue(), driverFailure("HTTP", connectionKind, err)
 		}
-		defer resp.Body.Close()
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody+1))
+		closeErr := driverFailure("HTTP", connectionKind, resp.Body.Close())
 		if err != nil {
+			reportCleanupError("HTTP response body close", closeErr)
 			return NoneValue(), driverFailure("HTTP", connectionKind, err)
+		}
+		if closeErr != nil {
+			return NoneValue(), closeErr
 		}
 		return httpResponse(vm, int64(resp.StatusCode), string(body), resp.Header)
 	}
-	return nativeObject(vm, typ, map[string]Value{
+	return scopedNativeObject(vm, typ, map[string]Value{
 		"request": driverFunc(typ.Members["request"], request),
 		"get": driverFunc(typ.Members["get"], func(vm *VM, args []Value) (Value, error) {
 			return request(vm, []Value{StringValue("GET"), args[0], StringValue("")})
 		}),
-		"close": driverFunc(typ.Members["close"], func(vm *VM, args []Value) (Value, error) { return NoneValue(), close() }),
+		"close": driverCloser(typ.Members["close"], close),
 	}), nil
 }
 
@@ -190,23 +194,30 @@ func httpVMHandler(engine *Engine, handler Value) http.Handler {
 			http.Error(writer, "request body is too large or unreadable", http.StatusRequestEntityTooLarge)
 			return
 		}
+		if !engine.beginExecution() {
+			http.Error(writer, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		defer engine.active.Done()
 		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
 		defer cancel()
 		stop := context.AfterFunc(engine.ctx, cancel)
 		defer stop()
-		scope := &resourceScope{}
-		child := &VM{engine: engine, ctx: ctx, resources: scope}
+		scope := &requestScope{}
+		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
 		typ := httpDriverTypes()["Request"]
-		request := nativeObject(child, typ, map[string]Value{
+		request := scopedNativeObject(child, typ, map[string]Value{
 			"method": StringValue(req.Method), "path": StringValue(req.URL.Path), "body": StringValue(string(body)),
 			"header": driverFunc(typ.Members["header"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.Header.Get(args[0].Str)), nil }),
 			"query":  driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) { return StringValue(req.URL.Query().Get(args[0].Str)), nil }),
 		})
-		result, runErr := child.runFunction(handler.Function, []Value{request})
-		cleanupErr := scope.close()
-		if runErr == nil {
-			runErr = cleanupErr
-		}
+		result, runErr := func() (Value, error) {
+			engine.execMu.Lock()
+			defer engine.execMu.Unlock()
+			defer cancel()
+			return child.runFunction(handler.Function, []Value{request})
+		}()
+		runErr = finalizeRun(runErr, scope.finish(engine))
 		if runErr != nil {
 			log.Printf("Typhon HTTP handler: %v", runErr)
 			http.Error(writer, "internal server error", http.StatusInternalServerError)
@@ -237,22 +248,22 @@ func nativeHTTPServe(vm *VM, args []Value) (Value, error) {
 		return NoneValue(), driverFailure("HTTP", connectionKind, err)
 	}
 	server := &http.Server{Handler: httpVMHandler(vm.engine, handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
-	scope := vm.resourceScope()
-	if err := scope.add(server, func() error { return driverFailure("HTTP", connectionKind, server.Close()) }); err != nil {
-		_ = listener.Close()
-		return NoneValue(), err
-	}
-	defer scope.remove(server)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	vm.engine.execMu.Unlock()
 	select {
 	case err = <-done:
+		if !errors.Is(err, http.ErrServerClosed) {
+			reportCleanupError("HTTP server close", driverFailure("HTTP", connectionKind, server.Close()))
+		}
 	case <-vm.context().Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = server.Shutdown(shutdown)
+		shutdownErr := server.Shutdown(shutdown)
 		cancel()
-		_ = server.Close()
+		if shutdownErr != nil {
+			reportCleanupError("HTTP server shutdown", driverFailure("HTTP", connectionKind, shutdownErr))
+			reportCleanupError("HTTP server close", driverFailure("HTTP", connectionKind, server.Close()))
+		}
 		err = <-done
 	}
 	vm.engine.execMu.Lock()

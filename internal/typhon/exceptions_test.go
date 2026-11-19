@@ -249,7 +249,7 @@ finally:
 	}
 	err = engine.ExecuteModule(module, true)
 	var exception *Exception
-	if !errors.Is(err, context.Canceled) || errors.As(err, &exception) || module.Globals["state"].Str != "started" {
+	if !errors.Is(err, context.Canceled) || errors.As(err, &exception) || module.Globals["state"].Str != "cleanup" {
 		t.Fatalf("cancellation was intercepted: %v, state %v", err, module.Globals["state"])
 	}
 }
@@ -280,7 +280,7 @@ finally:
 	if !errors.As(err, &stop) || !strings.Contains(err.Error(), "call depth limit") || module.Globals["state"].Str != "started" {
 		t.Fatalf("call depth limit was intercepted: %v", err)
 	}
-	vm := &VM{engine: engine, module: module, instructions: 9_999_997}
+	vm := &VM{engine: engine, module: module, instructions: 9_999_996}
 	_, err = vm.runFunction(module.Program.Module, nil)
 	if !errors.As(err, &stop) || !strings.Contains(err.Error(), "instruction budget") || module.Globals["state"].Str != "started" {
 		t.Fatalf("instruction budget was intercepted: %v", err)

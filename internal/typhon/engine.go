@@ -11,12 +11,18 @@ import (
 )
 
 type Engine struct {
-	resources resourceScope
+	resources   resourceScope
+	lifecycleMu sync.Mutex
+	closing     bool
+	active      sync.WaitGroup
+	closeOnce   sync.Once
+	closeErr    error
 	// VM execution is serialized. join yields this lock while its child runs.
 	execMu       sync.Mutex
 	moduleMu     sync.Mutex
 	loading      map[string]bool
 	tasks        []*Task
+	requestTasks int // guarded by execMu
 	ctx          context.Context
 	cancel       context.CancelFunc
 	modules      map[string]*LoadedModule
@@ -62,7 +68,7 @@ func RunFile(path string) error {
 	})
 }
 
-func RunFileWithOptions(path string, options RunOptions) error {
+func RunFileWithOptions(path string, options RunOptions) (runErr error) {
 	ctx := options.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -70,7 +76,14 @@ func RunFileWithOptions(path string, options RunOptions) error {
 	engine := NewEngineWithContext(ctx)
 	engine.warmPython = options.WarmPython
 	engine.sharedPython = options.SharedPython
-	defer engine.Close()
+	defer func() {
+		cleanupErr := engine.Close()
+		if ctx.Err() != nil && errors.Is(runErr, context.Canceled) {
+			// The CLI treats cancellation as graceful shutdown.
+			reportCleanupError("Engine shutdown", cleanupErr)
+		}
+		runErr = finalizeRun(runErr, cleanupErr)
+	}()
 	module, err := engine.LoadModule(path)
 	if err != nil {
 		return err
@@ -193,6 +206,10 @@ func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, erro
 }
 
 func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule, error) {
+	if !e.beginExecution() {
+		return nil, e.ctx.Err()
+	}
+	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
 	return e.loadModuleByNameLocked(module, fromDir)
@@ -326,9 +343,35 @@ func (e *Engine) WarmPythonBridge() error {
 	return bridge.Ping()
 }
 
+func (e *Engine) beginExecution() bool {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	if e.closing {
+		return false
+	}
+	e.active.Add(1)
+	return true
+}
+
 func (e *Engine) Close() error {
-	e.cancel()
-	resourceErr := e.resources.close()
+	e.closeOnce.Do(func() {
+		e.lifecycleMu.Lock()
+		e.closing = true
+		e.cancel()
+		e.lifecycleMu.Unlock()
+
+		// Closing the bridge first interrupts any in-flight Python transport.
+		// Cancellation finally blocks can still close native handles.
+		bridgeErr := e.closeBridge()
+		e.active.Wait()
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		e.closeErr = errors.Join(e.resources.close(ctx), bridgeErr)
+	})
+	return e.closeErr
+}
+
+func (e *Engine) closeBridge() error {
 	e.bridgeMu.Lock()
 	done := e.bridgeDone
 	e.bridgeMu.Unlock()
@@ -339,15 +382,19 @@ func (e *Engine) Close() error {
 	bridge := e.bridge
 	e.bridgeMu.Unlock()
 	if bridge == nil {
-		return resourceErr
+		return nil
 	}
-	if err := bridge.Close(); err != nil {
-		return err
-	}
-	return resourceErr
+	return bridge.Close()
 }
 
 func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
+	if module.Engine != e {
+		return errors.New("module belongs to another Engine")
+	}
+	if !e.beginExecution() {
+		return e.ctx.Err()
+	}
+	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
 	err := e.executeModuleLocked(module, main)

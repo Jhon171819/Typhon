@@ -1,6 +1,7 @@
 package typhon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -48,15 +49,18 @@ func exceptionConstructor(kind string) Value {
 	})
 }
 
-// executionStop bypasses Typhon handlers and finally blocks.
-type executionStop struct{ cause error }
+// Cancellation can enter finally blocks. Hard VM limits end bytecode execution.
+type executionStop struct {
+	cause     error
+	cancelled bool
+}
 
 func (e *executionStop) Error() string { return e.cause.Error() }
 func (e *executionStop) Unwrap() error { return e.cause }
 
 func (vm *VM) executionError() error {
 	if err := vm.context().Err(); err != nil {
-		return &executionStop{cause: err}
+		return &executionStop{cause: err, cancelled: vm.cleanupCtx == nil}
 	}
 	return nil
 }
@@ -83,19 +87,32 @@ type activeRegion struct {
 	inFinally bool
 }
 
-func (f *frame) unwind(exit completion) bool {
-	var exception *Exception
-	if exit.err != nil {
-		var stop *executionStop
-		if errors.As(exit.err, &stop) {
-			return false
-		}
-		errors.As(exit.err, &exception)
-	}
+var errCancellationIO = errors.New("cancellation finally permits native close and rollback, but not new I/O or tasks")
+
+func (vm *VM) unwind(f *frame, exit *completion) bool {
 	for len(f.regions) > exit.depth {
 		top := &f.regions[len(f.regions)-1]
 		clear(f.stack[top.height:])
 		f.stack = f.stack[:top.height]
+		var stop *executionStop
+		errors.As(exit.err, &stop)
+		hardStop := stop != nil && !stop.cancelled
+		if top.inFinally && top.pending.err != nil {
+			var pendingStop *executionStop
+			errors.As(top.pending.err, &pendingStop)
+			switch {
+			case pendingStop != nil || (exit.err != nil && stop == nil):
+				reportCleanupError("finally", exit.err)
+				*exit = top.pending
+				stop = pendingStop
+			case stop != nil:
+				reportCleanupError("error pending before execution stopped", top.pending.err)
+			}
+		}
+		var exception *Exception
+		if stop == nil {
+			errors.As(exit.err, &exception)
+		}
 		// The current PC is just past the opcode that initiated the unwind.
 		if exception != nil && f.pc <= top.spec.bodyEnd {
 			for _, handler := range top.spec.handlers {
@@ -114,19 +131,34 @@ func (f *frame) unwind(exit completion) bool {
 			top.slot = -1
 		}
 		top.caught = nil
-		if top.spec.cleanup >= 0 && !top.inFinally {
-			top.inFinally, top.pending = true, exit
+		if hardStop && vm.cleanupCtx != nil {
+			vm.cleanupSteps = 0
+		}
+		if top.spec.cleanup >= 0 && !top.inFinally && !hardStop {
+			if stop != nil && vm.cleanupCtx == nil {
+				vm.cleanupCtx, vm.cleanupCancel = context.WithTimeout(context.WithoutCancel(vm.context()), cleanupTimeout)
+				vm.cleanupSteps = 10_000
+			}
+			if vm.cleanupCtx != nil && (vm.cleanupSteps == 0 || vm.cleanupCtx.Err() != nil) {
+				f.popRegion()
+				continue
+			}
+			top.inFinally, top.pending = true, *exit
 			f.pc = top.spec.cleanup
 			return true
 		}
-		*top = activeRegion{}
-		f.regions = f.regions[:len(f.regions)-1]
+		f.popRegion()
 	}
 	if exit.target < 0 {
 		return false
 	}
 	f.pc = exit.target
 	return true
+}
+
+func (f *frame) popRegion() {
+	f.regions[len(f.regions)-1] = activeRegion{}
+	f.regions = f.regions[:len(f.regions)-1]
 }
 
 func (f *frame) reraise() error {

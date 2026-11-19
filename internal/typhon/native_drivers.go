@@ -8,7 +8,6 @@ import (
 	"math"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,6 +20,16 @@ func nativeFuncType(name string, params []Type, result Type, optional int) Type 
 
 func driverFunc(typ Type, fn func(*VM, []Value) (Value, error)) Value {
 	return Value{Kind: ValueNative, Native: &NativeFunc{Name: typ.Name, Signature: typ, Fn: fn}}
+}
+
+func driverCloser(typ Type, close func(context.Context) error) Value {
+	value := driverFunc(typ, func(vm *VM, args []Value) (Value, error) {
+		ctx, cancel := context.WithTimeout(vm.context(), cleanupTimeout)
+		defer cancel()
+		return NoneValue(), close(ctx)
+	})
+	value.Native.cleanup = true
+	return value
 }
 
 func listType(elem Type) Type { return Type{Kind: TypeList, Name: "list", Elem: typePtr(elem)} }
@@ -58,7 +67,32 @@ func nativeDriverModule(name string) (Value, bool) {
 }
 
 func nativeObject(vm *VM, typ Type, attrs map[string]Value) Value {
-	return Value{Kind: ValueNativeObject, NativeObject: &NativeObject{Type: typ, Owner: vm.engine, Attrs: attrs}}
+	object := &NativeObject{Type: typ, Owner: vm.engine, Attrs: attrs}
+	for _, attr := range attrs {
+		if attr.Kind == ValueNative {
+			attr.Native.owner = object
+		}
+	}
+	return Value{Kind: ValueNativeObject, NativeObject: object}
+}
+
+func scopedNativeObject(vm *VM, typ Type, attrs map[string]Value) Value {
+	value := nativeObject(vm, typ, attrs)
+	value.NativeObject.request = vm.request
+	return value
+}
+
+func (vm *VM) checkNativeOwner(obj *NativeObject) error {
+	if obj == nil {
+		return nil
+	}
+	if obj.Owner != nil && obj.Owner != vm.engine {
+		return &Exception{kind: validationKind, message: "native object belongs to another Engine"}
+	}
+	if obj.request != nil && obj.request != vm.request {
+		return &Exception{kind: validationKind, message: "native object belongs to another request"}
+	}
+	return nil
 }
 
 func driverTypeSymbols(types map[string]Type) map[string]Value {
@@ -72,14 +106,22 @@ func driverTypeSymbols(types map[string]Type) map[string]Value {
 }
 
 func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
+	if err := vm.checkNativeOwner(fn.owner); err != nil {
+		return NoneValue(), err
+	}
+	if vm.cleanupCtx != nil && !fn.cleanup {
+		return NoneValue(), errCancellationIO
+	}
 	typ := fn.Signature
 	if len(args) < len(typ.Params)-typ.Optional || len(args) > len(typ.Params) {
 		return NoneValue(), &Exception{kind: validationKind, message: fmt.Sprintf("%s expected %d to %d arguments, got %d", fn.Name, len(typ.Params)-typ.Optional, len(typ.Params), len(args))}
 	}
 	converted := make([]Value, len(args))
 	for i, arg := range args {
-		if arg.Kind == ValueNativeObject && arg.NativeObject.Owner != nil && arg.NativeObject.Owner != vm.engine {
-			return NoneValue(), fmt.Errorf("native object belongs to another Engine")
+		if arg.Kind == ValueNativeObject {
+			if err := vm.checkNativeOwner(arg.NativeObject); err != nil {
+				return NoneValue(), err
+			}
 		}
 		value, err := validateValue(arg, typ.Params[i])
 		if err != nil {
@@ -89,6 +131,9 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 	}
 	value, err := fn.Fn(vm, converted)
 	if stop := vm.executionError(); stop != nil {
+		if fn.cleanup && err != nil {
+			reportCleanupError(fn.Name, err)
+		}
 		return NoneValue(), stop
 	}
 	if err != nil {
@@ -189,62 +234,6 @@ func driverTimeout(args []Value, index int) (time.Duration, error) {
 
 func driverContext(vm *VM, timeout time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(vm.context(), timeout)
-}
-
-// Resources are owned by the Engine. Explicit close removes the registration.
-// HTTP callbacks use a separate scope so an abandoned transaction rolls back
-// after the request, rather than retaining a pool connection until shutdown.
-type resourceScope struct {
-	mu      sync.Mutex
-	closed  bool
-	closers map[any]func() error
-}
-
-func (scope *resourceScope) add(key any, close func() error) error {
-	scope.mu.Lock()
-	if scope.closed {
-		scope.mu.Unlock()
-		_ = close()
-		return fmt.Errorf("native resource scope is closed")
-	}
-	if scope.closers == nil {
-		scope.closers = map[any]func() error{}
-	}
-	scope.closers[key] = close
-	scope.mu.Unlock()
-	return nil
-}
-
-func (scope *resourceScope) remove(key any) {
-	scope.mu.Lock()
-	defer scope.mu.Unlock()
-	delete(scope.closers, key)
-}
-
-func (scope *resourceScope) close() error {
-	scope.mu.Lock()
-	if scope.closed {
-		scope.mu.Unlock()
-		return nil
-	}
-	scope.closed = true
-	closers := scope.closers
-	scope.closers = nil
-	scope.mu.Unlock()
-	var first error
-	for _, close := range closers {
-		if err := close(); err != nil && first == nil {
-			first = err
-		}
-	}
-	return first
-}
-
-func (vm *VM) resourceScope() *resourceScope {
-	if vm.resources != nil {
-		return vm.resources
-	}
-	return &vm.engine.resources
 }
 
 func driverEnv(vm *VM, args []Value) (Value, error) {
