@@ -1,0 +1,23 @@
+import typhon.http as http
+import typhon.redis as redis
+import typhon.web as web
+import job_schema as job
+
+cache: redis.Connection = redis.connect(redis.env('REDIS_URL'))
+jobs: redis.Stream = cache.stream(redis.env('REPORT_STREAM'), 'reports')
+jobs.create_group()
+routes: web.Router = web.router()
+routes.use_errors()
+
+def enqueue(req: http.Request) -> http.Response:
+    value: Any = req.json()
+    problem: http.Response | None = web.validate(req, job.schema, value)
+    if problem is not None:
+        return problem
+    entry: str = jobs.publish(value)
+    return http.json(202, {'entry': entry})
+
+routes.add('POST', '/reports', enqueue)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

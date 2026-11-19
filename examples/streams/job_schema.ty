@@ -1,0 +1,8 @@
+import typhon.validation as v
+
+schema: v.Schema = v.object({
+    'version': v.integer(1, 1),
+    'kind': v.enumeration(['report']),
+    'job_id': v.text(1, 80),
+    'title': v.text(1, 100)
+})

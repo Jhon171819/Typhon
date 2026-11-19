@@ -40,12 +40,17 @@ func redisDriverTypes() map[string]Type {
 	connection.Members["cache"] = nativeFuncType("redis.cache", []Type{StrType(), IntType(), FloatType()}, cache, 1)
 	lock := redisLockType()
 	connection.Members["lock"] = nativeFuncType("redis.lock", []Type{StrType(), FloatType()}, unionType(lock, NoneType()), 0)
+	stream, delivery, claim := redisStreamTypes()
+	connection.Members["stream"] = nativeFuncType("redis.stream", []Type{StrType(), StrType(), IntType()}, stream, 1)
 	return map[string]Type{
 		"Connection":        connection,
 		"Result":            result,
 		"Cache":             cache,
 		"CacheEntry":        entry,
 		"Lock":              lock,
+		"Stream":            stream,
+		"Delivery":          delivery,
+		"Claim":             claim,
 		"connect":           nativeFuncType("redis.connect", []Type{StrType(), FloatType()}, connection, 1),
 		"connect_with_pool": nativeFuncType("redis.connect_with_pool", []Type{StrType(), IntType(), IntType(), FloatType(), FloatType(), FloatType(), BoolType()}, connection, 4),
 		"env":               nativeFuncType("redis.env", []Type{StrType()}, StrType(), 0),
@@ -84,8 +89,9 @@ type redisConnection struct {
 	closed    atomic.Bool
 	timeout   time.Duration
 	// Only the owner Engine executes commands or reads these counters.
-	commands, latencyNS, timeouts, networkErrors            int64
-	cacheHits, cacheMisses, cacheErrors, cacheInvalidations int64
+	commands, latencyNS, timeouts, networkErrors                                 int64
+	cacheHits, cacheMisses, cacheErrors, cacheInvalidations                      int64
+	streamProcessed, streamProcessingNS, streamDeadLetters, streamTrimmedPending int64
 }
 
 func (db *redisConnection) start(ctx context.Context, timeout time.Duration) (context.Context, func(error)) {
@@ -135,6 +141,8 @@ func (db *redisConnection) stats() Value {
 		{"operations", db.commands}, {"latency_ns", db.latencyNS}, {"timeouts", db.timeouts}, {"network_errors", db.networkErrors},
 		{"cache_hits", db.cacheHits}, {"cache_misses", db.cacheMisses},
 		{"cache_errors", db.cacheErrors}, {"cache_invalidations", db.cacheInvalidations},
+		{"stream_processed", db.streamProcessed}, {"stream_processing_ns", db.streamProcessingNS},
+		{"stream_dead_letters", db.streamDeadLetters}, {"stream_trimmed_pending", db.streamTrimmedPending},
 		{"total_connections", int64(pool.TotalConns)}, {"idle_connections", int64(pool.IdleConns)},
 		{"in_use_connections", max(0, int64(pool.TotalConns)-int64(pool.IdleConns))},
 	} {
@@ -210,6 +218,7 @@ func connectRedis(vm *VM, dsn string, poolSize, minIdle int, dialTimeout, read, 
 	})
 	attrs["cache"] = driverFunc(typ.Members["cache"], db.newCache)
 	attrs["lock"] = driverFunc(typ.Members["lock"], db.acquireLock)
+	attrs["stream"] = driverFunc(typ.Members["stream"], db.newStream)
 	for _, name := range []string{"ping", "get", "set", "delete", "exists", "incr", "ttl", "command", "pipeline", "mget", "mset", "hget", "hset"} {
 		attrs[name] = driverFunc(typ.Members[name], func(vm *VM, args []Value) (_ Value, runErr error) {
 			if db.closed.Load() {

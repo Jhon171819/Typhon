@@ -109,6 +109,8 @@ The Go runtime currently supports:
   post-commit invalidation for authorized requests.
 - [Idempotent HTTP writes and Redis locks](docs/idempotency.md) coordinate
   retries and show a durable PostgreSQL constraint for critical writes.
+- [Redis Streams workers](docs/redis_streams.md) use consumer groups, bounded
+  reads, retries, dead letters and a durable deduplication example.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

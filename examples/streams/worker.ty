@@ -1,0 +1,56 @@
+import typhon.postgres as pg
+import typhon.redis as redis
+import typhon.validation as v
+import job_schema as job
+
+cache: redis.Connection = redis.connect(redis.env('REDIS_URL'))
+jobs: redis.Stream = cache.stream(redis.env('REPORT_STREAM'), 'reports')
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+jobs.create_group()
+
+def persist(item: dict[str, Any]) -> int:
+    return db.exec(
+        'INSERT INTO report_results (job_id, title) VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING',
+        [item['job_id'], item['title']]
+    )
+
+def reject(delivery: redis.Delivery, reason: str) -> None:
+    if not delivery.dead_letter(reason):
+        print('delivery ownership changed', delivery.id)
+
+def process(delivery: redis.Delivery) -> None:
+    value: Any = None
+    try:
+        value = delivery.decode()
+    except ValidationError:
+        reject(delivery, 'invalid_json')
+        return
+    if len(v.check(job.schema, value)) != 0:
+        reject(delivery, 'invalid_schema')
+        return
+    item: dict[str, Any] = value
+    try:
+        persist(item)
+    except Error as err:
+        if delivery.attempt >= 3:
+            reject(delivery, 'attempts_exhausted')
+        else:
+            print('report will be retried', delivery.id, err.kind)
+        return
+    if not delivery.ack():
+        print('delivery ownership changed', delivery.id)
+
+def run(consumer: str) -> None:
+    cursor: str = '0-0'
+    while True:
+        claimed: redis.Claim = jobs.claim(consumer, 5000, cursor, 16)
+        cursor = claimed.next
+        if claimed.trimmed > 0:
+            print('trimmed pending reports', claimed.trimmed)
+        for delivery: redis.Delivery in claimed.messages:
+            process(delivery)
+        for delivery: redis.Delivery in jobs.read(consumer, 16, 500):
+            process(delivery)
+
+if __name__ == '__main__':
+    run(redis.env('REPORT_CONSUMER'))
