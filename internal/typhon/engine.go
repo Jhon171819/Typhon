@@ -40,6 +40,7 @@ type Engine struct {
 	httpWorker    bool
 	openAPIExport bool
 	httpMetrics   atomic.Pointer[httpPoolMetrics]
+	postgresPools *postgresPoolRegistry
 	quotas        quotaLimits
 	quotaErr      error
 }
@@ -68,6 +69,7 @@ func NewEngineWithContext(parent context.Context) *Engine {
 		modules: map[string]*LoadedModule{},
 		infos:   map[string]*ModuleInfo{},
 		quotas:  limits, quotaErr: limitErr,
+		postgresPools: &postgresPoolRegistry{},
 	}
 }
 

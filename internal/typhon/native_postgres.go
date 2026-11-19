@@ -36,11 +36,13 @@ func postgresDriverTypes() map[string]Type {
 	connection := Type{Kind: TypeNative, Name: "typhon.postgres.Connection", Members: methods()}
 	connection.Members["begin"] = nativeFuncType("postgres.begin", nil, tx, 0)
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
+	connection.Members["stats"] = nativeFuncType("postgres.stats", nil, dictType(StrType(), IntType()), 0)
 	types := map[string]Type{
 		"Rows": rows, "Transaction": tx, "Connection": connection,
-		"connect":       nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
-		"connect_typed": nativeFuncType("postgres.connect_typed", []Type{StrType(), FloatType()}, connection, 1),
-		"env":           nativeFuncType("postgres.env", []Type{StrType()}, StrType(), 0),
+		"connect":        nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
+		"connect_typed":  nativeFuncType("postgres.connect_typed", []Type{StrType(), FloatType()}, connection, 1),
+		"connect_pooled": nativeFuncType("postgres.connect_pooled", []Type{StrType(), dictType(StrType(), AnyType())}, connection, 0),
+		"env":            nativeFuncType("postgres.env", []Type{StrType()}, StrType(), 0),
 	}
 	postgresParamTypes(types)
 	return types
@@ -55,35 +57,72 @@ func postgresDriverExports(types map[string]Type) map[string]Value {
 	exports["connect_typed"] = driverFunc(types["connect_typed"], func(vm *VM, args []Value) (Value, error) {
 		return nativePostgresConnect(vm, args, true)
 	})
+	exports["connect_pooled"] = driverFunc(types["connect_pooled"], nativePostgresPooled)
 	exports["env"] = driverFunc(types["env"], driverEnv)
 	return exports
 }
 
 type postgresConnection struct {
-	scope   *resourceScope
-	pool    *pgxpool.Pool
-	timeout time.Duration
-	typed   bool
-	closed  atomic.Bool
-	txs     resourceScope
+	scope     *resourceScope
+	pool      *pgxpool.Pool
+	timeout   time.Duration
+	acquire   time.Duration
+	grace     time.Duration
+	typed     bool
+	closing   atomic.Bool
+	closed    atomic.Bool
+	txs       resourceScope
+	release   func()
+	closeOnce sync.Once
+	closeErr  error
+	activeMu  sync.Mutex
+	activeTxs map[*postgresTransaction]bool
 }
 
 type postgresTransaction struct {
 	scope  *resourceScope
 	parent *postgresConnection
 	tx     pgx.Tx
+	conn   *pgxpool.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 	mu     sync.Mutex
 	ended  bool
 }
 
 func (db *postgresConnection) close(ctx context.Context) error {
-	if db.closed.Swap(true) {
-		return nil
-	}
-	db.scope.remove(db)
-	err := db.txs.close(ctx)
-	db.pool.Close()
-	return err
+	db.closeOnce.Do(func() {
+		db.activeMu.Lock()
+		db.closing.Store(true)
+		active := make([]*postgresTransaction, 0, len(db.activeTxs))
+		for tx := range db.activeTxs {
+			active = append(active, tx)
+		}
+		db.activeMu.Unlock()
+		if len(active) > 0 && db.grace > 0 {
+			wait := db.grace
+			if deadline, ok := ctx.Deadline(); ok {
+				wait = min(wait, time.Until(deadline)/2)
+			}
+			grace, cancel := context.WithTimeout(ctx, wait)
+			for _, tx := range active {
+				select {
+				case <-tx.done:
+				case <-grace.Done():
+				}
+			}
+			cancel()
+		}
+		db.closed.Store(true)
+		for _, tx := range active {
+			tx.cancel()
+		}
+		db.scope.remove(db)
+		db.closeErr = db.txs.close(ctx)
+		db.release()
+	})
+	return db.closeErr
 }
 
 func (tx *postgresTransaction) rollback(ctx context.Context) error {
@@ -92,14 +131,66 @@ func (tx *postgresTransaction) rollback(ctx context.Context) error {
 	if tx.ended {
 		return nil
 	}
-	tx.ended = true
-	tx.scope.remove(tx)
-	tx.parent.txs.remove(tx)
 	err := tx.tx.Rollback(ctx)
+	tx.finish()
 	if errors.Is(err, pgx.ErrTxClosed) {
 		return nil
 	}
 	return driverFailure("PostgreSQL", databaseKind, err)
+}
+
+func (tx *postgresTransaction) finish() {
+	tx.ended = true
+	tx.scope.remove(tx)
+	tx.parent.txs.remove(tx)
+	tx.cancel()
+	tx.conn.Release()
+	tx.parent.activeMu.Lock()
+	delete(tx.parent.activeTxs, tx)
+	tx.parent.activeMu.Unlock()
+	close(tx.done)
+}
+
+func (tx *postgresTransaction) operation(vm *VM) (context.Context, context.CancelFunc) {
+	ctx, cancel := driverContext(vm, tx.parent.timeout)
+	stop := context.AfterFunc(tx.ctx, cancel)
+	if tx.ctx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (db *postgresConnection) acquireConn(vm *VM) (*pgxpool.Conn, context.Context, context.CancelFunc, error) {
+	if db.closing.Load() {
+		return nil, nil, nil, errors.New("PostgreSQL connection is closed")
+	}
+	wait := db.timeout
+	if db.acquire > 0 {
+		wait = db.acquire
+	}
+	ctx, cancel := driverContext(vm, wait)
+	if db.acquire > 0 {
+		vm.engine.execMu.Unlock()
+	}
+	conn, err := db.pool.Acquire(ctx)
+	if db.acquire > 0 {
+		vm.engine.execMu.Lock()
+		cancel()
+		ctx, cancel = driverContext(vm, db.timeout)
+	}
+	if err != nil {
+		cancel()
+		return nil, nil, nil, driverFailure("PostgreSQL", databaseKind, err)
+	}
+	if db.closing.Load() {
+		conn.Release()
+		cancel()
+		return nil, nil, nil, errors.New("PostgreSQL connection is closed")
+	}
+	return conn, ctx, cancel, nil
 }
 
 func nativePostgresConnect(vm *VM, args []Value, typed bool) (Value, error) {
@@ -107,12 +198,28 @@ func nativePostgresConnect(vm *VM, args []Value, typed bool) (Value, error) {
 	if err != nil {
 		return NoneValue(), err
 	}
-	if args[0].Str == "" {
-		return NoneValue(), fmt.Errorf("PostgreSQL DSN must not be empty")
-	}
-	config, err := pgxpool.ParseConfig(args[0].Str)
+	config, err := postgresPoolConfig(vm, args[0].Str, timeout)
 	if err != nil {
-		return NoneValue(), driverFailure("PostgreSQL", validationKind, err)
+		return NoneValue(), err
+	}
+	ctx, cancel := driverContext(vm, timeout)
+	defer cancel()
+	pool, err := openPostgresPool(ctx, config)
+	if err != nil {
+		return NoneValue(), err
+	}
+	return postgresConnectionValue(vm, &postgresConnection{
+		scope: vm.resourceScope(), pool: pool, timeout: timeout, typed: typed, release: pool.Close,
+	})
+}
+
+func postgresPoolConfig(vm *VM, dsn string, timeout time.Duration) (*pgxpool.Config, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("PostgreSQL DSN must not be empty")
+	}
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, driverFailure("PostgreSQL", validationKind, err)
 	}
 	config.MaxConns = 16
 	config.ConnConfig.ConnectTimeout = timeout
@@ -122,73 +229,105 @@ func nativePostgresConnect(vm *VM, args []Value, typed bool) (Value, error) {
 		frontend.SetMaxBodyLen(messageLimit)
 		return frontend
 	}
-	ctx, cancel := driverContext(vm, timeout)
-	defer cancel()
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
-	}
-	if err = pool.Ping(ctx); err != nil {
-		pool.Close()
-		return NoneValue(), driverFailure("PostgreSQL", connectionKind, err)
-	}
-	db := &postgresConnection{scope: vm.resourceScope(), pool: pool, timeout: timeout, typed: typed}
+	return config, nil
+}
+
+func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 	if err := db.scope.add(vm.context(), db, "PostgreSQL pool close", db.close); err != nil {
 		return NoneValue(), err
 	}
 	typ := postgresDriverTypes()["Connection"]
+	closeHandle := driverCloser(typ.Members["close"], db.close)
+	if db.acquire > 0 {
+		closeHandle = driverFunc(typ.Members["close"], func(vm *VM, args []Value) (Value, error) {
+			ctx, cancel := driverContext(vm, cleanupTimeout)
+			defer cancel()
+			db.closing.Store(true)
+			vm.engine.execMu.Unlock()
+			err := db.close(ctx)
+			vm.engine.execMu.Lock()
+			return NoneValue(), err
+		})
+		closeHandle.Native.cleanup = true
+	}
 	attrs := map[string]Value{
-		"close": driverCloser(typ.Members["close"], db.close),
+		"close": closeHandle,
+		"stats": driverFunc(typ.Members["stats"], func(vm *VM, args []Value) (Value, error) {
+			if db.closing.Load() {
+				return NoneValue(), errors.New("PostgreSQL connection is closed")
+			}
+			return db.stats(), nil
+		}),
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
-			if db.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
+			if db.closing.Load() {
+				return NoneValue(), errors.New("PostgreSQL connection is closed")
 			}
 			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
-			ctx, cancel := driverContext(vm, db.timeout)
+			conn, ctx, cancel, err := db.acquireConn(vm)
+			if err != nil {
+				return NoneValue(), err
+			}
+			defer conn.Release()
 			defer cancel()
-			tag, err := db.pool.Exec(ctx, args[0].Str, params...)
+			tag, err := conn.Exec(ctx, args[0].Str, params...)
 			return IntValue(tag.RowsAffected()), driverFailure("PostgreSQL", databaseKind, err)
 		}),
 		"query": driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) {
-			if db.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
+			if db.closing.Load() {
+				return NoneValue(), errors.New("PostgreSQL connection is closed")
 			}
 			params, err := postgresParams(vm, args)
 			if err != nil {
 				return NoneValue(), err
 			}
-			ctx, cancel := driverContext(vm, db.timeout)
+			conn, ctx, cancel, err := db.acquireConn(vm)
+			if err != nil {
+				return NoneValue(), err
+			}
+			defer conn.Release()
 			defer cancel()
-			rows, err := db.pool.Query(ctx, args[0].Str, params...)
+			rows, err := conn.Query(ctx, args[0].Str, params...)
 			if err != nil {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
 			return postgresRows(vm, rows, cancel, db.typed)
 		}),
 		"begin": driverFunc(typ.Members["begin"], func(vm *VM, args []Value) (Value, error) {
-			if db.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL connection is closed")
-			}
-			ctx, cancel := driverContext(vm, db.timeout)
-			defer cancel()
-			raw, err := db.pool.Begin(ctx)
+			conn, ctx, cancel, err := db.acquireConn(vm)
 			if err != nil {
+				return NoneValue(), err
+			}
+			defer cancel()
+			raw, err := conn.Begin(ctx)
+			if err != nil {
+				conn.Release()
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
-			tx := &postgresTransaction{scope: vm.resourceScope(), parent: db, tx: raw}
+			lifetime, stop := context.WithCancel(vm.context())
+			tx := &postgresTransaction{
+				scope: vm.resourceScope(), parent: db, tx: raw, conn: conn, ctx: lifetime, cancel: stop, done: make(chan struct{}),
+			}
 			if err := tx.scope.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
 				return NoneValue(), err
 			}
 			if err := db.txs.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
 				return NoneValue(), err
 			}
+			db.activeMu.Lock()
+			if db.activeTxs == nil {
+				db.activeTxs = make(map[*postgresTransaction]bool)
+			}
+			db.activeTxs[tx] = true
+			db.activeMu.Unlock()
 			return postgresTxValue(vm, tx), nil
 		}),
 	}
-	return scopedNativeObject(vm, typ, attrs), nil
+	value := scopedNativeObject(vm, typ, attrs)
+	value.NativeObject.data = db
+	return value, nil
 }
 
 func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
@@ -204,7 +343,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if err != nil {
 				return NoneValue(), err
 			}
-			ctx, cancel := driverContext(vm, tx.parent.timeout)
+			ctx, cancel := tx.operation(vm)
 			defer cancel()
 			tag, err := tx.tx.Exec(ctx, args[0].Str, params...)
 			return IntValue(tag.RowsAffected()), driverFailure("PostgreSQL", databaseKind, err)
@@ -219,7 +358,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if err != nil {
 				return NoneValue(), err
 			}
-			ctx, cancel := driverContext(vm, tx.parent.timeout)
+			ctx, cancel := tx.operation(vm)
 			defer cancel()
 			rows, err := tx.tx.Query(ctx, args[0].Str, params...)
 			if err != nil {
@@ -233,12 +372,10 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if tx.ended || tx.parent.closed.Load() {
 				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
 			}
-			ctx, cancel := driverContext(vm, tx.parent.timeout)
+			ctx, cancel := tx.operation(vm)
 			defer cancel()
 			err := tx.tx.Commit(ctx)
-			tx.ended = true
-			tx.scope.remove(tx)
-			tx.parent.txs.remove(tx)
+			tx.finish()
 			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 		}),
 		"rollback": driverCloser(typ.Members["rollback"], tx.rollback),

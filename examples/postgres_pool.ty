@@ -1,0 +1,29 @@
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.web as web
+
+options: dict[str, Any] = {
+    'share': 'backend',
+    'max_connections': 4,
+    'min_connections': 1,
+    'idle_seconds': 120,
+    'lifetime_seconds': 1800,
+    'health_seconds': 30,
+    'connect_seconds': 2,
+    'acquire_seconds': 0.5,
+    'query_seconds': 2,
+    'grace_seconds': 0.5,
+    'require_tls': pg.env('REQUIRE_DB_TLS') == '1'
+}
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), options)
+routes: web.Router = web.router()
+routes.use_errors()
+
+def select_value(req: http.Request) -> http.Response:
+    rows: pg.Rows = db.query('SELECT pg_backend_pid() AS backend')
+    return http.json(200, {'backend': rows.get(0, 'backend')})
+
+routes.add('GET', '/database', select_value)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes, 3, 12)

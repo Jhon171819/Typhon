@@ -89,6 +89,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		}
 		engine := NewEngineWithContext(p.ctx)
 		engine.httpWorker = true
+		engine.postgresPools = vm.engine.postgresPools
 		engine.httpMetrics.Store(&p.metrics)
 		p.engines = append(p.engines, engine)
 		module, err := engine.LoadModule(path)

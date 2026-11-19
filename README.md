@@ -93,6 +93,8 @@ The Go runtime currently supports:
   with heartbeat, backpressure, and independent connection admission.
 - [Complex PostgreSQL parameters](docs/postgres_parameters.md) support SQL
   arrays, JSONB, typed nulls and structured SQLSTATE diagnostics.
+- [Shared PostgreSQL pools](docs/postgres_pool.md) enforce a connection
+  budget across HTTP workers and expose saturation metrics.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
