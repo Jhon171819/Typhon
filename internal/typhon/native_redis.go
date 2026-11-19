@@ -109,6 +109,9 @@ func nativeRedisConnect(vm *VM, args []Value) (Value, error) {
 				if err == redis.Nil {
 					return NoneValue(), nil
 				}
+				if err == nil {
+					err = vm.chargeBytes(int64(len(value)))
+				}
 				return StringValue(value), driverFailure("Redis", databaseKind, err)
 			case "set":
 				var ttl time.Duration
@@ -174,6 +177,9 @@ func redisValue(vm *VM, value any, depth int) (Value, error) {
 	if depth > 64 {
 		return NoneValue(), fmt.Errorf("Redis response depth limit exceeded")
 	}
+	if err := vm.chargeBytes(valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
 	switch value := value.(type) {
 	case nil:
 		return NoneValue(), nil
@@ -182,6 +188,9 @@ func redisValue(vm *VM, value any, depth int) (Value, error) {
 	case int64:
 		return IntValue(value), nil
 	case string:
+		if err := vm.chargeBytes(int64(len(value))); err != nil {
+			return NoneValue(), err
+		}
 		return StringValue(value), nil
 	case []byte:
 		return StringValue(string(value)), nil

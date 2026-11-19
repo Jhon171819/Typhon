@@ -34,7 +34,7 @@ func writeHTTPStop(w http.ResponseWriter, server context.Context, err error) {
 	}
 }
 
-func readHTTPRequestBody(w http.ResponseWriter, req *http.Request, ctx context.Context) ([]byte, error) {
+func readHTTPRequestBody(w http.ResponseWriter, req *http.Request, ctx context.Context, limit int64) ([]byte, error) {
 	controller := http.NewResponseController(w)
 	done := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
@@ -48,5 +48,5 @@ func readHTTPRequestBody(w http.ResponseWriter, req *http.Request, ctx context.C
 			<-done
 		}
 	}()
-	return io.ReadAll(http.MaxBytesReader(w, req.Body, maxHTTPBody))
+	return io.ReadAll(http.MaxBytesReader(w, req.Body, limit))
 }

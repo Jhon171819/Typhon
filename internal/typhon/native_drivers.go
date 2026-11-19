@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -137,6 +138,11 @@ func callNativeDriver(vm *VM, fn *NativeFunc, args []Value) (Value, error) {
 		}
 		converted[i] = value
 	}
+	if typ.Return.Kind == TypeNative {
+		if err := vm.chargeBytes(valueSlotBytes); err != nil {
+			return NoneValue(), err
+		}
+	}
 	value, err := fn.Fn(vm, converted)
 	if stop := vm.executionError(); stop != nil {
 		if fn.cleanup && err != nil {
@@ -182,6 +188,14 @@ func (e *NativeCause) Error() string {
 func driverFailure(driver, kind string, err error) error {
 	if err == nil {
 		return nil
+	}
+	var stop *executionStop
+	if errors.As(err, &stop) {
+		return stop
+	}
+	var oversized *pgproto3.ExceededMaxBodyLenErr
+	if errors.As(err, &oversized) {
+		return quotaStop("PostgreSQL message byte", int64(oversized.MaxExpectedBodyLen))
 	}
 	code := ""
 	if kind != validationKind {

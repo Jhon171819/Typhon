@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type Engine struct {
@@ -35,7 +36,9 @@ type Engine struct {
 	warmPython   bool
 	sharedPython bool
 	httpWorker   bool
-	httpMetrics  *httpPoolMetrics
+	httpMetrics  atomic.Pointer[httpPoolMetrics]
+	quotas       quotaLimits
+	quotaErr     error
 }
 
 type LoadedModule struct {
@@ -56,10 +59,12 @@ func NewEngine() *Engine {
 
 func NewEngineWithContext(parent context.Context) *Engine {
 	ctx, cancel := context.WithCancel(parent)
+	limits, limitErr := configuredQuotas()
 	return &Engine{
 		ctx: ctx, cancel: cancel, loading: map[string]bool{},
 		modules: map[string]*LoadedModule{},
 		infos:   map[string]*ModuleInfo{},
+		quotas:  limits, quotaErr: limitErr,
 	}
 }
 
@@ -208,16 +213,19 @@ func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, erro
 }
 
 func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule, error) {
+	if e.quotaErr != nil {
+		return nil, e.quotaErr
+	}
 	if !e.beginExecution() {
 		return nil, e.ctx.Err()
 	}
 	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
-	return e.loadModuleByNameLocked(e.ctx, module, fromDir)
+	return e.loadModuleByNameLocked(e.ctx, nil, module, fromDir)
 }
 
-func (e *Engine) loadModuleByNameLocked(ctx context.Context, module string, fromDir string) (*LoadedModule, error) {
+func (e *Engine) loadModuleByNameLocked(ctx context.Context, budget *executionBudget, module string, fromDir string) (*LoadedModule, error) {
 	if module == "typhon.parallel" {
 		return &LoadedModule{
 			Path:     "<typhon.parallel>",
@@ -240,7 +248,7 @@ func (e *Engine) loadModuleByNameLocked(ctx context.Context, module string, from
 		return nil, err
 	}
 	if !loaded.Executed {
-		if err := e.executeModuleLocked(ctx, loaded, false); err != nil {
+		if err := e.executeModuleLocked(ctx, budget, loaded, false); err != nil {
 			return nil, err
 		}
 	}
@@ -390,6 +398,9 @@ func (e *Engine) closeBridge() error {
 }
 
 func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
+	if e.quotaErr != nil {
+		return e.quotaErr
+	}
 	if module.Engine != e {
 		return errors.New("module belongs to another Engine")
 	}
@@ -399,7 +410,7 @@ func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
 	defer e.active.Done()
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
-	err := e.executeModuleLocked(e.ctx, module, main)
+	err := e.executeModuleLocked(e.ctx, nil, module, main)
 	if main {
 		if err != nil {
 			e.stopTasks(err)
@@ -430,7 +441,7 @@ func (e *Engine) stopTasks(err error) {
 	}
 }
 
-func (e *Engine) executeModuleLocked(ctx context.Context, module *LoadedModule, main bool) error {
+func (e *Engine) executeModuleLocked(ctx context.Context, budget *executionBudget, module *LoadedModule, main bool) error {
 	if module.Executing {
 		return fmt.Errorf("cyclic module execution: %s", module.Path)
 	}
@@ -448,7 +459,7 @@ func (e *Engine) executeModuleLocked(ctx context.Context, module *LoadedModule, 
 	}
 	module.Executing = true
 	defer func() { module.Executing = false }()
-	vm := &VM{engine: e, module: module, depth: 1, ctx: ctx}
+	vm := &VM{engine: e, module: module, depth: 1, ctx: ctx, budget: budget}
 	_, err := vm.runFunction(module.Program.Module, nil)
 	if err != nil {
 		module.ExecuteErr = err

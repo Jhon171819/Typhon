@@ -138,6 +138,7 @@ func (vm *VM) unwind(f *frame, exit *completion) bool {
 			if stop != nil && vm.cleanupCtx == nil {
 				vm.cleanupCtx, vm.cleanupCancel = context.WithTimeout(context.WithoutCancel(vm.context()), cleanupTimeout)
 				vm.cleanupSteps = 10_000
+				vm.cleanupBytes = 1 << 20
 			}
 			if vm.cleanupCtx != nil && (vm.cleanupSteps == 0 || vm.cleanupCtx.Err() != nil) {
 				f.popRegion()

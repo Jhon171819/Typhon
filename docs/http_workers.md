@@ -42,6 +42,7 @@ antes de executar, e `completed` conta saídas de handlers. `queued`
 é a fila atual, `queue_peak` o pico e `queue_wait_ns` a soma dos
 tempos de espera. O backend aplica controle de acessos quando expõe
 essas métricas em rede.
+`quota_rejected` conta rejeições pelo [orçamento por requisição](request_budgets.md).
 
 Execute [http_workers.ty](../examples/http_workers.ty) para ver o
 contador local por worker e as métricas da instância. O benchmark

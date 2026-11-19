@@ -15,9 +15,11 @@ type VM struct {
 	cleanupCtx    context.Context
 	cleanupCancel context.CancelFunc
 	cleanupSteps  int
+	cleanupBytes  int64
 	ctx           context.Context
 	depth         int
 	instructions  int
+	budget        *executionBudget
 	engine        *Engine
 	module        *LoadedModule
 }
@@ -92,6 +94,9 @@ func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
 	if len(args) != len(fn.Params) {
 		return NoneValue(), traceFrame(fn, 0, fmt.Errorf("%s expected %d arguments, got %d", fn.Name, len(fn.Params), len(args)))
 	}
+	if err := vm.chargeBytes(int64(len(fn.LocalNames)) * valueSlotBytes); err != nil {
+		return NoneValue(), traceFrame(fn, 0, err)
+	}
 	locals := make([]Value, len(fn.LocalNames))
 	for i, arg := range args {
 		if i < len(fn.Signature.Params) {
@@ -143,16 +148,8 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		if err := vm.executionError(); err != nil {
 			return completion{}, err
 		}
-		if vm.cleanupCtx != nil {
-			if vm.cleanupSteps <= 0 {
-				return completion{}, &executionStop{cause: errors.New("cancellation finally instruction budget exceeded")}
-			}
-			vm.cleanupSteps--
-		} else {
-			vm.instructions++
-		}
-		if vm.cleanupCtx == nil && vm.instructions > 10_000_000 {
-			return completion{}, &executionStop{cause: errors.New("instruction budget exceeded")}
+		if err := vm.chargeWork(); err != nil {
+			return completion{}, err
 		}
 		instr := fn.Code[f.pc]
 		f.line = instr.Line
@@ -246,7 +243,7 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		case OpAdd, OpSub, OpMul, OpDiv, OpFloorDiv, OpMod:
 			right := f.pop()
 			left := f.pop()
-			value, err := arithmetic(instr.Op, left, right)
+			value, err := arithmetic(vm, instr.Op, left, right)
 			if err != nil {
 				return completion{}, err
 			}
@@ -294,6 +291,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		case OpReturn:
 			return completion{target: -1, value: f.pop(), line: instr.Line}, nil
 		case OpMakeList:
+			if err := vm.chargeBytes(int64(instr.A) * 2 * valueSlotBytes); err != nil {
+				return completion{}, err
+			}
 			items := make([]Value, instr.A)
 			for i := instr.A - 1; i >= 0; i-- {
 				items[i] = f.pop()
@@ -302,6 +302,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		case OpMakeDict:
 			if instr.A > maxCollectionItems {
 				return completion{}, fmt.Errorf("dictionary size limit exceeded")
+			}
+			if err := vm.chargeBytes(int64(instr.A) * 4 * valueSlotBytes); err != nil {
+				return completion{}, err
 			}
 			entries := make([]DictEntry, instr.A)
 			for i := instr.A - 1; i >= 0; i-- {
@@ -324,6 +327,11 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 			f.push(value)
 		case OpSetIndex:
 			key, obj, value := f.pop(), f.pop(), f.pop()
+			if obj.Kind == ValueDict {
+				if err := vm.chargeBytes(2 * valueSlotBytes); err != nil {
+					return completion{}, err
+				}
+			}
 			if err := setIndex(obj, key, value); err != nil {
 				return completion{}, err
 			}
@@ -368,7 +376,7 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 			}
 		case OpIter:
 			iterable := f.pop()
-			items, err := collectionValues(iterable)
+			items, err := vm.collectionValues(iterable)
 			if err != nil {
 				return completion{}, err
 			}
@@ -461,7 +469,7 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 				}
 				continue
 			}
-			imported, err := vm.engine.loadModuleByNameLocked(vm.context(), instr.S, filepathDir(f.module.Path))
+			imported, err := vm.engine.loadModuleByNameLocked(vm.context(), vm.executionBudget(), instr.S, filepathDir(f.module.Path))
 			if err != nil {
 				if !errors.Is(err, ErrModuleNotFound) {
 					return completion{}, err
@@ -495,6 +503,9 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 			value := f.pop()
 			if instr.S == ".2f" && value.Kind != ValueInt && value.Kind != ValueFloat {
 				return completion{}, fmt.Errorf(".2f format requires a number")
+			}
+			if err := vm.chargeValue(value, 0); err != nil {
+				return completion{}, err
 			}
 			f.push(StringValue(formatValue(value, instr.S)))
 		}
@@ -570,6 +581,9 @@ func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Va
 }
 
 func (vm *VM) callClass(class *RuntimeClass, args []Value) (Value, error) {
+	if err := vm.chargeBytes(int64(len(class.Spec.Fields)+1) * valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
 	fields := make([]Value, len(class.Spec.Fields))
 	object := Value{Kind: ValueObject, Object: &Object{Class: class, Fields: fields}}
 	if initFn, ok := class.Spec.Methods["__init__"]; ok {
@@ -673,6 +687,9 @@ func boundNative(receiver Value, name string, fn func(*VM, []Value) (Value, erro
 func nativePrint(vm *VM, args []Value) (Value, error) {
 	parts := make([]string, 0, len(args))
 	for _, arg := range args {
+		if err := vm.chargeValue(arg, 0); err != nil {
+			return NoneValue(), err
+		}
 		parts = append(parts, arg.String())
 	}
 	fmt.Println(strings.Join(parts, " "))
@@ -697,6 +714,7 @@ func nativeSpawn(vm *VM, args []Value) (Value, error) {
 	}
 	callee := args[0]
 	module := vm.module
+	budget := vm.executionBudget()
 	callArgs := append([]Value(nil), args[1:]...)
 	ctx, cancel := context.WithCancel(vm.context())
 	task := &Task{done: make(chan struct{}), cancel: cancel, engine: vm.engine, request: vm.request}
@@ -710,7 +728,7 @@ func nativeSpawn(vm *VM, args []Value) (Value, error) {
 		defer cancel()
 		vm.engine.execMu.Lock()
 		defer vm.engine.execMu.Unlock()
-		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, request: vm.request}
+		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, request: vm.request, budget: budget}
 		value, err := child.callValue(callee, callArgs, nil)
 		task.result = taskResult{value: value, err: err}
 		close(task.done)
@@ -801,8 +819,11 @@ func nativeEnumerate(vm *VM, args []Value) (Value, error) {
 	if len(args) != 1 {
 		return NoneValue(), fmt.Errorf("enumerate expected 1 argument")
 	}
-	values, err := collectionValues(args[0])
+	values, err := vm.collectionValues(args[0])
 	if err != nil {
+		return NoneValue(), err
+	}
+	if err := vm.chargeBytes(int64(len(values)) * 4 * valueSlotBytes); err != nil {
 		return NoneValue(), err
 	}
 	items := make([]Value, 0, len(values))
@@ -839,8 +860,17 @@ func nativeRange(vm *VM, args []Value) (Value, error) {
 	items := []Value{}
 	if step > 0 {
 		for value := start; value < stop; value += step {
+			if err := vm.executionError(); err != nil {
+				return NoneValue(), err
+			}
+			if err := vm.chargeWork(); err != nil {
+				return NoneValue(), err
+			}
 			if len(items) >= maxCollectionItems {
 				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
+			if err := vm.chargeBytes(valueSlotBytes); err != nil {
+				return NoneValue(), err
 			}
 			items = append(items, IntValue(value))
 			if value > math.MaxInt64-step {
@@ -849,8 +879,17 @@ func nativeRange(vm *VM, args []Value) (Value, error) {
 		}
 	} else {
 		for value := start; value > stop; value += step {
+			if err := vm.executionError(); err != nil {
+				return NoneValue(), err
+			}
+			if err := vm.chargeWork(); err != nil {
+				return NoneValue(), err
+			}
 			if len(items) >= maxCollectionItems {
 				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
+			if err := vm.chargeBytes(valueSlotBytes); err != nil {
+				return NoneValue(), err
 			}
 			items = append(items, IntValue(value))
 			if value < math.MinInt64-step {
@@ -903,6 +942,9 @@ func nativeListAppend(vm *VM, args []Value) (Value, error) {
 		if err != nil {
 			return NoneValue(), err
 		}
+	}
+	if err := vm.chargeBytes(valueSlotBytes); err != nil {
+		return NoneValue(), err
 	}
 	*receiver.List = append(*receiver.List, item)
 	return NoneValue(), nil

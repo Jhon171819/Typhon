@@ -62,6 +62,8 @@ The Go runtime currently supports:
   admission metrics.
 - [Request deadlines](docs/request_context.md) propagate through queued
   requests, Typhon tasks and native driver operations.
+- [Request budgets](docs/request_budgets.md) bound logical allocations,
+  work and SQL results.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

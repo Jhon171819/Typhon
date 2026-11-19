@@ -12,6 +12,7 @@ import (
 type httpPoolMetrics struct {
 	admitted, rejected, completed atomic.Int64
 	waiting, peak, waitNS         atomic.Int64
+	quotaRejected                 atomic.Int64
 }
 
 func (m *httpPoolMetrics) snapshot() Value {
@@ -22,6 +23,7 @@ func (m *httpPoolMetrics) snapshot() Value {
 	}{
 		{"admitted", &m.admitted}, {"rejected", &m.rejected}, {"completed", &m.completed},
 		{"queued", &m.waiting}, {"queue_peak", &m.peak}, {"queue_wait_ns", &m.waitNS},
+		{"quota_rejected", &m.quotaRejected},
 	} {
 		_ = result.Dict.put(StringValue(metric.name), IntValue(metric.value.Load()))
 	}
@@ -35,6 +37,7 @@ type httpWorkerPool struct {
 	engines        []*Engine
 	metrics        httpPoolMetrics
 	requestTimeout time.Duration
+	liveness       string
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
@@ -52,7 +55,7 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		}
 		engine := NewEngineWithContext(p.ctx)
 		engine.httpWorker = true
-		engine.httpMetrics = &p.metrics
+		engine.httpMetrics.Store(&p.metrics)
 		p.engines = append(p.engines, engine)
 		module, err := engine.LoadModule(handler.Function.ModulePath)
 		if err == nil {
@@ -81,6 +84,15 @@ func (p *httpWorkerPool) close() error {
 }
 
 func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request) {
+	if p.liveness != "" && req.URL.Path == p.liveness {
+		if req.Method == http.MethodGet || req.Method == http.MethodHead {
+			writer.WriteHeader(http.StatusNoContent)
+		} else {
+			writer.Header().Set("Allow", "GET, HEAD")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
 	if p.ctx.Err() != nil {
 		p.reject(writer, "server shutting down")
 		return

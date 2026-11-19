@@ -173,11 +173,7 @@ func (v *validationRun) step() error {
 	if v.steps > maxValidationSteps {
 		return &Exception{kind: validationKind, message: "schema validation work limit exceeded"}
 	}
-	v.vm.instructions++
-	if v.vm.instructions > 10_000_000 {
-		return &executionStop{cause: errors.New("instruction budget exceeded")}
-	}
-	return nil
+	return v.vm.chargeWork()
 }
 
 func (v *validationRun) issue(path, rule, code, message string) {

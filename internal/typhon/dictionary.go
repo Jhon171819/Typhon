@@ -249,11 +249,14 @@ func getIndex(obj, key Value) (Value, error) {
 	return NoneValue(), fmt.Errorf("%s does not support indexing", obj.Kind)
 }
 
-func collectionValues(obj Value) ([]Value, error) {
+func (vm *VM) collectionValues(obj Value) ([]Value, error) {
 	if obj.Kind == ValueList && obj.List != nil {
 		return *obj.List, nil
 	}
 	if obj.Kind == ValueDict && obj.Dict != nil {
+		if err := vm.chargeBytes(int64(len(obj.Dict.Entries)) * valueSlotBytes); err != nil {
+			return nil, err
+		}
 		keys := make([]Value, len(obj.Dict.Entries))
 		for i, entry := range obj.Dict.Entries {
 			keys[i] = entry.Key
@@ -321,6 +324,9 @@ func nativeDict(vm *VM, args []Value) (Value, error) {
 	if len(args) != 1 || args[0].Kind != ValueDict || args[0].Dict == nil {
 		return NoneValue(), fmt.Errorf("dict expected 0 arguments or a dictionary")
 	}
+	if err := vm.chargeBytes(int64(len(args[0].Dict.Entries)) * 2 * valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
 	copy := DictValue()
 	for _, entry := range args[0].Dict.Entries {
 		if err := copy.Dict.put(entry.Key, entry.Value); err != nil {
@@ -376,6 +382,9 @@ var dictionaryMethods = func() map[string]*NativeFunc {
 					return NoneValue(), fmt.Errorf("KeyError: %s", args[0].String())
 				}
 				if name == "setdefault" {
+					if err := vm.chargeBytes(2 * valueSlotBytes); err != nil {
+						return NoneValue(), err
+					}
 					if err := setIndex(receiver, key, fallback); err != nil {
 						return NoneValue(), err
 					}
@@ -396,6 +405,9 @@ var dictionaryMethods = func() map[string]*NativeFunc {
 					return NoneValue(), err
 				}
 				candidate.Dict.Contract = nil
+				if err := vm.chargeBytes(int64(len(args[0].Dict.Entries)) * 2 * valueSlotBytes); err != nil {
+					return NoneValue(), err
+				}
 				for _, entry := range args[0].Dict.Entries {
 					if err := candidate.Dict.put(entry.Key, entry.Value); err != nil {
 						return NoneValue(), err
@@ -408,6 +420,13 @@ var dictionaryMethods = func() map[string]*NativeFunc {
 				}
 				d.Entries, d.Index = candidate.Dict.Entries, candidate.Dict.Index
 			default:
+				slots := int64(len(d.Entries)) * 2
+				if name == "items" {
+					slots *= 2
+				}
+				if err := vm.chargeBytes(slots * valueSlotBytes); err != nil {
+					return NoneValue(), err
+				}
 				items := make([]Value, len(d.Entries))
 				for i, entry := range d.Entries {
 					switch name {

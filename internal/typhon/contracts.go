@@ -193,10 +193,13 @@ func (plan *validationPlan) validate(value Value, typ Type, depth int) (Value, e
 const maxCollectionItems = 1_000_000
 const maxStringBytes = 16 * 1024 * 1024
 
-func arithmetic(op Op, left, right Value) (Value, error) {
+func arithmetic(vm *VM, op Op, left, right Value) (Value, error) {
 	if op == OpAdd && left.Kind == ValueString && right.Kind == ValueString {
 		if len(left.Str) > maxStringBytes-len(right.Str) {
 			return NoneValue(), fmt.Errorf("string size limit exceeded")
+		}
+		if err := vm.chargeBytes(int64(len(left.Str) + len(right.Str))); err != nil {
+			return NoneValue(), err
 		}
 		return StringValue(left.Str + right.Str), nil
 	}
@@ -212,6 +215,9 @@ func arithmetic(op Op, left, right Value) (Value, error) {
 		}
 		if right.Int > int64(maxStringBytes/len(left.Str)) {
 			return NoneValue(), fmt.Errorf("string size limit exceeded")
+		}
+		if err := vm.chargeBytes(int64(len(left.Str)) * right.Int); err != nil {
+			return NoneValue(), err
 		}
 		return StringValue(strings.Repeat(left.Str, int(right.Int))), nil
 	}

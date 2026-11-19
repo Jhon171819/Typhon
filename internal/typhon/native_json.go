@@ -72,10 +72,7 @@ func (b *jsonBudget) visit(offset int64, depth int) error {
 		if err := b.vm.executionError(); err != nil {
 			return err
 		}
-		b.vm.instructions++
-		if b.vm.instructions > 10_000_000 {
-			return &executionStop{cause: errors.New("instruction budget exceeded")}
-		}
+		return b.vm.chargeWork()
 	}
 	return nil
 }
@@ -83,6 +80,11 @@ func (b *jsonBudget) visit(offset int64, depth int) error {
 func loadJSON(vm *VM, text string) (Value, error) {
 	if len(text) > maxJSONBytes {
 		return NoneValue(), invalidJSON(maxJSONBytes+1, "byte limit exceeded")
+	}
+	if vm != nil {
+		if err := vm.chargeBytes(int64(len(text))); err != nil {
+			return NoneValue(), err
+		}
 	}
 	if err := checkJSONUnicode(vm, text); err != nil {
 		return NoneValue(), err
@@ -168,6 +170,11 @@ func readJSON(d *json.Decoder, budget *jsonBudget, depth int) (Value, error) {
 	if err := budget.visit(offset, depth); err != nil {
 		return NoneValue(), err
 	}
+	if budget.vm != nil {
+		if err := budget.vm.chargeBytes(valueSlotBytes); err != nil {
+			return NoneValue(), err
+		}
+	}
 	token, err := jsonToken(d)
 	if err != nil {
 		return NoneValue(), err
@@ -212,6 +219,11 @@ func readJSON(d *json.Decoder, budget *jsonBudget, depth int) (Value, error) {
 				if err := budget.visit(keyOffset, depth+1); err != nil {
 					return NoneValue(), err
 				}
+				if budget.vm != nil {
+					if err := budget.vm.chargeBytes(2 * valueSlotBytes); err != nil {
+						return NoneValue(), err
+					}
+				}
 				keyToken, err := jsonToken(d)
 				if err != nil {
 					return NoneValue(), err
@@ -255,6 +267,11 @@ func dumpJSON(vm *VM, value Value) (string, error) {
 func (w *jsonWriter) write(s string) error {
 	if len(s) > maxJSONBytes-w.text.Len() {
 		return invalidJSON(0, "byte limit exceeded")
+	}
+	if w.vm != nil {
+		if err := w.vm.chargeBytes(int64(len(s))); err != nil {
+			return err
+		}
 	}
 	w.text.WriteString(s)
 	return nil

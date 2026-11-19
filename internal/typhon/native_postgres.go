@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -104,6 +106,12 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 	}
 	config.MaxConns = 16
 	config.ConnConfig.ConnectTimeout = timeout
+	messageLimit := int(min(vm.engine.quotas.engineBytes, 64<<20))
+	config.ConnConfig.BuildFrontend = func(r io.Reader, w io.Writer) *pgproto3.Frontend {
+		frontend := pgproto3.NewFrontend(r, w)
+		frontend.SetMaxBodyLen(messageLimit)
+		return frontend
+	}
 	ctx, cancel := driverContext(vm, timeout)
 	defer cancel()
 	pool, err := pgxpool.NewWithConfig(ctx, config)
@@ -148,7 +156,7 @@ func nativePostgresConnect(vm *VM, args []Value) (Value, error) {
 			if err != nil {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
-			return postgresRows(vm, rows)
+			return postgresRows(vm, rows, cancel)
 		}),
 		"begin": driverFunc(typ.Members["begin"], func(vm *VM, args []Value) (Value, error) {
 			if db.closed.Load() {
@@ -207,7 +215,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			if err != nil {
 				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
 			}
-			return postgresRows(vm, rows)
+			return postgresRows(vm, rows, cancel)
 		}),
 		"commit": driverFunc(typ.Members["commit"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
@@ -328,11 +336,20 @@ func postgresValue(value any, depth int) (Value, error) {
 	}
 }
 
-func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
-	defer rows.Close()
+func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc) (_ Value, runErr error) {
+	defer func() {
+		var quota *QuotaError
+		if errors.As(runErr, &quota) {
+			cancel()
+		}
+		rows.Close()
+	}()
 	var columns []Value
 	index := map[string]int{}
 	for i, field := range rows.FieldDescriptions() {
+		if err := vm.chargeBytes(int64(len(field.Name)) + valueSlotBytes); err != nil {
+			return NoneValue(), err
+		}
 		columns = append(columns, StringValue(field.Name))
 		index[field.Name] = i
 	}
@@ -341,8 +358,13 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 		if err := vm.executionError(); err != nil {
 			return NoneValue(), err
 		}
-		if len(result) >= 100_000 {
-			return NoneValue(), fmt.Errorf("PostgreSQL row limit exceeded; use LIMIT")
+		if err := vm.chargeSQLRow(); err != nil {
+			return NoneValue(), err
+		}
+		for _, column := range rows.RawValues() {
+			if err := vm.chargeBytes(2*int64(len(column)) + valueSlotBytes); err != nil {
+				return NoneValue(), err
+			}
 		}
 		values, err := rows.Values()
 		if err != nil {
@@ -352,6 +374,9 @@ func postgresRows(vm *VM, rows pgx.Rows) (Value, error) {
 		for _, value := range values {
 			converted, err := postgresValue(value, 0)
 			if err != nil {
+				return NoneValue(), err
+			}
+			if err := vm.chargeValue(converted, 0); err != nil {
 				return NoneValue(), err
 			}
 			row = append(row, converted)

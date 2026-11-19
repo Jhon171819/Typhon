@@ -59,6 +59,8 @@ WebSocket ou upload multipart nesta API; o corpo completo fica em memória,
 com limite de 8 MiB para requests e responses. Headers fornecidos são pares
 `[nome, valor]`; nomes inválidos e quebras de linha são rejeitados.
 `req.json()` decodifica o corpo com o mesmo codec de `json.loads`.
+O [orçamento lógico](request_budgets.md) pode impor um teto menor e
+também considera bytes materializados pelo PostgreSQL e os corpos HTTP.
 
 Com a configuração padrão o servidor recebe até 16 requisições em
 processamento/fila e retorna 503 quando esse limite é atingido. Cada

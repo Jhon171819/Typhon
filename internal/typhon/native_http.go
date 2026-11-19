@@ -67,10 +67,11 @@ func httpDriverExports(types map[string]Type) map[string]Value {
 	})
 	exports["serve"] = driverFunc(types["serve"], nativeHTTPServe)
 	exports["server_stats"] = driverFunc(types["server_stats"], func(vm *VM, args []Value) (Value, error) {
-		if vm.engine.httpMetrics == nil {
+		metrics := vm.engine.httpMetrics.Load()
+		if metrics == nil {
 			return DictValue(), nil
 		}
-		return vm.engine.httpMetrics.snapshot(), nil
+		return metrics.snapshot(), nil
 	})
 	exports["env"] = driverFunc(types["env"], driverEnv)
 	return exports
@@ -111,6 +112,9 @@ func httpResponse(vm *VM, status int64, body string, headers http.Header) (Value
 	if len(body) > maxHTTPBody {
 		return NoneValue(), fmt.Errorf("HTTP body limit exceeded")
 	}
+	if err := vm.chargeBytes(int64(len(body))); err != nil {
+		return NoneValue(), err
+	}
 	typ := httpDriverTypes()["Response"]
 	value := nativeObject(vm, typ, map[string]Value{
 		"status": IntValue(status), "body": StringValue(body),
@@ -148,6 +152,9 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		if len(args[2].Str) > maxHTTPBody {
 			return NoneValue(), fmt.Errorf("HTTP body limit exceeded")
 		}
+		if err := vm.chargeBytes(int64(len(args[2].Str))); err != nil {
+			return NoneValue(), err
+		}
 		ctx, cancel := driverContext(vm, timeout)
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, args[0].Str, args[1].Str, strings.NewReader(args[2].Str))
@@ -167,7 +174,9 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		if err != nil {
 			return NoneValue(), driverFailure("HTTP", connectionKind, err)
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody+1))
+		budget := vm.executionBudget()
+		limit := min(int64(maxHTTPBody), budget.byteLimit-budget.bytes)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		closeErr := driverFailure("HTTP", connectionKind, resp.Body.Close())
 		if err != nil {
 			reportCleanupError("HTTP response body close", closeErr)
@@ -175,6 +184,9 @@ func nativeHTTPClient(vm *VM, args []Value) (Value, error) {
 		}
 		if closeErr != nil {
 			return NoneValue(), closeErr
+		}
+		if int64(len(body)) > limit && limit < maxHTTPBody {
+			return NoneValue(), quotaStop("byte", budget.byteLimit)
 		}
 		return httpResponse(vm, int64(resp.StatusCode), string(body), resp.Header)
 	}
@@ -214,13 +226,19 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			writeHTTPStop(writer, engine.ctx, ctx.Err())
 			return
 		}
-		body, err := readHTTPRequestBody(writer, req, ctx)
+		body, err := readHTTPRequestBody(writer, req, ctx, min(int64(maxHTTPBody), engine.quotas.requestBytes-valueSlotBytes))
 		if ctx.Err() != nil {
 			writeHTTPStop(writer, engine.ctx, ctx.Err())
 			return
 		}
 		if err != nil {
 			var network net.Error
+			var oversized *http.MaxBytesError
+			if errors.As(err, &oversized) {
+				if metrics := engine.httpMetrics.Load(); metrics != nil {
+					metrics.quotaRejected.Add(1)
+				}
+			}
 			if errors.As(err, &network) && network.Timeout() {
 				http.Error(writer, "request body timed out", http.StatusRequestTimeout)
 			} else {
@@ -230,6 +248,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		}
 		scope := &requestScope{cancel: cancel}
 		child := &VM{engine: engine, ctx: ctx, request: scope, depth: 1}
+		child.executionBudget().bytes = int64(len(body)) + valueSlotBytes
 		typ := httpDriverTypes()["Request"]
 		bodyText := string(body)
 		attrs := map[string]Value{
@@ -264,11 +283,19 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			writeHTTPStop(writer, engine.ctx, stopped.cause)
 			return
 		}
-		runErr = finalizeRun(runErr, cleanupErr)
-		if runErr != nil {
-			log.Printf("Typhon HTTP handler: %v", runErr)
+		primary := runErr
+		if primary == nil {
+			primary = cleanupErr
+		}
+		if primary != nil {
+			log.Printf("Typhon HTTP handler: %v", finalizeRun(runErr, cleanupErr))
+			var quota *QuotaError
+			if errors.As(primary, &quota) {
+				writeHTTPQuota(writer, engine, quota)
+				return
+			}
 			var ex *Exception
-			if errors.As(runErr, &ex) && ex.kind == timeoutKind {
+			if errors.As(primary, &ex) && ex.kind == timeoutKind {
 				http.Error(writer, "upstream operation timed out", http.StatusGatewayTimeout)
 				return
 			}
@@ -288,6 +315,13 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return
 		}
 		responseAttrs := result.NativeObject.Attrs
+		if err := child.executionBudget().chargeBytes(int64(len(responseAttrs["body"].Str))); err != nil {
+			var quota *QuotaError
+			if errors.As(err, &quota) {
+				writeHTTPQuota(writer, engine, quota)
+				return
+			}
+		}
 		headers := result.NativeObject.data.(http.Header)
 		for name, values := range headers {
 			writer.Header()[name] = values
@@ -297,24 +331,31 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 	})
 }
 
+func writeHTTPQuota(writer http.ResponseWriter, engine *Engine, quota *QuotaError) {
+	if metrics := engine.httpMetrics.Load(); metrics != nil {
+		metrics.quotaRejected.Add(1)
+	}
+	http.Error(writer, quota.Error(), http.StatusUnprocessableEntity)
+}
+
 func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	handler := args[1]
 	types := httpDriverTypes()
 	if handler.Kind != ValueFunction || len(handler.Function.Signature.Params) != 1 || !handler.Function.Signature.Params[0].Equal(types["Request"]) || handler.Function.Signature.Return == nil || !handler.Function.Signature.Return.Equal(types["Response"]) {
 		return NoneValue(), fmt.Errorf("handler must have signature (Request) -> Response")
 	}
-	if vm.engine.httpWorker || vm.engine.httpMetrics != nil {
+	if vm.engine.httpWorker || vm.engine.httpMetrics.Load() != nil {
 		return NoneValue(), fmt.Errorf("HTTP serve is unavailable during worker initialization or a running server")
 	}
-	workers, queue := int64(1), int64(15)
+	workers, queue := int64(1), min(int64(15), vm.engine.quotas.queue)
 	if len(args) > 2 {
 		workers = args[2].Int
 	}
 	if len(args) > 3 {
 		queue = args[3].Int
 	}
-	if workers < 1 || workers > 16 || queue < 0 || queue > 256 {
-		return NoneValue(), fmt.Errorf("HTTP serve requires 1 to 16 workers and a queue size from 0 to 256")
+	if workers < 1 || workers > 16 || queue < 0 || queue > vm.engine.quotas.queue {
+		return NoneValue(), fmt.Errorf("HTTP serve requires 1 to 16 workers and a queue size from 0 to %d", vm.engine.quotas.queue)
 	}
 	requestTimeout, err := driverTimeout(args, 4)
 	if err != nil {
@@ -326,9 +367,10 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	}
 	pool := newHTTPWorkerPool(vm.context(), int(workers), int(queue))
 	pool.requestTimeout = requestTimeout
-	vm.engine.httpMetrics = &pool.metrics
+	pool.liveness = vm.engine.quotas.liveness
+	vm.engine.httpMetrics.Store(&pool.metrics)
 	defer func() {
-		vm.engine.httpMetrics = nil
+		vm.engine.httpMetrics.Store(nil)
 		cleanupErr := pool.close()
 		if vm.context().Err() != nil {
 			reportCleanupError("HTTP workers", cleanupErr)
