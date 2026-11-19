@@ -56,6 +56,8 @@ The Go runtime currently supports:
   bounded cancellation cleanup and automatic rollback of open transactions.
 - [Native JSON](docs/native_json.md) for modules and HTTP, with exact int64
   parsing and bounded conversion.
+- [Payload schemas](docs/payload_validation.md) for typed validation and
+  field-level diagnostics.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
