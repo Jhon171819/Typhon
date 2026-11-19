@@ -105,6 +105,8 @@ The Go runtime currently supports:
   deployment step with checksums, revision history and a database lock.
 - [PostgreSQL tenant isolation](docs/postgres_rls.md) binds the authorized
   tenant to a transaction and illustrates row security and tenant-scoped cache.
+- [Redis tenant cache](docs/redis_cache.md) adds versioned JSON entries and
+  post-commit invalidation for authorized requests.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

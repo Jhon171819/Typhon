@@ -68,10 +68,10 @@ parameterized SQL. Application code with arbitrary SQL access can change a
 custom PostgreSQL setting, so keep the database credentials and SQL
 execution away from user-controlled code.
 
-The example serializes the verified tenant and record ID together for its
-Redis key. Cache reads occur after route authorization. Successful writes
-invalidate the corresponding key after commit. Its ten-second TTL bounds
-the lifetime of a stale entry if a concurrent read races an invalidation.
+The example uses the [tenant Redis cache](redis_cache.md) for record lookup.
+Cache reads occur after route authorization. Successful writes invalidate
+the corresponding key after commit. That invalidation also revokes the
+token of an in-flight cache fill that began before the write.
 
 ## Operator audit
 

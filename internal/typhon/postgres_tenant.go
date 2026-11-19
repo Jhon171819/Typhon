@@ -17,10 +17,9 @@ const postgresPrivilegedRole = `SELECT EXISTS (
 
 func (db *postgresConnection) tenantTransaction(vm *VM, args []Value) (Value, error) {
 	request := args[0]
-	state, ok := request.NativeObject.data.(*webRequest)
-	if !ok || vm.request == nil || vm.request.web != state || state.authorizationAction == "" ||
-		!validAuthText(state.principal.subject, 256) || !validAuthText(state.principal.tenant, 256) {
-		return NoneValue(), (&webRejection{status: 403}).exception()
+	state, err := authorizedTenantRequest(vm, request)
+	if err != nil {
+		return NoneValue(), err
 	}
 	principal, action := state.principal, state.authorizationAction
 	value, err := db.scopedTransaction(vm, args[1], args[2:], func(tx *postgresTransaction) error {

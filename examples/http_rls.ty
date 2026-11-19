@@ -7,17 +7,14 @@ import typhon.web as web
 
 pool_options: dict[str, Any] = {'max_connections': 1, 'share': 'tenant_records'}
 db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), pool_options)
-cache: redis.Connection = redis.connect(redis.env('REDIS_URL'))
+redis_pool: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 4, 0, 0.5, 0.5, 0.5, False)
+cache: redis.Cache = redis_pool.cache('records', 1, 10)
 token: auth.Authenticator = auth.jwt(
     http.env('AUTH_ISSUER'), http.env('AUTH_AUDIENCE'), http.env('AUTH_JWKS_URL')
 )
 policy: auth.Policy = auth.policy({'member': ['records:read', 'records:write']})
 routes: web.Router = web.router()
 routes.use_errors()
-
-def cache_key(req: http.Request) -> str:
-    fields: list[Any] = [req.tenant, req.param('id')]
-    return 'typhon:rls:records:v1:' + json.dumps(fields)
 
 def read_record(tx: pg.Transaction, req: http.Request) -> Any:
     rows: pg.Rows = tx.query('SELECT label FROM tenant_records WHERE id = $1', [req.param('id')])
@@ -44,34 +41,42 @@ def delete_record(tx: pg.Transaction, req: http.Request) -> Any:
     return affected
 
 def read(req: http.Request) -> http.Response:
-    key: str = cache_key(req)
-    stored: str | None = cache.get(key)
-    if stored is not None:
-        return http.response(200, stored, [['Content-Type', 'application/json']])
+    key: str = req.param('id')
+    entry: redis.CacheEntry | None = None
+    try:
+        cached: redis.CacheEntry = cache.lookup(req, key)
+        if cached.hit:
+            return http.json(200, cached.value)
+        entry = cached
+    except Error as err:
+        print('record cache lookup failed', req.request_id, err.kind)
     value: Any = db.tenant_transaction(req, read_record, 'read_committed', True)
     if value is None:
         return web.problem(req, 404)
-    body: str = json.dumps(value)
-    cache.set(key, body, 10)
-    return http.response(200, body, [['Content-Type', 'application/json']])
+    if entry is not None:
+        try:
+            entry.store(req, value)
+        except Error as err:
+            print('record cache fill failed', req.request_id, err.kind)
+    return http.json(200, value)
 
 def create(req: http.Request) -> http.Response:
     db.tenant_transaction(req, create_record)
-    cache.delete(cache_key(req))
+    cache.invalidate(req, req.param('id'))
     return http.response(201, 'created')
 
 def update(req: http.Request) -> http.Response:
     edited: int = db.tenant_transaction(req, update_record)
     if edited == 0:
         return web.problem(req, 404)
-    cache.delete(cache_key(req))
+    cache.invalidate(req, req.param('id'))
     return http.response(204, '')
 
 def remove(req: http.Request) -> http.Response:
     removed: int = db.tenant_transaction(req, delete_record)
     if removed == 0:
         return web.problem(req, 404)
-    cache.delete(cache_key(req))
+    cache.invalidate(req, req.param('id'))
     return http.response(204, '')
 
 routes.add('GET', '/records/{id}', read)

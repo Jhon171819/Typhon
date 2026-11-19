@@ -47,9 +47,23 @@ def retry(req: http.Request) -> http.Response:
     value: Any = db.tenant_transaction(req, retry_record, 'serializable', False, 1)
     return http.response(200, json.dumps(value))
 
+def undo_record(tx: pg.Transaction, req: http.Request) -> Any:
+    return tx.exec("UPDATE tenant_records SET label = 'uncommitted' WHERE id = 'shared'", [])
+
+def undo(req: http.Request) -> http.Response:
+    return http.json(200, db.tenant_transaction(req, undo_record))
+
+def drop_cache(req: http.Request) -> http.Response:
+    redis_pool.close()
+    return http.response(204, '')
+
 routes.add('POST', '/retry', retry)
 routes.require_auth('POST', '/retry', token)
 routes.authorize('POST', '/retry', policy, 'records:write')
+routes.add('POST', '/undo', undo)
+routes.require_auth('POST', '/undo', token)
+routes.authorize('POST', '/undo', policy, 'records:write')
+routes.add('POST', '/drop-cache', drop_cache)
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +75,9 @@ routes.authorize('POST', '/retry', policy, 'records:write')
 	router, _ := routerValue(routes)
 	router.frozen = true
 	for _, route := range router.routes {
-		route.auth = identity
+		if route.auth != nil {
+			route.auth = identity
+		}
 	}
 	return module.Globals["db"].NativeObject.data.(*postgresConnection), httpVMHandler(engine, routes)
 }
@@ -195,12 +211,16 @@ func TestNativePostgresTenantIsolationIntegration(t *testing.T) {
 	send(handler, "GET", "/records/created", "a", "", 200, "alpha-only")
 	send(handler, "PUT", "/records/shared", "a", "alpha-updated", 204, "")
 	send(handler, "GET", "/records/shared", "a", "", 200, "alpha-updated")
+	send(handler, "POST", "/undo", "a", "", 200, "1")
+	send(handler, "GET", "/records/shared", "a", "", 200, "alpha-updated")
 	send(handler, "GET", "/records/shared", "b", "", 200, "beta")
 	send(handler, "DELETE", "/records/shared", "a", "", 204, "")
 	send(handler, "GET", "/records/shared", "a", "", 404, "")
 	send(handler, "GET", "/records/shared", "b", "", 200, "beta")
 	send(handler, "POST", "/retry", "a", "", 200, `["`+tenantA+`", 2]`)
 	send(handler, "GET", "/records/retried", "b", "", 404, "")
+	send(handler, "GET", "/records/retried", "a", "", 200, "after retry")
+	send(handler, "POST", "/drop-cache", "", "", 204, "")
 	send(handler, "GET", "/records/retried", "a", "", 200, "after retry")
 	checkScope(pid)
 

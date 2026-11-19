@@ -69,6 +69,15 @@ func (p *webPolicy) allows(identity verifiedRequestIdentity, action string) bool
 	return false
 }
 
+func authorizedTenantRequest(vm *VM, request Value) (*webRequest, error) {
+	state, ok := request.NativeObject.data.(*webRequest)
+	if !ok || vm.request == nil || vm.request.web != state || state.authorizationAction == "" ||
+		!validAuthText(state.principal.subject, 256) || !validAuthText(state.principal.tenant, 256) {
+		return nil, (&webRejection{status: 403}).exception()
+	}
+	return state, nil
+}
+
 func logWebAuthorization(id, pattern, action string, allowed bool) {
 	log.Printf("Typhon authorization id=%s route=%q action=%q allowed=%t", id, pattern, action, allowed)
 }
