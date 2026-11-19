@@ -18,6 +18,7 @@ const (
 type quotaLimits struct {
 	engineBytes, requestBytes int64
 	work, sqlRows, queue      int64
+	sqlCursorRows             int64
 	liveness                  string
 }
 
@@ -32,6 +33,7 @@ func configuredQuotas() (quotaLimits, error) {
 		{"TYPHON_LIMIT_REQUEST_BYTES", &limits.requestBytes, 1024, 256 << 20},
 		{"TYPHON_LIMIT_INSTRUCTIONS", &limits.work, 1, 50_000_000},
 		{"TYPHON_LIMIT_SQL_ROWS", &limits.sqlRows, 1, defaultSQLRows},
+		{"TYPHON_LIMIT_SQL_CURSOR_ROWS", &limits.sqlCursorRows, 1, 10_000_000},
 		{"TYPHON_LIMIT_HTTP_QUEUE", &limits.queue, 0, maxQueuedHTTP},
 	} {
 		text, exists := os.LookupEnv(option.name)
@@ -127,6 +129,19 @@ func (vm *VM) chargeSQLRow() error {
 	b := vm.executionBudget()
 	if b.rows >= b.rowLimit {
 		return quotaStop("SQL row", b.rowLimit)
+	}
+	b.rows++
+	return vm.chargeWork()
+}
+
+func (vm *VM) chargeSQLCursorRow() error {
+	b := vm.executionBudget()
+	limit := vm.engine.quotas.sqlCursorRows
+	if limit == 0 {
+		limit = b.rowLimit
+	}
+	if b.rows >= limit {
+		return quotaStop("SQL cursor row", limit)
 	}
 	b.rows++
 	return vm.chargeWork()

@@ -19,6 +19,7 @@ import (
 )
 
 func postgresDriverTypes() map[string]Type {
+	cursor := postgresCursorType()
 	rows := Type{Kind: TypeNative, Name: "typhon.postgres.Rows", Members: map[string]Type{
 		"count": IntType(), "columns": listType(StrType()),
 		"get": nativeFuncType("postgres.rows.get", []Type{IntType(), StrType()}, AnyType(), 0),
@@ -26,8 +27,9 @@ func postgresDriverTypes() map[string]Type {
 	}}
 	methods := func() map[string]Type {
 		return map[string]Type{
-			"exec":  nativeFuncType("postgres.exec", []Type{StrType(), listType(AnyType())}, IntType(), 1),
-			"query": nativeFuncType("postgres.query", []Type{StrType(), listType(AnyType())}, rows, 1),
+			"exec":   nativeFuncType("postgres.exec", []Type{StrType(), listType(AnyType())}, IntType(), 1),
+			"query":  nativeFuncType("postgres.query", []Type{StrType(), listType(AnyType())}, rows, 1),
+			"cursor": nativeFuncType("postgres.cursor", []Type{StrType(), listType(AnyType()), IntType()}, cursor, 2),
 		}
 	}
 	tx := Type{Kind: TypeNative, Name: "typhon.postgres.Transaction", Members: methods()}
@@ -41,7 +43,7 @@ func postgresDriverTypes() map[string]Type {
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
 	connection.Members["stats"] = nativeFuncType("postgres.stats", nil, dictType(StrType(), IntType()), 0)
 	types := map[string]Type{
-		"Rows": rows, "Transaction": tx, "Connection": connection,
+		"Rows": rows, "Cursor": cursor, "Transaction": tx, "Connection": connection,
 		"connect":        nativeFuncType("postgres.connect", []Type{StrType(), FloatType()}, connection, 1),
 		"connect_typed":  nativeFuncType("postgres.connect_typed", []Type{StrType(), FloatType()}, connection, 1),
 		"connect_pooled": nativeFuncType("postgres.connect_pooled", []Type{StrType(), dictType(StrType(), AnyType())}, connection, 0),
@@ -75,6 +77,7 @@ type postgresConnection struct {
 	closing   atomic.Bool
 	closed    atomic.Bool
 	txs       resourceScope
+	cursors   resourceScope
 	release   func()
 	closeOnce sync.Once
 	closeErr  error
@@ -83,17 +86,20 @@ type postgresConnection struct {
 }
 
 type postgresTransaction struct {
-	scope     *resourceScope
-	parent    *postgresConnection
-	tx        pgx.Tx
-	conn      *pgxpool.Conn
-	ctx       context.Context
-	cancel    context.CancelFunc
-	done      chan struct{}
-	mu        sync.Mutex
-	ended     bool
-	committed bool
-	commitErr error
+	scope          *resourceScope
+	parent         *postgresConnection
+	tx             pgx.Tx
+	conn           *pgxpool.Conn
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	mu             sync.Mutex
+	ended          bool
+	committed      bool
+	commitErr      error
+	cursors        resourceScope
+	cursor         atomic.Pointer[postgresCursor]
+	cursorRollback atomic.Bool
 }
 
 func (db *postgresConnection) close(ctx context.Context) error {
@@ -124,7 +130,7 @@ func (db *postgresConnection) close(ctx context.Context) error {
 			tx.cancel()
 		}
 		db.scope.remove(db)
-		db.closeErr = db.txs.close(ctx)
+		db.closeErr = errors.Join(db.cursors.close(ctx), db.txs.close(ctx))
 		db.release()
 	})
 	return db.closeErr
@@ -136,12 +142,29 @@ func (tx *postgresTransaction) rollback(ctx context.Context) error {
 	if tx.ended {
 		return nil
 	}
-	err := tx.tx.Rollback(ctx)
+	cursorErr := tx.cursors.close(ctx)
+	var err error
+	if !tx.tx.Conn().PgConn().IsClosed() {
+		err = tx.tx.Rollback(ctx)
+	}
 	tx.finish()
 	if errors.Is(err, pgx.ErrTxClosed) {
-		return nil
+		return cursorErr
 	}
-	return driverFailure("PostgreSQL", databaseKind, err)
+	return errors.Join(cursorErr, driverFailure("PostgreSQL", databaseKind, err))
+}
+
+func (tx *postgresTransaction) commandAllowed() error {
+	if tx.ended || tx.parent.closed.Load() {
+		return errors.New("PostgreSQL transaction is closed")
+	}
+	if tx.cursor.Load() != nil {
+		return errors.New("consume or close the PostgreSQL cursor before another transaction command")
+	}
+	if tx.cursorRollback.Load() {
+		return errors.New("roll back the PostgreSQL transaction after a cursor closed early or failed")
+	}
+	return nil
 }
 
 func (tx *postgresTransaction) finish() {
@@ -312,6 +335,7 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 			return postgresTxValue(vm, tx), nil
 		}),
 		"transaction": driverFunc(typ.Members["transaction"], db.transaction),
+		"cursor":      driverFunc(typ.Members["cursor"], db.cursor),
 	}
 	value := scopedNativeObject(vm, typ, attrs)
 	value.NativeObject.data = db
@@ -324,8 +348,8 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
-			if tx.ended || tx.parent.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
+			if err := tx.commandAllowed(); err != nil {
+				return NoneValue(), err
 			}
 			params, err := postgresParams(vm, args)
 			if err != nil {
@@ -339,8 +363,8 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 		"query": driverFunc(typ.Members["query"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
-			if tx.ended || tx.parent.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
+			if err := tx.commandAllowed(); err != nil {
+				return NoneValue(), err
 			}
 			params, err := postgresParams(vm, args)
 			if err != nil {
@@ -357,8 +381,8 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 		"commit": driverFunc(typ.Members["commit"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
-			if tx.ended || tx.parent.closed.Load() {
-				return NoneValue(), fmt.Errorf("PostgreSQL transaction is closed")
+			if err := tx.commandAllowed(); err != nil {
+				return NoneValue(), err
 			}
 			ctx, cancel := tx.operation(vm)
 			defer cancel()
@@ -369,6 +393,7 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			return NoneValue(), tx.commitErr
 		}),
 		"rollback": driverCloser(typ.Members["rollback"], tx.rollback),
+		"cursor":   driverFunc(typ.Members["cursor"], tx.openCursor),
 	})
 	value.NativeObject.data = tx
 	return value
@@ -543,37 +568,9 @@ func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc, typed bool) 
 		if err := vm.chargeSQLRow(); err != nil {
 			return NoneValue(), err
 		}
-		for _, column := range rows.RawValues() {
-			if err := vm.chargeBytes(2*int64(len(column)) + valueSlotBytes); err != nil {
-				return NoneValue(), err
-			}
-		}
-		var values []any
-		var err error
-		if typed {
-			values = postgresScanTargets(fields)
-			err = rows.Scan(values...)
-		} else {
-			values, err = rows.Values()
-		}
+		row, err := postgresDecodedRow(vm, rows, typed)
 		if err != nil {
-			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
-		}
-		var row []Value
-		for _, value := range values {
-			var converted Value
-			if typed {
-				converted, err = postgresTypedValue(vm, value)
-			} else {
-				converted, err = postgresValue(value, 0)
-			}
-			if err != nil {
-				return NoneValue(), err
-			}
-			if err := vm.chargeValue(converted, 0); err != nil {
-				return NoneValue(), err
-			}
-			row = append(row, converted)
+			return NoneValue(), err
 		}
 		result = append(result, row)
 	}
@@ -608,4 +605,40 @@ func postgresRows(vm *VM, rows pgx.Rows, cancel context.CancelFunc, typed bool) 
 			return ListValue(row), nil
 		}),
 	}), nil
+}
+
+func postgresDecodedRow(vm *VM, rows pgx.Rows, typed bool) ([]Value, error) {
+	for _, column := range rows.RawValues() {
+		if err := vm.chargeBytes(2*int64(len(column)) + valueSlotBytes); err != nil {
+			return nil, err
+		}
+	}
+	var values []any
+	var err error
+	if typed {
+		values = postgresScanTargets(rows.FieldDescriptions())
+		err = rows.Scan(values...)
+	} else {
+		values, err = rows.Values()
+	}
+	if err != nil {
+		return nil, driverFailure("PostgreSQL", databaseKind, err)
+	}
+	row := make([]Value, 0, len(values))
+	for _, value := range values {
+		var converted Value
+		if typed {
+			converted, err = postgresTypedValue(vm, value)
+		} else {
+			converted, err = postgresValue(value, 0)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := vm.chargeValue(converted, 0); err != nil {
+			return nil, err
+		}
+		row = append(row, converted)
+	}
+	return row, nil
 }

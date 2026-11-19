@@ -97,6 +97,8 @@ The Go runtime currently supports:
   budget across HTTP workers and expose saturation metrics.
 - [Scoped PostgreSQL transactions](docs/postgres_transactions.md) provide
   explicit commit, bounded rollback and opt-in SQLSTATE retry.
+- [Streaming PostgreSQL cursors](docs/postgres_cursor.md) read bounded
+  batches and release their connections on EOF, close, or cancellation.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
