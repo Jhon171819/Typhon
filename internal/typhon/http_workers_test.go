@@ -152,6 +152,8 @@ func TestNativeHTTPWorkerBackpressureAndCancellation(t *testing.T) {
 	if status := workerStatus(pool, context.Background()); status != 503 {
 		t.Fatalf("overload returned %d", status)
 	}
+	// Let the queued interval span a clock tick even on Windows.
+	time.Sleep(time.Millisecond)
 	cancel()
 	select {
 	case status := <-queued:
@@ -163,7 +165,8 @@ func TestNativeHTTPWorkerBackpressureAndCancellation(t *testing.T) {
 	}
 	if pool.metrics.rejected.Load() != 2 || pool.metrics.waiting.Load() != 0 ||
 		pool.metrics.peak.Load() != 1 || pool.metrics.waitNS.Load() == 0 {
-		t.Fatal("incorrect queue or rejection metrics")
+		t.Fatalf("incorrect queue metrics: rejected=%d waiting=%d peak=%d wait_ns=%d",
+			pool.metrics.rejected.Load(), pool.metrics.waiting.Load(), pool.metrics.peak.Load(), pool.metrics.waitNS.Load())
 	}
 }
 
