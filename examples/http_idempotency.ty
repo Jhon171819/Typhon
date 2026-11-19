@@ -1,0 +1,49 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.redis as redis
+import typhon.web as web
+
+options: dict[str, Any] = {'max_connections': 2, 'share': 'orders'}
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), options)
+coordinator: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 4, 0, 0.5, 0.5, 0.5, False)
+token: auth.Authenticator = auth.jwt(
+    http.env('AUTH_ISSUER'), http.env('AUTH_AUDIENCE'), http.env('AUTH_JWKS_URL')
+)
+policy: auth.Policy = auth.policy({'buyer': ['orders:create']})
+routes: web.Router = web.router()
+routes.use_errors()
+
+def insert_order(tx: pg.Transaction, req: http.Request) -> Any:
+    fingerprint: str | None = req.idempotency_fingerprint
+    if fingerprint is None:
+        raise web.reject(403)
+    actor: str | None = req.identity
+    key: str = req.header('Idempotency-Key')
+    result: pg.Rows = tx.query(
+        "INSERT INTO idempotent_orders (tenant_id, actor, request_key, fingerprint, item) VALUES (pg_catalog.current_setting('typhon.tenant_id'), $1, $2, $3, $4) ON CONFLICT (tenant_id, actor, request_key) DO NOTHING RETURNING id, fingerprint, item",
+        [actor, key, fingerprint, req.body]
+    )
+    if result.count == 0:
+        result = tx.query(
+            'SELECT id, fingerprint, item FROM idempotent_orders WHERE actor = $1 AND request_key = $2',
+            [actor, key]
+        )
+        if result.count != 1 or result.get(0, 'fingerprint') != fingerprint:
+            raise web.reject(409)
+    tx.commit()
+    return {'id': result.get(0, 'id'), 'item': result.get(0, 'item')}
+
+def order(req: http.Request) -> http.Response:
+    if len(req.body) == 0 or len(req.body) > 80:
+        return web.problem(req, 422)
+    result: Any = db.tenant_transaction(req, insert_order)
+    return http.json(201, result)
+
+routes.add('POST', '/orders', order)
+routes.require_auth('POST', '/orders', token)
+routes.authorize('POST', '/orders', policy, 'orders:create')
+routes.idempotency('POST', '/orders', coordinator, 'orders-v1')
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes, 4, 128)

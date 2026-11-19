@@ -82,7 +82,7 @@ routes.add('POST', '/drop-cache', drop_cache)
 	return module.Globals["db"].NativeObject.data.(*postgresConnection), httpVMHandler(engine, routes)
 }
 
-func tenantTestRole(t *testing.T, ctx context.Context, admin *pgx.Conn, schema, dsn string) string {
+func tenantTestRole(t *testing.T, ctx context.Context, admin *pgx.Conn, schema, dsn, table string) string {
 	t.Helper()
 	role := "typhon_api_" + strings.ToLower(rand.Text())
 	identifier := pgx.Identifier{role}.Sanitize()
@@ -102,7 +102,7 @@ func tenantTestRole(t *testing.T, ctx context.Context, admin *pgx.Conn, schema, 
 	})
 	for _, sql := range []string{
 		"GRANT USAGE ON SCHEMA " + schema + " TO " + identifier,
-		"GRANT SELECT, INSERT, UPDATE, DELETE ON " + schema + ".tenant_records TO " + identifier,
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON " + schema + "." + pgx.Identifier{table}.Sanitize() + " TO " + identifier,
 	} {
 		if _, err := admin.Exec(ctx, sql); err != nil {
 			t.Fatal(driverFailure("PostgreSQL", databaseKind, err))
@@ -143,7 +143,7 @@ func TestNativePostgresTenantIsolationIntegration(t *testing.T) {
 	if err := RunMigrations(ctx, adminDSN, filepath.Join("..", "..", "examples", "rls", "migrations"), "up", io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	dsn := tenantTestRole(t, ctx, admin, schema, adminDSN)
+	dsn := tenantTestRole(t, ctx, admin, schema, adminDSN, "tenant_records")
 	tenantA, tenantB := rand.Text(), rand.Text()
 	if _, err := admin.Exec(ctx, "INSERT INTO "+schema+".tenant_records (tenant_id,id,label) VALUES ($1,'shared','alpha'), ($2,'shared','beta'), ($2,'private','beta-private')", tenantA, tenantB); err != nil {
 		t.Fatal(err)

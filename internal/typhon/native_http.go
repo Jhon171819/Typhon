@@ -23,17 +23,18 @@ func httpDriverTypes() map[string]Type {
 	}}
 	request := Type{Kind: TypeNative, Name: "typhon.http.Request", Members: map[string]Type{
 		"method": StrType(), "path": StrType(), "body": StrType(), "header": header,
-		"query":      nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
-		"query_all":  nativeFuncType("http.query_all", []Type{StrType()}, listType(StrType()), 0),
-		"param":      nativeFuncType("http.param", []Type{StrType()}, StrType(), 0),
-		"json":       nativeFuncType("http.request.json", nil, AnyType(), 0),
-		"remaining":  nativeFuncType("http.request.remaining", nil, FloatType(), 0),
-		"cancelled":  nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
-		"request_id": StrType(),
-		"identity":   unionType(StrType(), NoneType()),
-		"tenant":     unionType(StrType(), NoneType()),
-		"state":      nativeFuncType("http.request.state", []Type{StrType()}, unionType(StrType(), NoneType()), 0),
-		"set_state":  nativeFuncType("http.request.set_state", []Type{StrType(), StrType()}, NoneType(), 0),
+		"query":                   nativeFuncType("http.query", []Type{StrType()}, StrType(), 0),
+		"query_all":               nativeFuncType("http.query_all", []Type{StrType()}, listType(StrType()), 0),
+		"param":                   nativeFuncType("http.param", []Type{StrType()}, StrType(), 0),
+		"json":                    nativeFuncType("http.request.json", nil, AnyType(), 0),
+		"remaining":               nativeFuncType("http.request.remaining", nil, FloatType(), 0),
+		"cancelled":               nativeFuncType("http.request.cancelled", nil, BoolType(), 0),
+		"request_id":              StrType(),
+		"identity":                unionType(StrType(), NoneType()),
+		"tenant":                  unionType(StrType(), NoneType()),
+		"idempotency_fingerprint": unionType(StrType(), NoneType()),
+		"state":                   nativeFuncType("http.request.state", []Type{StrType()}, unionType(StrType(), NoneType()), 0),
+		"set_state":               nativeFuncType("http.request.set_state", []Type{StrType(), StrType()}, NoneType(), 0),
 	}}
 	headers := listType(listType(StrType()))
 	bodyType, form, part := httpStreamTypes()
@@ -368,6 +369,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		attrs["request_id"] = StringValue(webState.id)
 		attrs["identity"] = optionalWebString(webState.principal.subject, webState.principal.subject != "")
 		attrs["tenant"] = optionalWebString(webState.principal.tenant, webState.principal.tenant != "")
+		attrs["idempotency_fingerprint"] = NoneValue()
 		attrs["state"] = driverFunc(typ.Members["state"], func(vm *VM, args []Value) (Value, error) {
 			value, exists := webState.state[args[0].Str]
 			return optionalWebString(value, exists), nil

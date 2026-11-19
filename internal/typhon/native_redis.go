@@ -38,11 +38,14 @@ func redisDriverTypes() map[string]Type {
 	connection.Members["stats"] = nativeFuncType("redis.stats", nil, dictType(StrType(), IntType()), 0)
 	cache, entry := redisCacheTypes()
 	connection.Members["cache"] = nativeFuncType("redis.cache", []Type{StrType(), IntType(), FloatType()}, cache, 1)
+	lock := redisLockType()
+	connection.Members["lock"] = nativeFuncType("redis.lock", []Type{StrType(), FloatType()}, unionType(lock, NoneType()), 0)
 	return map[string]Type{
 		"Connection":        connection,
 		"Result":            result,
 		"Cache":             cache,
 		"CacheEntry":        entry,
+		"Lock":              lock,
 		"connect":           nativeFuncType("redis.connect", []Type{StrType(), FloatType()}, connection, 1),
 		"connect_with_pool": nativeFuncType("redis.connect_with_pool", []Type{StrType(), IntType(), IntType(), FloatType(), FloatType(), FloatType(), BoolType()}, connection, 4),
 		"env":               nativeFuncType("redis.env", []Type{StrType()}, StrType(), 0),
@@ -110,6 +113,16 @@ func (db *redisConnection) start(ctx context.Context, timeout time.Duration) (co
 			}
 		}
 	}
+}
+
+func (db *redisConnection) run(ctx context.Context, timeout time.Duration, operation func(context.Context) error) error {
+	if db.closed.Load() {
+		return &Exception{kind: connectionKind, message: "Redis connection is closed"}
+	}
+	ctx, done := db.start(ctx, timeout)
+	err := operation(ctx)
+	done(err)
+	return driverFailure("Redis", databaseKind, err)
 }
 
 func (db *redisConnection) stats() Value {
@@ -196,6 +209,7 @@ func connectRedis(vm *VM, dsn string, poolSize, minIdle int, dialTimeout, read, 
 		return db.stats(), nil
 	})
 	attrs["cache"] = driverFunc(typ.Members["cache"], db.newCache)
+	attrs["lock"] = driverFunc(typ.Members["lock"], db.acquireLock)
 	for _, name := range []string{"ping", "get", "set", "delete", "exists", "incr", "ttl", "command", "pipeline", "mget", "mset", "hget", "hset"} {
 		attrs[name] = driverFunc(typ.Members[name], func(vm *VM, args []Value) (_ Value, runErr error) {
 			if db.closed.Load() {

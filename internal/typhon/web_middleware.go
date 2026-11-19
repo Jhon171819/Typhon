@@ -28,7 +28,12 @@ func newWebRequest(req *http.Request) *webRequest {
 		!utf8.ValidString(principal.subject) || !utf8.ValidString(principal.tenant) {
 		principal = verifiedRequestIdentity{}
 	}
-	return &webRequest{path: req.URL.EscapedPath(), rawQuery: req.URL.RawQuery, id: rand.Text(), principal: principal, bearer: bearerToken(req.Header.Values("Authorization"))}
+	state := &webRequest{path: req.URL.EscapedPath(), rawQuery: req.URL.RawQuery, id: rand.Text(), principal: principal,
+		bearer: bearerToken(req.Header.Values("Authorization")), contentType: req.Header.Get("Content-Type")}
+	if keys := req.Header.Values("Idempotency-Key"); len(keys) == 1 {
+		state.idempotencyKey = keys[0]
+	}
+	return state
 }
 
 func webNextType() Type {
@@ -80,6 +85,9 @@ func (p webPipeline) run(vm *VM, index int) (Value, error) {
 	case index-len(p.routerSteps) < len(p.route.steps):
 		step = p.route.steps[index-len(p.routerSteps)]
 	default:
+		if p.route.idempotency != nil {
+			return p.route.idempotency.call(vm, p)
+		}
 		return vm.callValue(p.route.handler, []Value{p.request}, nil)
 	}
 	switch step.native {

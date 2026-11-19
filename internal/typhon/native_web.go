@@ -17,17 +17,18 @@ const maxWebPath = 4096
 const maxWebSegments = 32
 
 type webRoute struct {
-	handler Value
-	names   []string
-	pattern string
-	steps   []webStep
-	auth    webAuthenticator
-	policy  *webPolicy
-	action  string
-	rate    *webRouteRate
-	doc     *webRouteDoc
-	upload  *httpUploadPolicy
-	sse     *httpSSEPolicy
+	handler     Value
+	names       []string
+	pattern     string
+	steps       []webStep
+	auth        webAuthenticator
+	policy      *webPolicy
+	action      string
+	rate        *webRouteRate
+	doc         *webRouteDoc
+	upload      *httpUploadPolicy
+	sse         *httpSSEPolicy
+	idempotency *webIdempotency
 }
 
 type webNode struct {
@@ -60,6 +61,8 @@ type webRequest struct {
 	authorizationAction string
 	bearer              string
 	rateHeaders         http.Header
+	idempotencyKey      string
+	contentType         string
 }
 
 func httpHandlerType() Type {
@@ -86,6 +89,8 @@ func webDriverTypes() map[string]Type {
 	router.Members["use_cors"] = nativeFuncType("web.use_cors", []Type{strings, strings, strings, BoolType()}, NoneType(), 1)
 	router.Members["use_security_headers"] = nativeFuncType("web.use_security_headers", []Type{StrType(), StrType(), IntType()}, NoneType(), 3)
 	router.Members["rate_limit"] = nativeFuncType("web.rate_limit", []Type{StrType(), StrType(), webRateLimiterType()}, NoneType(), 0)
+	router.Members["idempotency"] = nativeFuncType("web.idempotency",
+		[]Type{StrType(), StrType(), redisDriverTypes()["Connection"], StrType(), IntType()}, NoneType(), 1)
 	schema := unionType(validationTypes()["Schema"], NoneType())
 	router.Members["document"] = nativeFuncType("web.document",
 		[]Type{StrType(), StrType(), StrType(), strings, dictType(IntType(), schema), schema, schema}, NoneType(), 2)
@@ -248,6 +253,9 @@ func webDriverExports(types map[string]Type) map[string]Value {
 				route.rate = limiter.bind(args[0].Str, args[1].Str)
 				return NoneValue(), nil
 			}),
+			"idempotency": driverFunc(typ.Members["idempotency"], func(vm *VM, args []Value) (Value, error) {
+				return NoneValue(), router.configureIdempotency(args)
+			}),
 			"document": driverFunc(typ.Members["document"], func(vm *VM, args []Value) (Value, error) {
 				return NoneValue(), router.document(vm, args)
 			}),
@@ -263,7 +271,7 @@ func webDriverExports(types map[string]Type) map[string]Value {
 					return NoneValue(), errors.New("router was already started")
 				}
 				route := router.routes[[2]string{args[0].Str, args[1].Str}]
-				if route == nil || route.upload != nil || route.sse != nil || args[0].Str == "HEAD" {
+				if route == nil || route.upload != nil || route.sse != nil || route.idempotency != nil || args[0].Str == "HEAD" {
 					return NoneValue(), errors.New("stream upload requires a registered non-HEAD route without an upload policy")
 				}
 				total, part, parts := args[2].Int, args[2].Int, int64(16)

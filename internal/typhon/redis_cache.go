@@ -88,17 +88,11 @@ func redisCacheRequest(vm *VM, request Value) (*webRequest, error) {
 }
 
 func (c redisCache) run(vm *VM, operation func(context.Context) error) error {
-	if c.db.closed.Load() {
-		c.db.cacheErrors++
-		return &Exception{kind: connectionKind, message: "Redis cache connection is closed"}
-	}
-	ctx, done := c.db.start(vm.context(), c.db.timeout)
-	err := operation(ctx)
-	done(err)
+	err := c.db.run(vm.context(), c.db.timeout, operation)
 	if err != nil {
 		c.db.cacheErrors++
 	}
-	return driverFailure("Redis", databaseKind, err)
+	return err
 }
 
 func (c redisCache) lookup(vm *VM, args []Value) (Value, error) {

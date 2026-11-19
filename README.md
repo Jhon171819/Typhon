@@ -107,6 +107,8 @@ The Go runtime currently supports:
   tenant to a transaction and illustrates row security and tenant-scoped cache.
 - [Redis tenant cache](docs/redis_cache.md) adds versioned JSON entries and
   post-commit invalidation for authorized requests.
+- [Idempotent HTTP writes and Redis locks](docs/idempotency.md) coordinate
+  retries and show a durable PostgreSQL constraint for critical writes.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)
