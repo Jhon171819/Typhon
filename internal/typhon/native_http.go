@@ -231,6 +231,10 @@ func httpVMHandler(engine *Engine, handler Value) http.Handler {
 }
 
 func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Duration) http.Handler {
+	return httpVMHandlerWithContext(engine, handler, timeout, engine.ctx)
+}
+
+func httpVMHandlerWithContext(engine *Engine, handler Value, timeout time.Duration, serverContext context.Context) http.Handler {
 	// ponytail: at most 16 queued/running requests, while the Engine serializes
 	// Typhon execution; use independent Engines when parallel CPU work is needed.
 	admission := make(chan struct{}, 16)
@@ -269,10 +273,10 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			return
 		}
 		defer engine.active.Done()
-		ctx, cancel := httpRequestContext(req.Context(), engine.ctx, timeout)
+		ctx, cancel := httpRequestContext(req.Context(), serverContext, timeout)
 		defer cancel()
 		if ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
+			writeHTTPStop(writer, serverContext, ctx.Err(), problems)
 			return
 		}
 		var upload *httpUploadPolicy
@@ -297,7 +301,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			defer func() { reportCleanupError("HTTP streaming request body", inbound.release()) }()
 		}
 		if ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, ctx.Err(), problems)
+			writeHTTPStop(writer, serverContext, ctx.Err(), problems)
 			return
 		}
 		if err != nil {
@@ -406,7 +410,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 				}
 				cancel()
 				if req.Method != http.MethodHead {
-					ctx, stopEvents = newHTTPSSEContext(req, child, webState.principal, sse)
+					ctx, stopEvents = newHTTPSSEContext(req, serverContext, webState.principal, sse)
 					child.ctx, scope.cancel = ctx, stopEvents
 				}
 			} else if stream == nil {
@@ -451,7 +455,7 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 		var stopped *executionStop
 		if errors.As(runErr, &stopped) && stopped.cancelled {
 			reportCleanupError("HTTP request", cleanupErr)
-			writeHTTPStop(writer, engine.ctx, stopped.cause, problems)
+			writeHTTPStop(writer, serverContext, stopped.cause, problems)
 			return
 		}
 		primary := runErr
@@ -489,12 +493,12 @@ func httpVMHandlerWithTimeout(engine *Engine, handler Value, timeout time.Durati
 			problems.write(writer, http.StatusInternalServerError, "internal server error")
 			return
 		}
-		if req.Context().Err() != nil || engine.ctx.Err() != nil {
-			writeHTTPStop(writer, engine.ctx, req.Context().Err(), problems)
+		if req.Context().Err() != nil || serverContext.Err() != nil {
+			writeHTTPStop(writer, serverContext, req.Context().Err(), problems)
 			return
 		}
 		if deadline, _ := ctx.Deadline(); time.Now().After(deadline) {
-			writeHTTPStop(writer, engine.ctx, context.DeadlineExceeded, problems)
+			writeHTTPStop(writer, serverContext, context.DeadlineExceeded, problems)
 			return
 		}
 		if result.Kind != ValueNativeObject || !result.NativeObject.Type.Equal(httpDriverTypes()["Response"]) {
@@ -567,11 +571,23 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 	if err != nil {
 		return NoneValue(), err
 	}
+	grace, err := httpShutdownGrace()
+	if err != nil {
+		return NoneValue(), err
+	}
+	readiness, err := httpReadinessPath(vm.engine.quotas.liveness)
+	if err != nil {
+		return NoneValue(), err
+	}
 	listener, err := net.Listen("tcp", args[0].Str)
 	if err != nil {
 		return NoneValue(), driverFailure("HTTP", connectionKind, err)
 	}
-	pool := newHTTPWorkerPool(vm.context(), int(workers), int(queue))
+	workerContext, cancelWorkers := context.WithCancel(context.WithoutCancel(vm.context()))
+	defer cancelWorkers()
+	stopStartup := context.AfterFunc(vm.context(), cancelWorkers)
+	defer stopStartup()
+	pool := newHTTPWorkerPool(workerContext, int(workers), int(queue))
 	pool.requestTimeout = requestTimeout
 	pool.liveness = vm.engine.quotas.liveness
 	vm.engine.httpMetrics.Store(&pool.metrics)
@@ -587,6 +603,10 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 		reportCleanupError("HTTP listener after worker startup failure", driverFailure("HTTP", connectionKind, listener.Close()))
 		return NoneValue(), err
 	}
+	if !stopStartup() || vm.context().Err() != nil {
+		reportCleanupError("HTTP listener after startup cancellation", driverFailure("HTTP", connectionKind, listener.Close()))
+		return NoneValue(), vm.context().Err()
+	}
 	httpHandler := pool.browser.wrap(pool, pool.apiErrors)
 	if router, ok := routerValue(handler); ok {
 		httpHandler, err = router.docsHandler(httpHandler)
@@ -595,7 +615,8 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 			return NoneValue(), err
 		}
 	}
-	server := &http.Server{Handler: httpHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	drain := newHTTPDrain(httpHandler, pool, readiness)
+	server := &http.Server{Handler: drain, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	vm.engine.execMu.Unlock()
@@ -605,13 +626,7 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 			reportCleanupError("HTTP server close", driverFailure("HTTP", connectionKind, server.Close()))
 		}
 	case <-vm.context().Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		shutdownErr := server.Shutdown(shutdown)
-		cancel()
-		if shutdownErr != nil {
-			reportCleanupError("HTTP server shutdown", driverFailure("HTTP", connectionKind, shutdownErr))
-			reportCleanupError("HTTP server close", driverFailure("HTTP", connectionKind, server.Close()))
-		}
+		drain.shutdown(server, cancelWorkers, grace)
 		err = <-done
 	}
 	vm.engine.execMu.Lock()

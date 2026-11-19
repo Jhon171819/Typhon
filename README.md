@@ -111,6 +111,8 @@ The Go runtime currently supports:
   retries and show a durable PostgreSQL constraint for critical writes.
 - [Redis Streams workers](docs/redis_streams.md) use consumer groups, bounded
   reads, retries, dead letters and a durable deduplication example.
+- [Graceful HTTP shutdown](docs/http_shutdown.md) drains in-flight work on
+  SIGTERM and SIGINT, with a configurable grace period.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

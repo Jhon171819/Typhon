@@ -215,10 +215,10 @@ func writeSSEResponse(vm *VM, writer http.ResponseWriter, state *webRequest, las
 	}
 }
 
-func newHTTPSSEContext(req *http.Request, vm *VM, principal verifiedRequestIdentity, policy *httpSSEPolicy) (context.Context, context.CancelFunc) {
+func newHTTPSSEContext(req *http.Request, serverContext context.Context, principal verifiedRequestIdentity, policy *httpSSEPolicy) (context.Context, context.CancelFunc) {
 	duration := policy.duration
 	if !principal.expires.IsZero() {
 		duration = min(duration, time.Until(principal.expires))
 	}
-	return httpRequestContext(req.Context(), vm.engine.ctx, duration)
+	return httpRequestContext(req.Context(), serverContext, duration)
 }

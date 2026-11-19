@@ -67,6 +67,9 @@ jobs:
           go-version-file: go.mod
       - run: go test -race -count=1 ./internal/typhon -run TestNative -v
       - run: go test -race -count=1 ./cmd/typhon -run '^TestSIGTERMShutsDownActiveRequest$' -v
+      - name: Verify rollback under docker stop
+        timeout-minutes: 4
+        run: bash tests/docker_shutdown.sh
       - run: go test ./internal/typhon -run '^$' -bench '^BenchmarkNativePostgresBulk$' -benchmem -benchtime=3x
   test:
     strategy:

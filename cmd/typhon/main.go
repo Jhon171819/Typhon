@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"typhon/internal/typhon"
 )
@@ -15,6 +16,19 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	finished := make(chan struct{})
+	defer close(finished)
+	stopWatchdog := context.AfterFunc(ctx, func() {
+		timer := time.NewTimer(typhon.ShutdownExitTimeout())
+		defer timer.Stop()
+		select {
+		case <-finished:
+		case <-timer.C:
+			fmt.Fprintln(os.Stderr, "Typhon shutdown deadline exceeded")
+			os.Exit(1)
+		}
+	})
+	defer stopWatchdog()
 	if err := runWithContext(ctx, os.Args[1:]); err != nil && !(ctx.Err() != nil && errors.Is(err, context.Canceled)) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

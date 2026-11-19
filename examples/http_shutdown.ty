@@ -1,0 +1,18 @@
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.web as web
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+routes: web.Router = web.router()
+routes.use_errors()
+
+def work(req: http.Request) -> http.Response:
+    tx: pg.Transaction = db.begin()
+    tx.exec('INSERT INTO typhon_docker_stop_fixture (id) VALUES ($1)', [1])
+    tx.query('SELECT pg_sleep(8) /* typhon_container_drain */', [])
+    return http.response(200, 'rolled back')
+
+routes.add('POST', '/work', work)
+
+if __name__ == '__main__':
+    http.serve(http.env('TYPHON_LISTEN_ADDRESS'), routes)

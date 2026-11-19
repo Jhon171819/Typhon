@@ -48,6 +48,8 @@ type httpWorkerPool struct {
 	eventHandlers   []http.Handler
 	eventSlots      chan struct{}
 	eventRoundRobin atomic.Uint64
+	eventContext    context.Context
+	stopEvents      context.CancelFunc
 }
 
 func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
@@ -66,10 +68,11 @@ func (p *httpWorkerPool) load(vm *VM, handler Value) error {
 		if router.hasSSE {
 			p.eventRouter = router
 			p.eventSlots = make(chan struct{}, maxSSEConnections)
+			p.eventContext, p.stopEvents = context.WithCancel(p.ctx)
 		}
 	}
 	addWorker := func(engine *Engine, entry Value) {
-		server := httpVMHandlerWithTimeout(engine, entry, p.requestTimeout)
+		server := httpVMHandlerWithContext(engine, entry, p.requestTimeout, p.ctx)
 		p.idle <- server
 		if p.eventRouter != nil {
 			p.eventHandlers = append(p.eventHandlers, server)
@@ -134,6 +137,9 @@ func httpWorkerBinding(handler Value) (path, binding string, err error) {
 }
 
 func (p *httpWorkerPool) close() error {
+	if p.stopEvents != nil {
+		p.stopEvents()
+	}
 	var failures []error
 	for i := len(p.engines) - 1; i >= 0; i-- {
 		if err := p.engines[i].Close(); err != nil {
@@ -206,7 +212,7 @@ func (p *httpWorkerPool) serveEvent(writer http.ResponseWriter, req *http.Reques
 	p.metrics.eventConnections.Add(1)
 	defer p.metrics.eventConnections.Add(-1)
 	ctx, cancel := context.WithCancel(req.Context())
-	stop := context.AfterFunc(p.ctx, cancel)
+	stop := context.AfterFunc(p.eventContext, cancel)
 	defer cancel()
 	defer stop()
 	index := (p.eventRoundRobin.Add(1) - 1) % uint64(len(p.eventHandlers))
