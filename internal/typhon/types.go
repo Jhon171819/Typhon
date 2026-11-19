@@ -52,6 +52,7 @@ type ModuleInfo struct {
 	Path    string
 	Exports map[string]Type
 	Classes map[string]*ClassInfo
+	Aliases map[string]Type
 }
 
 func AnyType() Type   { return Type{Kind: TypeAny, Name: "Any"} }

@@ -71,6 +71,7 @@ type NativeObject struct {
 type NativeModule struct {
 	Name    string
 	Exports map[string]Value
+	Loaded  *LoadedModule
 }
 
 type RuntimeClass struct {

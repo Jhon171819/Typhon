@@ -19,26 +19,28 @@ type Engine struct {
 	closeOnce   sync.Once
 	closeErr    error
 	// VM execution is serialized. join yields this lock while its child runs.
-	execMu       sync.Mutex
-	moduleMu     sync.Mutex
-	loading      map[string]bool
-	tasks        []*Task
-	requestTasks int // guarded by execMu
-	ctx          context.Context
-	cancel       context.CancelFunc
-	modules      map[string]*LoadedModule
-	infos        map[string]*ModuleInfo
-	root         string
-	bridge       *PythonBridge
-	bridgeErr    error
-	bridgeDone   chan struct{}
-	bridgeMu     sync.Mutex
-	warmPython   bool
-	sharedPython bool
-	httpWorker   bool
-	httpMetrics  atomic.Pointer[httpPoolMetrics]
-	quotas       quotaLimits
-	quotaErr     error
+	execMu        sync.Mutex
+	moduleMu      sync.Mutex
+	moduleRoot    string
+	strictImports bool
+	loading       map[string]bool
+	tasks         []*Task
+	requestTasks  int // guarded by execMu
+	ctx           context.Context
+	cancel        context.CancelFunc
+	modules       map[string]*LoadedModule
+	infos         map[string]*ModuleInfo
+	root          string
+	bridge        *PythonBridge
+	bridgeErr     error
+	bridgeDone    chan struct{}
+	bridgeMu      sync.Mutex
+	warmPython    bool
+	sharedPython  bool
+	httpWorker    bool
+	httpMetrics   atomic.Pointer[httpPoolMetrics]
+	quotas        quotaLimits
+	quotaErr      error
 }
 
 type LoadedModule struct {
@@ -105,6 +107,14 @@ func CheckFile(path string) error {
 	return err
 }
 
+func CheckImports(path string) error {
+	engine := NewEngine()
+	defer engine.Close()
+	engine.strictImports = true
+	_, err := engine.LoadModule(path)
+	return err
+}
+
 func BytecodeFile(path string) (string, error) {
 	engine := NewEngine()
 	defer engine.Close()
@@ -118,13 +128,26 @@ func BytecodeFile(path string) (string, error) {
 func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
 	e.moduleMu.Lock()
 	defer e.moduleMu.Unlock()
-	return e.loadModule(path)
+	return e.loadModule(path, false)
 }
 
-func (e *Engine) loadModule(path string) (*LoadedModule, error) {
+func (e *Engine) loadModule(path string, imported bool) (*LoadedModule, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.initializeModuleRoot(filepath.Dir(abs)); err != nil {
+		return nil, err
+	}
+	if imported {
+		rel, err := filepath.Rel(e.moduleRoot, abs)
+		if err != nil || !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("Typhon import leaves module root: %s", path)
+		}
 	}
 	if module, ok := e.modules[abs]; ok {
 		return module, nil
@@ -142,7 +165,12 @@ func (e *Engine) loadModule(path string) (*LoadedModule, error) {
 	if e.warmPython {
 		e.StartPythonBridgeWarmup()
 	}
-	source, err := os.ReadFile(abs)
+	var source []byte
+	if imported {
+		source, err = e.readImportedSource(abs)
+	} else {
+		source, err = os.ReadFile(abs)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +188,7 @@ func (e *Engine) loadModule(path string) (*LoadedModule, error) {
 	}
 	module := &LoadedModule{
 		Path:    abs,
-		Name:    moduleNameFromPath(abs),
+		Name:    moduleNameFromPath(e.moduleRoot, abs),
 		Program: program,
 		Info:    info,
 		Globals: runtimeGlobals(),
@@ -174,15 +202,22 @@ func (e *Engine) loadModule(path string) (*LoadedModule, error) {
 type lockedImportResolver struct{ engine *Engine }
 
 func (r lockedImportResolver) ResolveImport(module, fromDir string) (*ModuleInfo, error) {
-	path, err := resolveModulePath(module, fromDir)
+	loaded, err := r.engine.loadNamedModule(module, fromDir)
 	if err != nil {
-		return nil, err
-	}
-	loaded, err := r.engine.loadModule(path)
-	if err != nil {
+		if r.engine.strictImports && errors.Is(err, ErrModuleNotFound) {
+			return nil, fmt.Errorf("%v; use py.%s for an explicit Python import", err, module)
+		}
 		return nil, err
 	}
 	return loaded.Info, nil
+}
+
+func (e *Engine) loadNamedModule(module, fromDir string) (*LoadedModule, error) {
+	path, err := e.modulePath(module, fromDir)
+	if err != nil {
+		return nil, err
+	}
+	return e.loadModule(path, true)
 }
 
 type RunOptions struct {
@@ -201,15 +236,9 @@ func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, erro
 	if isPythonImport(module) {
 		return pythonModuleInfo(module), nil
 	}
-	path, err := resolveModulePath(module, fromDir)
-	if err != nil {
-		return nil, err
-	}
-	loaded, err := e.LoadModule(path)
-	if err != nil {
-		return nil, err
-	}
-	return loaded.Info, nil
+	e.moduleMu.Lock()
+	defer e.moduleMu.Unlock()
+	return (lockedImportResolver{e}).ResolveImport(module, fromDir)
 }
 
 func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule, error) {
@@ -239,11 +268,9 @@ func (e *Engine) loadModuleByNameLocked(ctx context.Context, budget *executionBu
 	if isPythonImport(module) {
 		return nil, fmt.Errorf("python module %q is handled by the Python bridge", module)
 	}
-	path, err := resolveModulePath(module, fromDir)
-	if err != nil {
-		return nil, err
-	}
-	loaded, err := e.LoadModule(path)
+	e.moduleMu.Lock()
+	loaded, err := e.loadNamedModule(module, fromDir)
+	e.moduleMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -452,6 +479,13 @@ func (e *Engine) executeModuleLocked(ctx context.Context, budget *executionBudge
 		return nil
 	}
 	module.Globals["__file__"] = StringValue(module.Path)
+	packageName := ""
+	if filepath.Base(module.Path) == "__init__.ty" {
+		packageName = module.Name
+	} else if i := strings.LastIndexByte(module.Name, '.'); i >= 0 {
+		packageName = module.Name[:i]
+	}
+	module.Globals["__package__"] = StringValue(packageName)
 	if main {
 		module.Globals["__name__"] = StringValue("__main__")
 	} else {
@@ -469,29 +503,19 @@ func (e *Engine) executeModuleLocked(ctx context.Context, budget *executionBudge
 	return nil
 }
 
-func resolveModulePath(module string, fromDir string) (string, error) {
-	parts := strings.Split(module, ".")
-	base := filepath.Join(append([]string{fromDir}, parts...)...)
-	filePath := base + ".ty"
-	if _, err := os.Stat(filePath); err == nil {
-		return filePath, nil
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-	initPath := filepath.Join(base, "__init__.ty")
-	if _, err := os.Stat(initPath); err == nil {
-		return initPath, nil
-	} else if !os.IsNotExist(err) {
-		return "", err
-	}
-	return "", fmt.Errorf("%w: cannot import module %q from %s", ErrModuleNotFound, module, fromDir)
-}
-
 var ErrModuleNotFound = errors.New("Typhon module not found")
 
-func moduleNameFromPath(path string) string {
-	base := filepath.Base(path)
-	return strings.TrimSuffix(base, filepath.Ext(base))
+func moduleNameFromPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(rel) {
+		rel = filepath.Base(path)
+	}
+	if filepath.Base(rel) == "__init__.ty" && filepath.Dir(rel) != "." {
+		rel = filepath.Dir(rel)
+	} else {
+		rel = strings.TrimSuffix(rel, filepath.Ext(rel))
+	}
+	return strings.ReplaceAll(filepath.ToSlash(rel), "/", ".")
 }
 
 func projectRoot(start string) string {

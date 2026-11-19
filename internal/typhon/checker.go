@@ -38,11 +38,11 @@ func CheckModule(module *Module, resolver ImportResolver) (*ModuleInfo, error) {
 	}
 	exports := map[string]Type{}
 	for name, typ := range c.globals {
-		if !isBuiltinName(name) && typ.Kind != typeExceptionConstructor {
+		if _, typeOnly := c.aliases[name]; !typeOnly && !isBuiltinName(name) && typ.Kind != typeExceptionConstructor {
 			exports[name] = typ
 		}
 	}
-	return &ModuleInfo{Path: module.Path, Exports: exports, Classes: c.classes}, nil
+	return &ModuleInfo{Path: module.Path, Exports: exports, Classes: c.classes, Aliases: c.aliases}, nil
 }
 
 func builtinTypes() map[string]Type {
@@ -66,7 +66,7 @@ func builtinTypes() map[string]Type {
 		"list":        {Kind: TypeList, Name: "list"},
 		"__name__":    StrType(),
 		"__file__":    StrType(),
-		"__package__": AnyType(),
+		"__package__": StrType(),
 	}
 	for _, name := range exceptionNames {
 		types[name] = Type{Kind: typeExceptionConstructor, Name: name}
@@ -101,7 +101,7 @@ func (c *checker) collect(stmts []Stmt) {
 			if alias == "" {
 				alias = importBindingName(s.Name)
 			}
-			if info, ok := nativeDriverInfo(s.Name); ok {
+			if info := c.importInfo(s.Name, s.Line); info != nil {
 				c.globals[alias] = Type{Kind: TypeModule, Name: s.Name, Members: info.Exports}
 			} else {
 				c.globals[alias] = PyType()
@@ -131,58 +131,49 @@ func (c *checker) collect(stmts []Stmt) {
 }
 
 func (c *checker) collectImport(stmt *ImportFromStmt) {
-	if info, ok := nativeDriverInfo(stmt.Module); ok {
-		for _, name := range stmt.Names {
-			if typ, exists := info.Exports[name]; exists {
-				c.globals[name] = typ
-			} else {
-				c.fail(stmt.Line, fmt.Sprintf("module %q has no export %q", stmt.Module, name))
-			}
+	info := c.importInfo(stmt.Module, stmt.Line)
+	stmt.TypeOnly = make([]bool, len(stmt.Names))
+	for i, name := range stmt.Names {
+		binding := name
+		if i < len(stmt.Bindings) {
+			binding = stmt.Bindings[i]
 		}
-		return
-	}
-	if stmt.Module == "typhon.parallel" {
-		for _, name := range stmt.Names {
-			if typ, ok := c.globals[name]; ok {
-				c.globals[name] = typ
-			} else {
-				c.fail(stmt.Line, fmt.Sprintf("unknown typhon.parallel import %q", name))
-			}
+		if info == nil {
+			c.globals[binding] = PyType()
+			continue
 		}
-		return
-	}
-	if isPythonImport(stmt.Module) {
-		for _, name := range stmt.Names {
-			c.globals[name] = PyType()
+		if typ, exists := info.Aliases[name]; exists {
+			c.aliases[binding] = typ
+			stmt.TypeOnly[i] = true
+			continue
 		}
-		return
-	}
-	if c.resolver == nil {
-		c.fail(stmt.Line, "imports are not available")
-		return
-	}
-	info, err := c.resolver.ResolveImport(stmt.Module, c.module.Dir)
-	if err != nil {
-		if !errors.Is(err, ErrModuleNotFound) {
-			c.fail(stmt.Line, err.Error())
-			return
-		}
-		for _, name := range stmt.Names {
-			c.globals[name] = PyType()
-		}
-		return
-	}
-	for _, name := range stmt.Names {
 		typ, ok := info.Exports[name]
 		if !ok {
 			c.fail(stmt.Line, fmt.Sprintf("module %q has no export %q", stmt.Module, name))
 			continue
 		}
-		c.globals[name] = typ
+		c.globals[binding] = typ
 		if typ.Kind == TypeClass && typ.Class != nil {
-			c.classes[name] = typ.Class
+			c.classes[binding] = typ.Class
 		}
 	}
+}
+
+func (c *checker) importInfo(name string, line int) *ModuleInfo {
+	if info, ok := nativeDriverInfo(name); ok {
+		return info
+	}
+	if name == "typhon.parallel" {
+		return parallelModuleInfo()
+	}
+	if isPythonImport(name) || c.resolver == nil {
+		return nil
+	}
+	info, err := c.resolver.ResolveImport(name, c.module.Dir)
+	if err != nil && !errors.Is(err, ErrModuleNotFound) {
+		c.fail(line, err.Error())
+	}
+	return info
 }
 
 func (c *checker) functionType(fn *FuncDefStmt, classInfo *ClassInfo) Type {
@@ -216,8 +207,12 @@ func (c *checker) checkStatements(stmts []Stmt, scope *scope, classInfo *ClassIn
 
 func (c *checker) checkStatement(stmt Stmt, scope *scope, classInfo *ClassInfo, expectedReturn Type) {
 	switch s := stmt.(type) {
-	case *TypeAliasStmt, *ImportFromStmt, *ImportStmt:
+	case *TypeAliasStmt:
 		return
+	case *ImportFromStmt, *ImportStmt:
+		if !scope.module {
+			c.collect([]Stmt{stmt})
+		}
 	case *FuncDefStmt:
 		c.checkFunction(s, classInfo)
 	case *ClassDefStmt:
@@ -807,10 +802,20 @@ func (c *checker) inferCall(expr *CallExpr, scope *scope, classInfo *ClassInfo) 
 			} else if len(expr.Args) != 0 {
 				c.fail(expr.Line, fmt.Sprintf("%s() expected 0 arguments, got %d", name.Name, len(expr.Args)))
 			}
-			return Type{Kind: TypeClass, Name: name.Name, Class: class}
+			return Type{Kind: TypeClass, Name: class.Name, Class: class}
 		}
 	}
 	calleeType := c.inferExpr(expr.Callee, scope, classInfo)
+	if calleeType.Kind == TypeClass && calleeType.Class != nil {
+		if attr, ok := expr.Callee.(*AttrExpr); ok && c.inferExpr(attr.Object, scope, classInfo).Kind == TypeModule {
+			var params []Type
+			if init, exists := calleeType.Class.Methods["__init__"]; exists {
+				params = init.Params[1:]
+			}
+			c.checkCallArgs(expr.Line, params, expr.Args, scope, classInfo)
+			return calleeType
+		}
+	}
 	if calleeType.Kind == typeExceptionConstructor {
 		calleeType = nativeFuncType(calleeType.Name, []Type{StrType()}, exceptionType(calleeType.Name), 0)
 	}
@@ -987,7 +992,7 @@ func (c *checker) resolveTypeRef(ref TypeRef) (Type, error) {
 		return Type{Kind: TypeList, Name: "list", Elem: typePtr(elem)}, nil
 	default:
 		if classInfo, ok := c.classes[name]; ok {
-			return Type{Kind: TypeClass, Name: name, Class: classInfo}, nil
+			return Type{Kind: TypeClass, Name: classInfo.Name, Class: classInfo}, nil
 		}
 		if typ, ok := c.globals[name]; ok {
 			if typ.Kind == typeExceptionConstructor {
@@ -997,7 +1002,7 @@ func (c *checker) resolveTypeRef(ref TypeRef) (Type, error) {
 		}
 		if module, member, ok := strings.Cut(name, "."); ok {
 			if typ, exists := c.globals[module]; exists && typ.Kind == TypeModule {
-				if exported, exists := typ.Members[member]; exists && exported.Kind == TypeNative {
+				if exported, exists := typ.Members[member]; exists && (exported.Kind == TypeNative || exported.Kind == TypeClass) {
 					return exported, nil
 				}
 			}

@@ -1,0 +1,5 @@
+import repositories.profiles as profiles
+from config import DefaultName as DisplayName
+
+def lookup(name: str) -> DisplayName:
+    return profiles.normalize(name)

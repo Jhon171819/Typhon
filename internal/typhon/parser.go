@@ -263,25 +263,67 @@ func (p *parser) parseImportFrom(line sourceLine) (Stmt, error) {
 	if !ok {
 		return nil, syntaxError(p.path, line.line, "from import statement must use 'from module import name'")
 	}
-	names := splitTopLevel(namesText, ',')
-	if len(names) == 0 {
+	module = strings.TrimSpace(module)
+	if !validModuleName(module) {
+		return nil, syntaxError(p.path, line.line, "invalid import module name")
+	}
+	stmt := &ImportFromStmt{Line: line.line, Module: module}
+	for _, item := range splitTopLevel(namesText, ',') {
+		name, binding, err := importNames(item, false)
+		if err != nil {
+			return nil, syntaxError(p.path, line.line, err.Error())
+		}
+		if binding == "" {
+			binding = name
+		}
+		stmt.Names = append(stmt.Names, name)
+		stmt.Bindings = append(stmt.Bindings, binding)
+	}
+	if len(stmt.Names) == 0 {
 		return nil, syntaxError(p.path, line.line, "import list cannot be empty")
 	}
-	for i := range names {
-		names[i] = strings.TrimSpace(names[i])
-	}
-	return &ImportFromStmt{Line: line.line, Module: strings.TrimSpace(module), Names: names}, nil
+	return stmt, nil
 }
 
 func (p *parser) parseImport(line sourceLine) (Stmt, error) {
-	rest := strings.TrimSpace(strings.TrimPrefix(line.text, "import "))
-	name := rest
-	alias := ""
-	if left, right, ok := strings.Cut(rest, " as "); ok {
-		name = strings.TrimSpace(left)
-		alias = strings.TrimSpace(right)
+	name, alias, err := importNames(strings.TrimPrefix(line.text, "import "), true)
+	if err != nil {
+		return nil, syntaxError(p.path, line.line, err.Error())
 	}
 	return &ImportStmt{Line: line.line, Name: name, Alias: alias}, nil
+}
+
+func importNames(text string, module bool) (string, string, error) {
+	parts := strings.Fields(text)
+	if len(parts) != 1 && (len(parts) != 3 || parts[1] != "as" || !validImportIdentifier(parts[2])) {
+		return "", "", fmt.Errorf("expected an import name with an optional alias")
+	}
+	name := parts[0]
+	if module && !validModuleName(name) || !module && !validImportIdentifier(name) {
+		return "", "", fmt.Errorf("invalid import name")
+	}
+	if len(parts) == 3 {
+		return name, parts[2], nil
+	}
+	return name, "", nil
+}
+
+func validModuleName(name string) bool {
+	for _, segment := range strings.Split(name, ".") {
+		if !validImportIdentifier(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+func validImportIdentifier(name string) bool {
+	for i, ch := range name {
+		if !(ch == '_' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || i > 0 && ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	return name != ""
 }
 
 func (p *parser) parseClass(line sourceLine, indent int) (Stmt, error) {

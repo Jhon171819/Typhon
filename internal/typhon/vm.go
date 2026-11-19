@@ -419,85 +419,25 @@ func (vm *VM) runFrame(f *frame) (completion, error) {
 		case OpDefineClass:
 			class := runtimeClass(instr.Class, f.module)
 			f.module.Globals[instr.Class.Name] = Value{Kind: ValueClass, Class: class}
-		case OpImportModule:
-			if vm.cleanupCtx != nil {
-				return completion{}, errCancellationIO
+		case OpImportModule, OpImportFrom:
+			module, err := vm.importModule(instr.S, filepathDir(f.module.Path))
+			if err != nil {
+				return completion{}, err
 			}
-			if module, ok := nativePythonModule(instr.S); ok {
+			if instr.Op == OpImportModule {
 				f.module.Globals[instr.Names[0]] = module
 				continue
 			}
-			bridge, err := vm.engine.PythonBridge()
-			if err != nil {
-				return completion{}, err
-			}
-			module, err := bridge.ImportModule(instr.S)
-			if err != nil {
-				return completion{}, err
-			}
-			f.module.Globals[instr.Names[0]] = module
-		case OpImportFrom:
-			if vm.cleanupCtx != nil {
-				return completion{}, errCancellationIO
-			}
-			if module, ok := nativePythonModule(instr.S); ok {
-				for _, name := range instr.Names {
-					value, ok := module.Module.Exports[name]
-					if !ok {
-						return completion{}, fmt.Errorf("module %q has no export %q", instr.S, name)
-					}
-					f.module.Globals[name] = value
+			for i, name := range instr.Names {
+				binding := instr.Bindings[i]
+				if binding == "" {
+					continue // type-only import
 				}
-				continue
-			}
-			if isPythonImport(instr.S) {
-				bridge, err := vm.engine.PythonBridge()
+				value, err := vm.getAttr(module, name)
 				if err != nil {
 					return completion{}, err
 				}
-				module, err := bridge.ImportModule(instr.S)
-				if err != nil {
-					return completion{}, err
-				}
-				pyModule := module.PyObject
-				for _, name := range instr.Names {
-					value, err := bridge.GetAttr(pyModule, name)
-					if err != nil {
-						return completion{}, err
-					}
-					f.module.Globals[name] = value
-				}
-				continue
-			}
-			imported, err := vm.engine.loadModuleByNameLocked(vm.context(), vm.executionBudget(), instr.S, filepathDir(f.module.Path))
-			if err != nil {
-				if !errors.Is(err, ErrModuleNotFound) {
-					return completion{}, err
-				}
-				bridge, bridgeErr := vm.engine.PythonBridge()
-				if bridgeErr != nil {
-					return completion{}, err
-				}
-				module, importErr := bridge.ImportModule(instr.S)
-				if importErr != nil {
-					return completion{}, err
-				}
-				pyModule := module.PyObject
-				for _, name := range instr.Names {
-					value, attrErr := bridge.GetAttr(pyModule, name)
-					if attrErr != nil {
-						return completion{}, attrErr
-					}
-					f.module.Globals[name] = value
-				}
-				continue
-			}
-			for _, name := range instr.Names {
-				value, ok := imported.Globals[name]
-				if !ok {
-					return completion{}, fmt.Errorf("module %q has no export %q", instr.S, name)
-				}
-				f.module.Globals[name] = value
+				f.module.Globals[binding] = value
 			}
 		case OpString:
 			value := f.pop()
@@ -519,6 +459,35 @@ func filepathDir(path string) string {
 		return "."
 	}
 	return path[:idx]
+}
+
+func (vm *VM) importModule(name, fromDir string) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
+	if module, ok := nativePythonModule(name); ok {
+		return module, nil
+	}
+	var missing error
+	if !isPythonImport(name) {
+		module, err := vm.engine.loadModuleByNameLocked(vm.context(), vm.executionBudget(), name, fromDir)
+		if err == nil {
+			return Value{Kind: ValueNativeModule, Module: &NativeModule{Name: name, Loaded: module}}, nil
+		}
+		if !errors.Is(err, ErrModuleNotFound) {
+			return NoneValue(), err
+		}
+		missing = err
+	}
+	bridge, err := vm.engine.PythonBridge()
+	if err != nil {
+		return NoneValue(), errors.Join(missing, err)
+	}
+	module, err := bridge.ImportModule(name)
+	if err != nil {
+		return NoneValue(), errors.Join(missing, err)
+	}
+	return module, nil
 }
 
 func runtimeClass(spec *ClassSpec, module *LoadedModule) *RuntimeClass {
@@ -647,6 +616,18 @@ func (vm *VM) getAttr(value Value, name string) (Value, error) {
 			return method, nil
 		}
 	case ValueNativeModule:
+		if loaded := value.Module.Loaded; loaded != nil {
+			if loaded.Engine != vm.engine {
+				return NoneValue(), fmt.Errorf("module belongs to another Engine")
+			}
+			if _, exported := loaded.Info.Exports[name]; exported {
+				if attr, exists := loaded.Globals[name]; exists {
+					return attr, nil
+				}
+				return NoneValue(), fmt.Errorf("export %q of module %q is not initialized", name, value.Module.Name)
+			}
+			return NoneValue(), fmt.Errorf("module %q has no export %q", value.Module.Name, name)
+		}
 		if exported, ok := value.Module.Exports[name]; ok {
 			return exported, nil
 		}

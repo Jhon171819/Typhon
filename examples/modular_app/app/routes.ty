@@ -1,0 +1,9 @@
+import typhon.http as http
+from app import api_version as version
+from services.profiles import lookup as profile_name
+
+def handle(req: http.Request) -> http.Response:
+    if req.path == '/health':
+        return http.response(200, 'ready')
+    name: str = profile_name(req.query('name'))
+    return http.json(200, {'version': version, 'name': name})

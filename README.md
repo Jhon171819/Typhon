@@ -49,7 +49,8 @@ The Go runtime currently supports:
   `in`/`not in`, and iteration over keys in insertion order.
 - `print`, `len`, `dict`, `range`, `enumerate`, `list.append`, and the string methods
   `strip`, `title`, and `upper`.
-- Local `.ty` modules through `from module import name`.
+- [Local Typhon packages and imports](docs/modules.md), including aliases and
+  a strict import-checking command.
 - Typed recovery with `try`/`except`/`else`/`finally` and `raise` for
   application errors and failures from HTTP, PostgreSQL, and Redis.
 - [Deterministic native resource cleanup](docs/resource_cleanup.md), with

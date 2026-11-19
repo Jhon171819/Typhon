@@ -66,9 +66,11 @@ func (*TypeAliasStmt) stmtNode()     {}
 func (s *TypeAliasStmt) LineNo() int { return s.Line }
 
 type ImportFromStmt struct {
-	Line   int
-	Module string
-	Names  []string
+	Line     int
+	Module   string
+	Names    []string
+	Bindings []string
+	TypeOnly []bool
 }
 
 func (*ImportFromStmt) stmtNode()     {}

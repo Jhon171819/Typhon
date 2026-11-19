@@ -126,7 +126,14 @@ func (fc *functionCompiler) compileStmt(stmt Stmt) error {
 	case *TypeAliasStmt:
 		return nil
 	case *ImportFromStmt:
-		fc.emit(Instr{Op: OpImportFrom, S: s.Module, Names: s.Names})
+		bindings := append([]string(nil), s.Names...)
+		copy(bindings, s.Bindings)
+		for i, typeOnly := range s.TypeOnly {
+			if typeOnly {
+				bindings[i] = ""
+			}
+		}
+		fc.emit(Instr{Op: OpImportFrom, S: s.Module, Names: s.Names, Bindings: bindings})
 	case *ImportStmt:
 		alias := s.Alias
 		if alias == "" {

@@ -164,6 +164,7 @@ type Instr struct {
 	Depth    int
 	S        string
 	Names    []string
+	Bindings []string
 	Keywords []string
 	Val      Value
 	Fn       *Function
@@ -256,7 +257,7 @@ func writeFunction(out *strings.Builder, fn *Function) {
 		case OpImportModule:
 			fmt.Fprintf(out, " %s as %s", instr.S, instr.Names[0])
 		case OpImportFrom:
-			fmt.Fprintf(out, " %s %v", instr.S, instr.Names)
+			fmt.Fprintf(out, " %s %v as %v", instr.S, instr.Names, instr.Bindings)
 		}
 		out.WriteByte('\n')
 	}

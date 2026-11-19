@@ -1,0 +1,5 @@
+import typhon.http as http
+import app.routes as routes
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes.handle)
