@@ -238,7 +238,7 @@ func nativePostgresConnect(vm *VM, args []Value, typed bool) (Value, error) {
 	}
 	ctx, cancel := driverContext(vm, timeout)
 	defer cancel()
-	pool, err := openPostgresPool(ctx, config)
+	pool, err := openPostgresPool(ctx, config, true)
 	if err != nil {
 		return NoneValue(), err
 	}

@@ -616,6 +616,13 @@ func nativeHTTPServe(vm *VM, args []Value) (_ Value, runErr error) {
 		}
 	}
 	drain := newHTTPDrain(httpHandler, pool, readiness)
+	health, err := newHTTPHealth(workerContext, readiness, pool.liveness)
+	if err != nil {
+		reportCleanupError("HTTP listener after health configuration failure", driverFailure("HTTP", connectionKind, listener.Close()))
+		return NoneValue(), err
+	}
+	drain.health = health
+	defer health.close()
 	server := &http.Server{Handler: drain, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()

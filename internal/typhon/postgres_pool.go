@@ -18,6 +18,7 @@ type postgresPoolSettings struct {
 	acquire, query, connect time.Duration
 	grace                   time.Duration
 	typed, requireTLS       bool
+	lazy                    bool
 	share                   string
 }
 
@@ -35,7 +36,7 @@ type sharedPostgresPool struct {
 
 func (r *postgresPoolRegistry) checkout(ctx context.Context, dsn string, config *pgxpool.Config, options postgresPoolSettings) (*pgxpool.Pool, func(), error) {
 	if options.share == "" {
-		pool, err := openPostgresPool(ctx, config)
+		pool, err := openPostgresPool(ctx, config, !options.lazy)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -49,7 +50,7 @@ func (r *postgresPoolRegistry) checkout(ctx context.Context, dsn string, config 
 		return nil, nil, errors.New("shared PostgreSQL pool name already uses a different configuration")
 	}
 	if entry == nil {
-		pool, err := openPostgresPool(ctx, config)
+		pool, err := openPostgresPool(ctx, config, !options.lazy)
 		if err != nil {
 			r.mu.Unlock()
 			return nil, nil, err
@@ -73,14 +74,16 @@ func (r *postgresPoolRegistry) checkout(ctx context.Context, dsn string, config 
 	}, nil
 }
 
-func openPostgresPool(ctx context.Context, config *pgxpool.Config) (*pgxpool.Pool, error) {
+func openPostgresPool(ctx context.Context, config *pgxpool.Config, probe bool) (*pgxpool.Pool, error) {
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, driverFailure("PostgreSQL", connectionKind, err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, driverFailure("PostgreSQL", connectionKind, err)
+	if probe {
+		if err := pool.Ping(ctx); err != nil {
+			pool.Close()
+			return nil, driverFailure("PostgreSQL", connectionKind, err)
+		}
 	}
 	return pool, nil
 }
@@ -102,14 +105,17 @@ func parsePostgresPoolSettings(input Value) (postgresPoolSettings, error) {
 			} else {
 				p.min = int32(value.Int)
 			}
-		case "require_tls", "typed":
+		case "require_tls", "typed", "lazy":
 			if value.Kind != ValueBool {
 				return p, errors.New("PostgreSQL pool flags must be booleans")
 			}
-			if name == "typed" {
+			switch name {
+			case "typed":
 				p.typed = value.Bool
-			} else {
+			case "require_tls":
 				p.requireTLS = value.Bool
+			case "lazy":
+				p.lazy = value.Bool
 			}
 		case "share":
 			if value.Kind != ValueString || !validPermissionName(value.Str) {

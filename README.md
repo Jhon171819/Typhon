@@ -113,6 +113,8 @@ The Go runtime currently supports:
   reads, retries, dead letters and a durable deduplication example.
 - [Graceful HTTP shutdown](docs/http_shutdown.md) drains in-flight work on
   SIGTERM and SIGINT, with a configurable grace period.
+- [Host HTTP health probes](docs/http_health.md) report liveness, readiness
+  and authenticated dependency diagnostics outside the VM queue.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

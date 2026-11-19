@@ -19,6 +19,7 @@ da conexão continuam os mesmos. As APIs `pg.connect` e
 | `grace_seconds` | 0.5 | janela para as transações do handle terminarem, até 2 s |
 | `typed` | `False` | tipos de resultado de `pg.connect_typed` quando `True` |
 | `require_tls` | `False` | exige verificação de certificado e hostname em cada destino |
+| `lazy` | `False` | com `True`, inicia o pool sem o ping inicial, para uso com [readiness independente](http_health.md) |
 
 Um nome compartilhado exige a mesma configuração e o mesmo DSN no
 grupo. Cada Engine mantém o próprio handle e as próprias transações.

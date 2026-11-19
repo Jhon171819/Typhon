@@ -1,0 +1,18 @@
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.redis as redis
+import typhon.web as web
+
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), {'lazy': True})
+cache: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 2, 0, 0.5, 0.5, 0.5, False)
+routes: web.Router = web.router()
+routes.use_errors()
+
+def work(req: http.Request) -> http.Response:
+    rows: pg.Rows = db.query('SELECT 1 AS value')
+    return http.json(200, {'value': rows.get(0, 'value'), 'cache': cache.ping()})
+
+routes.add('GET', '/', work)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes, 1, 0)

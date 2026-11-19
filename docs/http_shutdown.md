@@ -23,7 +23,8 @@ eight seconds if the CLI should enforce that hard deadline.
 
 Enable the host readiness probe with
 `TYPHON_READINESS_PATH=/health/ready`. It returns 200 after startup and
-503 during drain, independently of the worker queue. An independent
+503 during drain, without entering the worker queue. [Optional health checks](http_health.md)
+also consider admission capacity and configured dependencies. An independent
 `TYPHON_LIVENESS_PATH=/health/live` continues to return 204 while the
 listener responds. Leave either path unset to keep application routes
 in control of those URLs.

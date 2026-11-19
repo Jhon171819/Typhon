@@ -37,16 +37,21 @@ func ShutdownExitTimeout() time.Duration {
 
 func httpReadinessPath(liveness string) (string, error) {
 	path := os.Getenv("TYPHON_READINESS_PATH")
-	if path != "" && (!strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\t\r\n ?#") || path == liveness) {
+	if path != "" && (!validHealthPath(path) || path == liveness) {
 		return "", errors.New("TYPHON_READINESS_PATH must be an absolute HTTP path distinct from liveness")
 	}
 	return path, nil
+}
+
+func validHealthPath(path string) bool {
+	return strings.HasPrefix(path, "/") && !strings.ContainsAny(path, "\t\r\n ?#")
 }
 
 type httpDrain struct {
 	handler   http.Handler
 	pool      *httpWorkerPool
 	readiness string
+	health    *httpHealth
 	mu        sync.Mutex
 	draining  bool
 	active    int
@@ -63,15 +68,24 @@ func (d *httpDrain) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	d.mu.Lock()
-	if d.readiness != "" && request.URL.Path == d.readiness {
+	readyPath := d.readiness != "" && request.URL.Path == d.readiness
+	diagnostics := d.health != nil && d.health.diagnostics != "" && request.URL.Path == d.health.diagnostics
+	if readyPath || diagnostics {
 		draining := d.draining
 		d.mu.Unlock()
 		writer.Header().Set("Cache-Control", "no-store")
-		switch {
-		case request.Method != http.MethodGet && request.Method != http.MethodHead:
+		if request.Method != http.MethodGet && request.Method != http.MethodHead {
 			writer.Header().Set("Allow", "GET, HEAD")
 			writer.WriteHeader(http.StatusMethodNotAllowed)
-		case draining:
+			return
+		}
+		capacity := len(d.pool.admission) < cap(d.pool.admission)
+		dependenciesReady, dependencies := d.health.status()
+		ready := !draining && capacity && dependenciesReady
+		switch {
+		case diagnostics:
+			d.health.writeDiagnostics(writer, request, ready, draining, capacity, dependencies)
+		case !ready:
 			writer.WriteHeader(http.StatusServiceUnavailable)
 		default:
 			writer.WriteHeader(http.StatusOK)
