@@ -90,12 +90,14 @@ func TestNativeRedisStreamOwnershipAndCancellation(t *testing.T) {
 		t.Fatal("dead-letter transition did not acknowledge exactly once")
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	timer := time.AfterFunc(50*time.Millisecond, cancel)
+	defer timer.Stop()
 	vm.ctx = ctx
 	start := time.Now()
 	_, err = vm.callValue(attrs["read"], []Value{StringValue("new"), IntValue(1), IntValue(500)}, nil)
-	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) >= 400*time.Millisecond {
+	if !errors.Is(err, context.Canceled) || time.Since(start) >= 400*time.Millisecond {
 		t.Fatalf("blocking Redis read survived its context: %v, elapsed %s", err, time.Since(start))
 	}
 	vm.ctx = nil
