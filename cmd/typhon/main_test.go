@@ -113,11 +113,12 @@ def handler(req: http.Request) -> http.Response:
 %s        return http.response(201, 'commit completed')
 %s    upstream.get(%q)
     return http.response(200, 'done')
-try:
-    http.serve(%q, handler, 3, 4)
-finally:
-    upstream.close()
-    print('cleanup ran')
+if __name__ == '__main__':
+    try:
+        http.serve(%q, handler, 3, 4)
+    finally:
+        upstream.close()
+        print('cleanup ran')
 `, setup, upstream.URL+"/short", commitBegin, upstream.URL+"/commit", commitEnd, insert, upstream.URL+"/long", address)
 	if err := os.WriteFile(file, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
@@ -149,7 +150,9 @@ finally:
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("CLI server did not become available")
+			cancel()
+			_ = child.Wait()
+			t.Fatalf("CLI server did not become available: %s", output.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
