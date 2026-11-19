@@ -95,6 +95,8 @@ The Go runtime currently supports:
   arrays, JSONB, typed nulls and structured SQLSTATE diagnostics.
 - [Shared PostgreSQL pools](docs/postgres_pool.md) enforce a connection
   budget across HTTP workers and expose saturation metrics.
+- [Scoped PostgreSQL transactions](docs/postgres_transactions.md) provide
+  explicit commit, bounded rollback and opt-in SQLSTATE retry.
 
 Comprehensions, sets, slices, closures, and decorators remain outside the
 current Typhon subset. See the [exception contract](docs/typed_exceptions.md)

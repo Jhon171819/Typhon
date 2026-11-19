@@ -34,7 +34,10 @@ func postgresDriverTypes() map[string]Type {
 	tx.Members["commit"] = nativeFuncType("postgres.commit", nil, NoneType(), 0)
 	tx.Members["rollback"] = nativeFuncType("postgres.rollback", nil, NoneType(), 0)
 	connection := Type{Kind: TypeNative, Name: "typhon.postgres.Connection", Members: methods()}
-	connection.Members["begin"] = nativeFuncType("postgres.begin", nil, tx, 0)
+	connection.Members["begin"] = nativeFuncType("postgres.begin", []Type{StrType(), BoolType()}, tx, 2)
+	callback := nativeFuncType("postgres.transaction.callback", []Type{tx}, AnyType(), 0)
+	connection.Members["transaction"] = nativeFuncType("postgres.transaction",
+		[]Type{callback, StrType(), BoolType(), IntType()}, AnyType(), 3)
 	connection.Members["close"] = nativeFuncType("postgres.close", nil, NoneType(), 0)
 	connection.Members["stats"] = nativeFuncType("postgres.stats", nil, dictType(StrType(), IntType()), 0)
 	types := map[string]Type{
@@ -80,15 +83,17 @@ type postgresConnection struct {
 }
 
 type postgresTransaction struct {
-	scope  *resourceScope
-	parent *postgresConnection
-	tx     pgx.Tx
-	conn   *pgxpool.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
-	mu     sync.Mutex
-	ended  bool
+	scope     *resourceScope
+	parent    *postgresConnection
+	tx        pgx.Tx
+	conn      *pgxpool.Conn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	mu        sync.Mutex
+	ended     bool
+	committed bool
+	commitErr error
 }
 
 func (db *postgresConnection) close(ctx context.Context) error {
@@ -296,34 +301,17 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 			return postgresRows(vm, rows, cancel, db.typed)
 		}),
 		"begin": driverFunc(typ.Members["begin"], func(vm *VM, args []Value) (Value, error) {
-			conn, ctx, cancel, err := db.acquireConn(vm)
+			options, err := postgresTxOptions(args)
 			if err != nil {
 				return NoneValue(), err
 			}
-			defer cancel()
-			raw, err := conn.Begin(ctx)
+			tx, err := db.beginTransaction(vm, options)
 			if err != nil {
-				conn.Release()
-				return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
-			}
-			lifetime, stop := context.WithCancel(vm.context())
-			tx := &postgresTransaction{
-				scope: vm.resourceScope(), parent: db, tx: raw, conn: conn, ctx: lifetime, cancel: stop, done: make(chan struct{}),
-			}
-			if err := tx.scope.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
 				return NoneValue(), err
 			}
-			if err := db.txs.add(vm.context(), tx, "PostgreSQL transaction rollback", tx.rollback); err != nil {
-				return NoneValue(), err
-			}
-			db.activeMu.Lock()
-			if db.activeTxs == nil {
-				db.activeTxs = make(map[*postgresTransaction]bool)
-			}
-			db.activeTxs[tx] = true
-			db.activeMu.Unlock()
 			return postgresTxValue(vm, tx), nil
 		}),
+		"transaction": driverFunc(typ.Members["transaction"], db.transaction),
 	}
 	value := scopedNativeObject(vm, typ, attrs)
 	value.NativeObject.data = db
@@ -332,7 +320,7 @@ func postgresConnectionValue(vm *VM, db *postgresConnection) (Value, error) {
 
 func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 	typ := postgresDriverTypes()["Transaction"]
-	return scopedNativeObject(vm, typ, map[string]Value{
+	value := scopedNativeObject(vm, typ, map[string]Value{
 		"exec": driverFunc(typ.Members["exec"], func(vm *VM, args []Value) (Value, error) {
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
@@ -375,11 +363,15 @@ func postgresTxValue(vm *VM, tx *postgresTransaction) Value {
 			ctx, cancel := tx.operation(vm)
 			defer cancel()
 			err := tx.tx.Commit(ctx)
+			tx.committed = err == nil
+			tx.commitErr = postgresCommitError(err)
 			tx.finish()
-			return NoneValue(), driverFailure("PostgreSQL", databaseKind, err)
+			return NoneValue(), tx.commitErr
 		}),
 		"rollback": driverCloser(typ.Members["rollback"], tx.rollback),
 	})
+	value.NativeObject.data = tx
+	return value
 }
 
 func postgresParams(vm *VM, args []Value) ([]any, error) {

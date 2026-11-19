@@ -1,0 +1,15 @@
+import typhon.postgres as pg
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+
+def create_member(tx: pg.Transaction) -> Any:
+    tx.exec('INSERT INTO members (email) VALUES ($1) ON CONFLICT (email) DO NOTHING', ['ada@example.org'])
+    tx.commit()
+    return 'stored'
+
+def verify_member(tx: pg.Transaction) -> Any:
+    count: Any = tx.query('SELECT count(*) AS total FROM members WHERE email = $1', ['ada@example.org']).get(0, 'total')
+    return count
+
+print(db.transaction(create_member, 'serializable', False, 2))
+print(db.transaction(verify_member, 'repeatable_read', True))

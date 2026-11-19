@@ -89,7 +89,8 @@ Implementado com [`pgx/v5`](https://github.com/jackc/pgx), com pool de até
 | `pg.connect_typed(dsn, timeout=10)` | `pg.Connection`; decodifica [escalares nativos](native_scalars.md) e JSON/JSONB com precisão |
 | `db.exec(sql, params=[])` | `int`; linhas afetadas |
 | `db.query(sql, params=[])` | `pg.Rows`; resultado materializado |
-| `db.begin()` | `pg.Transaction`; reserva uma conexão do pool |
+| `db.begin(isolation?, read_only?)` | `pg.Transaction`; reserva uma conexão do pool |
+| `db.transaction(callback, isolation?, read_only?, max_retries?)` | `Any`; fecha a transação no fim do callback, com [commit explícito](postgres_transactions.md) |
 | `tx.exec(sql, params=[])`, `tx.query(sql, params=[])` | Mesmos contratos da conexão |
 | `tx.commit()`, `tx.rollback()` | `None`; encerra a transação |
 | `db.close()` | `None`; faz rollback das transações abertas e fecha o pool |
