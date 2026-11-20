@@ -1,0 +1,165 @@
+name: VM checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify Go formatting and dependency lock
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal ./tests/load)
+          if [[ -n "$unformatted" ]]; then printf '%s\n' "$unformatted"; exit 1; fi
+          go mod verify
+          go mod tidy -diff
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+      - name: Run high-confidence, high-severity Go security analysis
+        if: '!cancelled()'
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.30.0 -severity high -confidence high ./...
+      - name: Scan Git history for committed credentials
+        if: '!cancelled()'
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact=100 .
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash tests/compose_smoke.sh
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+        with:
+          syft-version: v1.57.2
+      - name: Inventory the tested container
+        env:
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        run: |
+          "$SYFT_CMD" scan docker:typhon-local:dev -o spdx-json=container.spdx.json
+          jq -e '.packages | length > 1' container.spdx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-sbom
+          path: container.spdx.json
+          if-no-files-found: error
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: typhon
+          POSTGRES_PASSWORD: typhon_test
+          POSTGRES_DB: typhon_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U typhon -d typhon_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://typhon:typhon_test@localhost:5432/typhon_test?sslmode=disable
+      TYPHON_ENV: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go build -o ./typhon-cli ./cmd/typhon
+      - name: Verify migration and seed lifecycle
+        run: |
+          ./typhon-cli migrate plan examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate status examples/migrations
+          ./typhon-cli migrate down examples/migrations
+          ./typhon-cli migrate up examples/migrations
+          ./typhon-cli migrate seed examples/seeds
+  native-drivers:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: typhon
+          POSTGRES_PASSWORD: typhon_test
+          POSTGRES_DB: typhon_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U typhon -d typhon_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TYPHON_TEST_POSTGRES_URL: postgres://typhon:typhon_test@localhost:5432/typhon_test?sslmode=disable
+      TYPHON_TEST_REDIS_URL: redis://localhost:6379/0
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./internal/typhon -run TestNative -v
+      - run: go test -race -count=1 ./cmd/typhon -run '^TestSIGTERMShutsDownActiveRequest$' -v
+      - name: Verify rollback under docker stop
+        timeout-minutes: 4
+        run: bash tests/docker_shutdown.sh
+      - run: go test ./internal/typhon -run '^$' -bench '^BenchmarkNativePostgresBulk$' -benchmem -benchtime=3x
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Select bridge Python
+        shell: bash
+        run: echo "TYPHON_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+      - run: go test -count=1 -cover ./...
+      - run: go vet ./...
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+      - run: python -m unittest discover -s tests
+      - run: go build ./...
+      - name: Validate exported OpenAPI
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: |
+          python -m pip install 'openapi-spec-validator==0.7.2'
+          go run ./cmd/typhon openapi examples/http_openapi.ty > openapi.json
+          python -m openapi_spec_validator openapi.json
+      - name: JSON fuzz smoke
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: go test ./internal/typhon -run '^$' -fuzz '^FuzzNativeJSON$' -fuzztime 5s -parallel 2
+      - name: Race detector
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 ./...

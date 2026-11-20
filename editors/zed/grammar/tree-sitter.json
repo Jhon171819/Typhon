@@ -1,0 +1,18 @@
+{
+  "grammars": [
+    {
+      "name": "typhon",
+      "camelcase": "Typhon",
+      "scope": "source.typhon",
+      "path": ".",
+      "file-types": ["ty"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Typhon editor grammar",
+    "authors": [{"name": "Typhon contributors"}],
+    "links": {"repository": "https://github.com/Jhon171819/Typhon"}
+  }
+}

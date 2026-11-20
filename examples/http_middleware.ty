@@ -1,0 +1,24 @@
+import typhon.http as http
+import typhon.web as web
+
+def context(req: http.Request, next: web.Next) -> http.Response:
+    req.set_state('resource', 'users')
+    try:
+        return next.call()
+    except ValidationError:
+        return http.json(400, {'error': 'invalid_request', 'request_id': req.request_id})
+
+def handle(req: http.Request) -> http.Response:
+    name: str = req.query('name')
+    if name == '':
+        raise ValidationError('name is required')
+    return http.json(200, {'resource': req.state('resource'), 'name': name, 'request_id': req.request_id})
+
+routes: web.Router = web.router()
+routes.use_request_id()
+routes.use_logging()
+routes.use(context)
+routes.add('GET', '/v1/users', handle)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes, 2, 8)

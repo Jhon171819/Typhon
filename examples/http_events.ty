@@ -1,0 +1,25 @@
+import typhon.http as http
+import typhon.web as web
+
+routes: web.Router = web.router()
+routes.use_errors()
+
+def next_event(after: str, state: Any) -> http.Event | None:
+    if after == '':
+        return http.event('1', 'appointment', '{"status":"scheduled"}')
+    if after == '1':
+        return http.event('2', 'appointment', '{"status":"completed"}')
+    return None
+
+def events(req: http.Request) -> http.Response:
+    return http.sse(next_event, None)
+
+def health(req: http.Request) -> http.Response:
+    return http.response(204, '')
+
+routes.add('GET', '/v1/events', events)
+routes.enable_sse('/v1/events', 300, 15)
+routes.add('GET', '/health', health)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

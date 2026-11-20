@@ -1,0 +1,48 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.validation as v
+import typhon.web as web
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+verifier: auth.Authenticator = auth.jwt(
+    http.env('AUTH_ISSUER'), http.env('AUTH_AUDIENCE'), http.env('AUTH_JWKS_URL')
+)
+policy: auth.Policy = auth.policy({'professional': ['appointments:list']})
+status_schema: v.Schema = v.enumeration(['scheduled', 'completed', 'cancelled'])
+filters: v.Schema = v.object({}, {'status': status_schema})
+pages: web.Paginator = web.paginator(http.env('PAGINATION_KEY'), 'id_asc', filters, 25, 100, 900)
+appointment: v.Schema = v.object({'id': v.integer(1), 'status': status_schema})
+listing: v.Schema = v.object({
+    'items': v.array(appointment, 0, 100),
+    'limit': v.integer(1, 100),
+    'next_cursor': v.nullable(v.text()),
+    'links': v.object({'next': v.nullable(v.text())})
+})
+routes: web.Router = web.router()
+routes.use_errors()
+routes.configure_docs('Appointments API', '1.0.0')
+
+def list_appointments(req: http.Request) -> http.Response:
+    page: web.Page = pages.parse(req)
+    rows: pg.Rows = db.query(
+        'SELECT id, status FROM appointments WHERE tenant_id = $1 AND id > $2 AND ($3::text IS NULL OR status = $3) ORDER BY id ASC LIMIT $4 OFFSET $5',
+        [req.tenant, page.after, page.filter('status'), page.limit + 1, page.offset]
+    )
+    items: list[dict[str, Any]] = []
+    i: int = 0
+    while i < rows.count and i < page.limit:
+        items.append({'id': rows.get(i, 'id'), 'status': rows.get(i, 'status')})
+        i = i + 1
+    if rows.count > page.limit:
+        last: int = rows.get(page.limit - 1, 'id')
+        return page.respond(items, last)
+    return page.respond(items)
+
+routes.add('GET', '/v1/appointments', list_appointments)
+routes.require_auth('GET', '/v1/appointments', verifier)
+routes.authorize('GET', '/v1/appointments', policy, 'appointments:list')
+routes.document('GET', '/v1/appointments', 'listAppointments', ['appointments'], {200: listing, 400: None}, None, pages.query_schema())
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

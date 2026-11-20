@@ -1,0 +1,574 @@
+package typhon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+)
+
+type Engine struct {
+	resources   resourceScope
+	lifecycleMu sync.Mutex
+	closing     bool
+	active      sync.WaitGroup
+	closeOnce   sync.Once
+	closeErr    error
+	// VM execution is serialized. join yields this lock while its child runs.
+	execMu        sync.Mutex
+	moduleMu      sync.Mutex
+	moduleRoot    string
+	strictImports bool
+	loading       map[string]bool
+	tasks         []*Task
+	requestTasks  int // guarded by execMu
+	ctx           context.Context
+	cancel        context.CancelFunc
+	modules       map[string]*LoadedModule
+	infos         map[string]*ModuleInfo
+	root          string
+	bridge        *PythonBridge
+	bridgeErr     error
+	bridgeDone    chan struct{}
+	bridgeMu      sync.Mutex
+	warmPython    bool
+	sharedPython  bool
+	httpWorker    bool
+	openAPIExport bool
+	httpMetrics   atomic.Pointer[httpPoolMetrics]
+	postgresPools *postgresPoolRegistry
+	quotas        quotaLimits
+	quotaErr      error
+}
+
+type LoadedModule struct {
+	Executing  bool
+	ExecuteErr error
+	Path       string
+	Name       string
+	Program    *Program
+	Info       *ModuleInfo
+	Globals    map[string]Value
+	Executed   bool
+	Engine     *Engine
+}
+
+func NewEngine() *Engine {
+	return NewEngineWithContext(context.Background())
+}
+
+func NewEngineWithContext(parent context.Context) *Engine {
+	ctx, cancel := context.WithCancel(parent)
+	limits, limitErr := configuredQuotas()
+	return &Engine{
+		ctx: ctx, cancel: cancel, loading: map[string]bool{},
+		modules: map[string]*LoadedModule{},
+		infos:   map[string]*ModuleInfo{},
+		quotas:  limits, quotaErr: limitErr,
+		postgresPools: &postgresPoolRegistry{},
+	}
+}
+
+func RunFile(path string) error {
+	return RunFileWithOptions(path, RunOptions{
+		WarmPython:   envEnabled("TYPHON_WARM_PYTHON"),
+		SharedPython: envEnabled("TYPHON_SHARED_PYTHON"),
+	})
+}
+
+func RunFileWithOptions(path string, options RunOptions) (runErr error) {
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	engine := NewEngineWithContext(ctx)
+	engine.warmPython = options.WarmPython
+	engine.sharedPython = options.SharedPython
+	defer func() {
+		cleanupErr := engine.Close()
+		if ctx.Err() != nil && errors.Is(runErr, context.Canceled) {
+			// The CLI treats cancellation as graceful shutdown.
+			reportCleanupError("Engine shutdown", cleanupErr)
+		}
+		runErr = finalizeRun(runErr, cleanupErr)
+	}()
+	module, err := engine.LoadModule(path)
+	if err != nil {
+		return err
+	}
+	return engine.ExecuteModule(module, true)
+}
+
+func CheckFile(path string) error {
+	engine := NewEngine()
+	defer engine.Close()
+	_, err := engine.LoadModule(path)
+	return err
+}
+
+func CheckImports(path string) error {
+	engine := NewEngine()
+	defer engine.Close()
+	engine.strictImports = true
+	_, err := engine.LoadModule(path)
+	return err
+}
+
+func BytecodeFile(path string) (string, error) {
+	engine := NewEngine()
+	defer engine.Close()
+	module, err := engine.LoadModule(path)
+	if err != nil {
+		return "", err
+	}
+	return Disassemble(module.Program), nil
+}
+
+func (e *Engine) LoadModule(path string) (*LoadedModule, error) {
+	e.moduleMu.Lock()
+	defer e.moduleMu.Unlock()
+	return e.loadModule(path, false)
+}
+
+func (e *Engine) loadModule(path string, imported bool) (*LoadedModule, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.initializeModuleRoot(filepath.Dir(abs)); err != nil {
+		return nil, err
+	}
+	if imported {
+		rel, err := filepath.Rel(e.moduleRoot, abs)
+		if err != nil || !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("Typhon import leaves module root: %s", path)
+		}
+	}
+	if module, ok := e.modules[abs]; ok {
+		return module, nil
+	}
+	if e.loading[abs] {
+		return nil, fmt.Errorf("cyclic Typhon import: %s", abs)
+	}
+	e.loading[abs] = true
+	defer delete(e.loading, abs)
+	if e.root == "" {
+		e.bridgeMu.Lock()
+		e.root = projectRoot(filepath.Dir(abs))
+		e.bridgeMu.Unlock()
+	}
+	if e.warmPython {
+		e.StartPythonBridgeWarmup()
+	}
+	var source []byte
+	if imported {
+		source, err = e.readImportedSource(abs)
+	} else {
+		source, err = os.ReadFile(abs) // #nosec G703 -- The host explicitly selects the entry point. Imports use readImportedSource.
+	}
+	if err != nil {
+		return nil, err
+	}
+	ast, err := ParseFile(abs, string(source))
+	if err != nil {
+		return nil, err
+	}
+	info, err := CheckModule(ast, lockedImportResolver{e})
+	if err != nil {
+		return nil, err
+	}
+	program, err := CompileModule(ast)
+	if err != nil {
+		return nil, err
+	}
+	module := &LoadedModule{
+		Path:    abs,
+		Name:    moduleNameFromPath(e.moduleRoot, abs),
+		Program: program,
+		Info:    info,
+		Globals: runtimeGlobals(),
+		Engine:  e,
+	}
+	e.modules[abs] = module
+	e.infos[abs] = info
+	return module, nil
+}
+
+type lockedImportResolver struct{ engine *Engine }
+
+func (r lockedImportResolver) ResolveImport(module, fromDir string) (*ModuleInfo, error) {
+	loaded, err := r.engine.loadNamedModule(module, fromDir)
+	if err != nil {
+		if r.engine.strictImports && errors.Is(err, ErrModuleNotFound) {
+			return nil, fmt.Errorf("%v; use py.%s for an explicit Python import", err, module)
+		}
+		return nil, err
+	}
+	return loaded.Info, nil
+}
+
+func (e *Engine) loadNamedModule(module, fromDir string) (*LoadedModule, error) {
+	path, err := e.modulePath(module, fromDir)
+	if err != nil {
+		return nil, err
+	}
+	return e.loadModule(path, true)
+}
+
+type RunOptions struct {
+	Context      context.Context
+	WarmPython   bool
+	SharedPython bool
+}
+
+func (e *Engine) ResolveImport(module string, fromDir string) (*ModuleInfo, error) {
+	if info, ok := nativeDriverInfo(module); ok {
+		return info, nil
+	}
+	if module == "typhon.parallel" {
+		return parallelModuleInfo(), nil
+	}
+	if isPythonImport(module) {
+		return pythonModuleInfo(module), nil
+	}
+	e.moduleMu.Lock()
+	defer e.moduleMu.Unlock()
+	return (lockedImportResolver{e}).ResolveImport(module, fromDir)
+}
+
+func (e *Engine) LoadModuleByName(module string, fromDir string) (*LoadedModule, error) {
+	if e.quotaErr != nil {
+		return nil, e.quotaErr
+	}
+	if !e.beginExecution() {
+		return nil, e.ctx.Err()
+	}
+	defer e.active.Done()
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	return e.loadModuleByNameLocked(e.ctx, nil, module, fromDir)
+}
+
+func (e *Engine) loadModuleByNameLocked(ctx context.Context, budget *executionBudget, module string, fromDir string) (*LoadedModule, error) {
+	if module == "typhon.parallel" {
+		return &LoadedModule{
+			Path:     "<typhon.parallel>",
+			Name:     "typhon.parallel",
+			Info:     parallelModuleInfo(),
+			Globals:  runtimeGlobals(),
+			Executed: true,
+			Engine:   e,
+		}, nil
+	}
+	if isPythonImport(module) {
+		return nil, fmt.Errorf("python module %q is handled by the Python bridge", module)
+	}
+	e.moduleMu.Lock()
+	loaded, err := e.loadNamedModule(module, fromDir)
+	e.moduleMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if !loaded.Executed {
+		if err := e.executeModuleLocked(ctx, budget, loaded, false); err != nil {
+			return nil, err
+		}
+	}
+	return loaded, nil
+}
+
+func (e *Engine) PythonBridge() (*PythonBridge, error) {
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.bridgeMu.Lock()
+	if e.bridge != nil {
+		bridge := e.bridge
+		e.bridgeMu.Unlock()
+		return bridge, nil
+	}
+	if e.bridgeDone != nil {
+		done := e.bridgeDone
+		e.bridgeMu.Unlock()
+		<-done
+		e.bridgeMu.Lock()
+		if e.bridge != nil {
+			bridge := e.bridge
+			e.bridgeMu.Unlock()
+			return bridge, nil
+		}
+		if e.bridgeErr != nil {
+			err := e.bridgeErr
+			e.bridgeMu.Unlock()
+			return nil, err
+		}
+	}
+	e.bridgeMu.Unlock()
+
+	e.bridgeMu.Lock()
+	defer e.bridgeMu.Unlock()
+	if err := e.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if e.bridge != nil {
+		return e.bridge, nil
+	}
+	root := e.root
+	if root == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			root = projectRoot(cwd)
+		}
+	}
+	bridge, err := newPythonBridge(root, e.sharedPython)
+	if err != nil {
+		return nil, err
+	}
+	e.bridge = bridge
+	return bridge, nil
+}
+
+func (e *Engine) StartPythonBridgeWarmup() {
+	e.bridgeMu.Lock()
+	if e.ctx.Err() != nil {
+		e.bridgeMu.Unlock()
+		return
+	}
+	if e.bridge != nil || e.bridgeDone != nil {
+		e.bridgeMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	e.bridgeDone = done
+	root := e.root
+	if root == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			root = projectRoot(cwd)
+		}
+	}
+	e.bridgeMu.Unlock()
+
+	go func() {
+		bridge, err := newPythonBridge(root, e.sharedPython)
+		if err == nil {
+			err = bridge.Ping()
+			if err != nil {
+				_ = bridge.Close()
+				bridge = nil
+			}
+		}
+		e.bridgeMu.Lock()
+		if err != nil {
+			e.bridgeErr = err
+		} else {
+			e.bridge = bridge
+		}
+		close(done)
+		e.bridgeMu.Unlock()
+	}()
+}
+
+func (e *Engine) WarmPythonBridge() error {
+	bridge, err := e.PythonBridge()
+	if err != nil {
+		return err
+	}
+	return bridge.Ping()
+}
+
+func (e *Engine) beginExecution() bool {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	if e.closing {
+		return false
+	}
+	e.active.Add(1)
+	return true
+}
+
+func (e *Engine) Close() error {
+	e.closeOnce.Do(func() {
+		e.lifecycleMu.Lock()
+		e.closing = true
+		e.cancel()
+		e.lifecycleMu.Unlock()
+
+		// Closing the bridge first interrupts any in-flight Python transport.
+		// Cancellation finally blocks can still close native handles.
+		bridgeErr := e.closeBridge()
+		e.active.Wait()
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		e.closeErr = errors.Join(e.resources.close(ctx), bridgeErr)
+	})
+	return e.closeErr
+}
+
+func (e *Engine) closeBridge() error {
+	e.bridgeMu.Lock()
+	done := e.bridgeDone
+	e.bridgeMu.Unlock()
+	if done != nil {
+		<-done
+	}
+	e.bridgeMu.Lock()
+	bridge := e.bridge
+	e.bridgeMu.Unlock()
+	if bridge == nil {
+		return nil
+	}
+	return bridge.Close()
+}
+
+func (e *Engine) ExecuteModule(module *LoadedModule, main bool) error {
+	if e.quotaErr != nil {
+		return e.quotaErr
+	}
+	if module.Engine != e {
+		return errors.New("module belongs to another Engine")
+	}
+	if !e.beginExecution() {
+		return e.ctx.Err()
+	}
+	defer e.active.Done()
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	err := e.executeModuleLocked(e.ctx, nil, module, main)
+	if main {
+		if err != nil {
+			e.stopTasks(err)
+		}
+		for i := 0; i < len(e.tasks); i++ {
+			task := e.tasks[i]
+			e.execMu.Unlock()
+			<-task.done
+			e.execMu.Lock()
+			if err == nil && !task.observed && task.result.err != nil && !(task.cancelled && errors.Is(task.result.err, context.Canceled)) {
+				err = fmt.Errorf("child task: %w", task.result.err)
+				e.stopTasks(err)
+			}
+			task.observed = true
+		}
+	}
+	return err
+}
+
+func (e *Engine) stopTasks(err error) {
+	var exception *Exception
+	if !errors.As(err, &exception) {
+		e.cancel()
+		return
+	}
+	for _, task := range e.tasks {
+		task.cancel()
+	}
+}
+
+func (e *Engine) executeModuleLocked(ctx context.Context, budget *executionBudget, module *LoadedModule, main bool) error {
+	if module.Executing {
+		return fmt.Errorf("cyclic module execution: %s", module.Path)
+	}
+	if module.ExecuteErr != nil {
+		return module.ExecuteErr
+	}
+	if module.Executed {
+		return nil
+	}
+	module.Globals["__file__"] = StringValue(module.Path)
+	packageName := ""
+	if filepath.Base(module.Path) == "__init__.ty" {
+		packageName = module.Name
+	} else if i := strings.LastIndexByte(module.Name, '.'); i >= 0 {
+		packageName = module.Name[:i]
+	}
+	module.Globals["__package__"] = StringValue(packageName)
+	if main {
+		module.Globals["__name__"] = StringValue("__main__")
+	} else {
+		module.Globals["__name__"] = StringValue(module.Name)
+	}
+	module.Executing = true
+	defer func() { module.Executing = false }()
+	vm := &VM{engine: e, module: module, depth: 1, ctx: ctx, budget: budget}
+	_, err := vm.runFunction(module.Program.Module, nil)
+	if err != nil {
+		module.ExecuteErr = err
+		return err
+	}
+	module.Executed = true
+	return nil
+}
+
+var ErrModuleNotFound = errors.New("Typhon module not found")
+
+func moduleNameFromPath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(rel) {
+		rel = filepath.Base(path)
+	}
+	if filepath.Base(rel) == "__init__.ty" && filepath.Dir(rel) != "." {
+		rel = filepath.Dir(rel)
+	} else {
+		rel = strings.TrimSuffix(rel, filepath.Ext(rel))
+	}
+	return strings.ReplaceAll(filepath.ToSlash(rel), "/", ".")
+}
+
+func projectRoot(start string) string {
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(abs, "go.mod")); err == nil { // #nosec G703 -- Search parent directories for the fixed module marker.
+			return abs
+		}
+		parent := filepath.Dir(abs)
+		if parent == abs {
+			return start
+		}
+		abs = parent
+	}
+}
+
+func importBindingName(name string) string {
+	name = trimPythonNamespace(name)
+	parts := strings.Split(name, ".")
+	if len(parts) == 0 {
+		return name
+	}
+	return parts[0]
+}
+
+func parallelModuleInfo() *ModuleInfo {
+	return &ModuleInfo{
+		Path: "<typhon.parallel>",
+		Exports: map[string]Type{
+			"TyphonTask": TaskType(),
+			"spawn":      {Kind: TypeFunc, Name: "spawn", Variadic: true, Params: []Type{AnyType()}, Return: typePtr(TaskType())},
+			"join":       {Kind: TypeFunc, Name: "join", Params: []Type{TaskType()}, Return: typePtr(AnyType())},
+			"cancel":     {Kind: TypeFunc, Name: "cancel", Params: []Type{TaskType()}, Return: typePtr(NoneType())},
+		},
+		Classes: map[string]*ClassInfo{},
+	}
+}
+
+func pythonModuleInfo(module string) *ModuleInfo {
+	return &ModuleInfo{
+		Path:    "<" + module + ">",
+		Exports: map[string]Type{},
+		Classes: map[string]*ClassInfo{},
+	}
+}
+
+func envEnabled(name string) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}

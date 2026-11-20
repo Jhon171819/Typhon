@@ -1,0 +1,25 @@
+type Scores = dict[str, int]
+
+
+def total(scores: Scores) -> int:
+    result: int = 0
+    for name: str, score: int in scores.items():
+        print(f'{name}: {score}')
+        result = result + score
+    return result
+
+
+scores: Scores = {
+    'Ada': 10,
+    'Grace': 20,
+}
+scores['Ada'] = scores['Ada'] + 5
+scores['Linus'] = 8
+print(total(scores))
+print('Ada' in scores, 'missing' not in scores)
+print(scores.get('missing', 0))
+print(scores.keys(), len(scores))
+del scores['Linus']
+
+import json
+print(json.dumps(scores))

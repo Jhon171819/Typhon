@@ -1,0 +1,248 @@
+package typhon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync/atomic"
+	"time"
+)
+
+type httpPoolMetrics struct {
+	admitted, rejected, completed       atomic.Int64
+	waiting, peak, waitNS               atomic.Int64
+	quotaRejected                       atomic.Int64
+	rateAllowed, rateDenied, rateErrors atomic.Int64
+	eventConnections                    atomic.Int64
+}
+
+func (m *httpPoolMetrics) snapshot() Value {
+	result := DictValue()
+	for _, metric := range []struct {
+		name  string
+		value *atomic.Int64
+	}{
+		{"admitted", &m.admitted}, {"rejected", &m.rejected}, {"completed", &m.completed},
+		{"queued", &m.waiting}, {"queue_peak", &m.peak}, {"queue_wait_ns", &m.waitNS},
+		{"quota_rejected", &m.quotaRejected},
+		{"rate_allowed", &m.rateAllowed}, {"rate_denied", &m.rateDenied}, {"rate_errors", &m.rateErrors},
+		{"event_connections", &m.eventConnections},
+	} {
+		_ = result.Dict.put(StringValue(metric.name), IntValue(metric.value.Load()))
+	}
+	return result
+}
+
+type httpWorkerPool struct {
+	ctx             context.Context
+	idle            chan http.Handler
+	admission       chan struct{}
+	engines         []*Engine
+	metrics         httpPoolMetrics
+	requestTimeout  time.Duration
+	liveness        string
+	apiErrors       bool
+	browser         webBrowserPolicy
+	eventRouter     *webRouter
+	eventHandlers   []http.Handler
+	eventSlots      chan struct{}
+	eventRoundRobin atomic.Uint64
+	eventContext    context.Context
+	stopEvents      context.CancelFunc
+}
+
+func newHTTPWorkerPool(ctx context.Context, workers, queue int) *httpWorkerPool {
+	return &httpWorkerPool{
+		ctx: ctx, idle: make(chan http.Handler, workers),
+		admission: make(chan struct{}, workers+queue), requestTimeout: defaultRequestTimeout,
+	}
+}
+
+func (p *httpWorkerPool) load(vm *VM, handler Value) error {
+	router, routed := routerValue(handler)
+	if routed {
+		router.frozen = true
+		p.apiErrors = router.apiErrors
+		p.browser = router.browser
+		if router.hasSSE {
+			p.eventRouter = router
+			p.eventSlots = make(chan struct{}, maxSSEConnections)
+			p.eventContext, p.stopEvents = context.WithCancel(p.ctx)
+		}
+	}
+	addWorker := func(engine *Engine, entry Value) {
+		server := httpVMHandlerWithContext(engine, entry, p.requestTimeout, p.ctx)
+		p.idle <- server
+		if p.eventRouter != nil {
+			p.eventHandlers = append(p.eventHandlers, server)
+		}
+	}
+	addWorker(vm.engine, handler)
+	if cap(p.idle) == 1 {
+		return nil
+	}
+	path, binding, err := httpWorkerBinding(handler)
+	if err != nil {
+		return err
+	}
+	for i := 1; i < cap(p.idle); i++ {
+		if err := vm.executionError(); err != nil {
+			return err
+		}
+		engine := NewEngineWithContext(p.ctx)
+		engine.httpWorker = true
+		engine.postgresPools = vm.engine.postgresPools
+		engine.httpMetrics.Store(&p.metrics)
+		p.engines = append(p.engines, engine)
+		module, err := engine.LoadModule(path)
+		if err == nil {
+			err = engine.ExecuteModule(module, false)
+		}
+		if err != nil {
+			return fmt.Errorf("HTTP worker %d initialization: %w", i+1, err)
+		}
+		entry := module.Globals[binding]
+		if routed {
+			cloned, ok := routerValue(entry)
+			if !ok {
+				return fmt.Errorf("HTTP worker %d could not resolve router %q", i+1, binding)
+			}
+			cloned.frozen = true
+			cloned.apiErrors = p.apiErrors
+		} else if entry.Kind != ValueFunction || !entry.Function.Signature.Equal(handler.Function.Signature) {
+			return fmt.Errorf("HTTP worker %d could not resolve handler %q", i+1, binding)
+		}
+		addWorker(engine, entry)
+	}
+	return nil
+}
+
+func httpWorkerBinding(handler Value) (path, binding string, err error) {
+	router, routed := routerValue(handler)
+	if !routed {
+		return handler.Function.ModulePath, handler.Function.Name, nil
+	}
+	if router.module != nil {
+		for name, value := range router.module.Globals {
+			if value.Kind == ValueNativeObject && value.NativeObject == handler.NativeObject && (binding == "" || name < binding) {
+				binding = name
+			}
+		}
+		if binding != "" {
+			return router.module.Path, binding, nil
+		}
+	}
+	return "", "", errors.New("a multi-worker router must be assigned to a module global")
+}
+
+func (p *httpWorkerPool) close() error {
+	if p.stopEvents != nil {
+		p.stopEvents()
+	}
+	var failures []error
+	for i := len(p.engines) - 1; i >= 0; i-- {
+		if err := p.engines[i].Close(); err != nil {
+			failures = append(failures, fmt.Errorf("HTTP worker %d: %w", i+2, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (p *httpWorkerPool) ServeHTTP(writer http.ResponseWriter, req *http.Request) {
+	problems := problemWriter{enabled: p.apiErrors, head: req.Method == http.MethodHead}
+	if p.liveness != "" && req.URL.Path == p.liveness {
+		if req.Method == http.MethodGet || req.Method == http.MethodHead {
+			writer.WriteHeader(http.StatusNoContent)
+		} else {
+			writer.Header().Set("Allow", "GET, HEAD")
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	if p.ctx.Err() != nil {
+		p.reject(writer, "server shutting down", problems)
+		return
+	}
+	if p.eventRouter != nil && req.Method == http.MethodGet {
+		if route := p.eventRouter.requestRoute(req.URL.EscapedPath(), req.Method); route != nil && route.sse != nil {
+			p.serveEvent(writer, req, problems)
+			return
+		}
+	}
+	ctx, cancel := httpRequestContext(req.Context(), p.ctx, p.requestTimeout)
+	defer cancel()
+	select {
+	case p.admission <- struct{}{}:
+		defer func() { <-p.admission }()
+	default:
+		p.reject(writer, "server busy", problems)
+		return
+	}
+	p.metrics.admitted.Add(1)
+	queuedAt := time.Now()
+	var worker http.Handler
+	select {
+	case worker = <-p.idle:
+	default:
+		worker = p.wait(ctx)
+	}
+	if worker == nil {
+		p.metrics.rejected.Add(1)
+		writeHTTPStop(writer, p.ctx, ctx.Err(), problems)
+		return
+	}
+	defer func() { p.idle <- worker }()
+	observeRequest(ctx).stage("queue", time.Since(queuedAt))
+	if ctx.Err() != nil || p.ctx.Err() != nil {
+		p.metrics.rejected.Add(1)
+		writeHTTPStop(writer, p.ctx, ctx.Err(), problems)
+		return
+	}
+	worker.ServeHTTP(writer, req.WithContext(ctx))
+	p.metrics.completed.Add(1)
+}
+
+func (p *httpWorkerPool) serveEvent(writer http.ResponseWriter, req *http.Request, problems problemWriter) {
+	select {
+	case p.eventSlots <- struct{}{}:
+		defer func() { <-p.eventSlots }()
+	default:
+		p.reject(writer, "too many event streams", problems)
+		return
+	}
+	p.metrics.eventConnections.Add(1)
+	defer p.metrics.eventConnections.Add(-1)
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(p.eventContext, cancel)
+	defer cancel()
+	defer stop()
+	index := (p.eventRoundRobin.Add(1) - 1) % uint64(len(p.eventHandlers))
+	p.eventHandlers[index].ServeHTTP(writer, req.WithContext(ctx))
+}
+
+func (p *httpWorkerPool) wait(ctx context.Context) http.Handler {
+	start := time.Now()
+	queued := p.metrics.waiting.Add(1)
+	for peak := p.metrics.peak.Load(); queued > peak; peak = p.metrics.peak.Load() {
+		if p.metrics.peak.CompareAndSwap(peak, queued) {
+			break
+		}
+	}
+	defer func() {
+		p.metrics.waiting.Add(-1)
+		p.metrics.waitNS.Add(time.Since(start).Nanoseconds())
+	}()
+	select {
+	case worker := <-p.idle:
+		return worker
+	case <-ctx.Done():
+	case <-p.ctx.Done():
+	}
+	return nil
+}
+
+func (p *httpWorkerPool) reject(writer http.ResponseWriter, message string, problems problemWriter) {
+	p.metrics.rejected.Add(1)
+	problems.write(writer, http.StatusServiceUnavailable, message)
+}

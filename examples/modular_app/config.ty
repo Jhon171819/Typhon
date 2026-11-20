@@ -1,0 +1,2 @@
+type DefaultName = str
+fallback: str = 'guest'

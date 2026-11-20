@@ -1,0 +1,25 @@
+import typhon.http as http
+import typhon.web as web
+import typhon.validation as v
+
+schema: v.Schema = v.object({'name': v.text(1, 80)})
+routes: web.Router = web.router()
+routes.use_errors()
+routes.use_request_id()
+
+def create(req: http.Request) -> http.Response:
+    payload: Any = req.json()
+    problem: http.Response | None = web.validate(req, schema, payload)
+    if problem is not None:
+        return problem
+    dto: dict[str, Any] = payload
+    return http.json(201, {'name': dto['name']})
+
+def unavailable(req: http.Request) -> http.Response:
+    raise web.reject(503)
+
+routes.add('POST', '/v1/users', create)
+routes.add('GET', '/v1/unavailable', unavailable)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

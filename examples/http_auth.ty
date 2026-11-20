@@ -1,0 +1,26 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.web as web
+
+verifier: auth.Authenticator = auth.jwt(
+    'https://issuer.example.org',
+    'orders-api',
+    'https://issuer.example.org/.well-known/jwks.json',
+    60
+)
+routes: web.Router = web.router()
+routes.use_request_id()
+routes.use_errors()
+
+def health(req: http.Request) -> http.Response:
+    return http.response(200, 'ok')
+
+def account(req: http.Request) -> http.Response:
+    return http.json(200, {'subject': req.identity, 'tenant': req.tenant})
+
+routes.add('GET', '/health', health)
+routes.add('GET', '/account', account)
+routes.require_auth('GET', '/account', verifier)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

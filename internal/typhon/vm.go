@@ -1,0 +1,1020 @@
+package typhon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+)
+
+type VM struct {
+	request       *requestScope
+	running       bool
+	cleanupCtx    context.Context
+	cleanupCancel context.CancelFunc
+	cleanupSteps  int
+	cleanupBytes  int64
+	ctx           context.Context
+	depth         int
+	instructions  int
+	budget        *executionBudget
+	engine        *Engine
+	module        *LoadedModule
+}
+
+type frame struct {
+	fn      *Function
+	locals  []Value
+	stack   []Value
+	pc      int
+	module  *LoadedModule
+	line    int
+	regions []activeRegion
+}
+
+func runtimeGlobals() map[string]Value {
+	globals := map[string]Value{}
+	globals["print"] = nativeValue("print", nativePrint)
+	globals["len"] = nativeValue("len", nativeLen)
+	globals["dict"] = nativeValue("dict", nativeDict)
+	globals["spawn"] = nativeValue("spawn", nativeSpawn)
+	globals["join"] = nativeValue("join", nativeJoin)
+	globals["cancel"] = nativeValue("cancel", nativeCancel)
+	globals["enumerate"] = nativeValue("enumerate", nativeEnumerate)
+	globals["range"] = nativeValue("range", nativeRange)
+	globals["TyphonTask"] = Value{Kind: ValueClass, Class: &RuntimeClass{Spec: &ClassSpec{Name: "TyphonTask"}, FieldIndex: map[string]int{}}}
+	globals["None"] = NoneValue()
+	globals["True"] = BoolValue(true)
+	globals["False"] = BoolValue(false)
+	globals["__name__"] = StringValue("")
+	globals["__file__"] = StringValue("")
+	for _, name := range exceptionNames {
+		globals[name] = exceptionConstructor(name)
+	}
+	return globals
+}
+
+func nativeValue(name string, fn func(*VM, []Value) (Value, error)) Value {
+	return Value{Kind: ValueNative, Native: &NativeFunc{Name: name, Fn: fn}}
+}
+
+func (vm *VM) runFunction(fn *Function, args []Value) (Value, error) {
+	if fn.Module != nil && fn.Module.Engine != vm.engine {
+		return NoneValue(), &Exception{kind: validationKind, message: "function belongs to another Engine"}
+	}
+	if vm.depth == 0 {
+		vm.engine.execMu.Lock()
+		defer vm.engine.execMu.Unlock()
+	}
+	if !vm.running {
+		vm.running = true
+		defer func() {
+			vm.running = false
+			if vm.cleanupCancel != nil {
+				vm.cleanupCancel()
+				vm.cleanupCtx, vm.cleanupCancel = nil, nil
+			}
+		}()
+	}
+	vm.depth++
+	defer func() { vm.depth-- }()
+	if vm.depth > 256 {
+		return NoneValue(), &executionStop{cause: errors.New("Typhon call depth limit exceeded")}
+	}
+	previousModule := vm.module
+	defer func() { vm.module = previousModule }()
+	if fn.Module != nil {
+		vm.module = fn.Module
+	}
+	if vm.module == nil {
+		vm.module = fn.Module
+	}
+	if len(args) != len(fn.Params) {
+		return NoneValue(), traceFrame(fn, 0, fmt.Errorf("%s expected %d arguments, got %d", fn.Name, len(fn.Params), len(args)))
+	}
+	if err := vm.chargeBytes(int64(len(fn.LocalNames)) * valueSlotBytes); err != nil {
+		return NoneValue(), traceFrame(fn, 0, err)
+	}
+	locals := make([]Value, len(fn.LocalNames))
+	for i, arg := range args {
+		if i < len(fn.Signature.Params) {
+			var err error
+			arg, err = validateValue(arg, fn.Signature.Params[i])
+			if err != nil {
+				return NoneValue(), traceFrame(fn, 0, fmt.Errorf("argument %s: %w", fn.Params[i], err))
+			}
+		}
+		locals[i] = arg
+	}
+	f := &frame{fn: fn, locals: locals, module: vm.module}
+	for {
+		exit, err := vm.runFrame(f)
+		if stop := vm.executionError(); stop != nil {
+			var stopped *executionStop
+			if !errors.As(err, &stopped) {
+				if errors.As(exit.err, &stopped) && stopped.cancelled {
+					reportCleanupError("finally", stop)
+					return NoneValue(), exit.err
+				}
+				reportCleanupError("error pending before execution stopped", exit.err)
+				err = stop
+			}
+		}
+		if err != nil {
+			exit = completion{target: -1, err: traceFrame(fn, f.line, err)}
+		}
+		if vm.unwind(f, &exit) {
+			continue
+		}
+		if exit.err != nil {
+			return NoneValue(), exit.err
+		}
+		if fn.Signature.Return != nil {
+			value, err := validateValue(exit.value, *fn.Signature.Return)
+			if err != nil {
+				return NoneValue(), traceFrame(fn, exit.line, err)
+			}
+			return value, nil
+		}
+		return exit.value, nil
+	}
+}
+
+func (vm *VM) runFrame(f *frame) (completion, error) {
+	fn := f.fn
+	for f.pc < len(fn.Code) {
+		if err := vm.executionError(); err != nil {
+			return completion{}, err
+		}
+		if err := vm.chargeWork(); err != nil {
+			return completion{}, err
+		}
+		instr := fn.Code[f.pc]
+		f.line = instr.Line
+		f.pc++
+		switch instr.Op {
+		case OpTry:
+			f.regions = append(f.regions, activeRegion{spec: &fn.regions[instr.A], height: len(f.stack), slot: -1})
+		case OpLeave:
+			return completion{target: instr.A, depth: instr.Depth}, nil
+		case OpEndFinally:
+			pending := f.regions[len(f.regions)-1].pending
+			f.popRegion()
+			return pending, nil
+		case OpRaise:
+			value := f.pop()
+			if value.Kind != ValueException || value.Exception == nil {
+				return completion{}, &Exception{kind: validationKind, message: fmt.Sprintf("raise requires Error, got %s", value.Kind)}
+			}
+			return completion{}, value.Exception
+		case OpReraise:
+			return completion{target: -1, err: f.reraise()}, nil
+		case OpDup:
+			f.push(f.peek())
+		case OpJumpIfTrue:
+			if truthy(f.pop()) {
+				f.pc = instr.A
+			}
+		case OpUnary:
+			value := f.pop()
+			if instr.S == "not" {
+				f.push(BoolValue(!truthy(value)))
+				continue
+			}
+			if value.Kind != ValueInt && value.Kind != ValueFloat {
+				return completion{}, fmt.Errorf("unary sign requires a number")
+			}
+			if instr.S == "-" {
+				if value.Kind == ValueInt {
+					if value.Int == math.MinInt64 {
+						return completion{}, fmt.Errorf("int64 overflow in unary -")
+					}
+					value.Int = -value.Int
+				} else {
+					value.Float = -value.Float
+				}
+			}
+			f.push(value)
+		case OpCompare:
+			right, left := f.pop(), f.pop()
+			cmp, err := compareValues(left, right)
+			if err != nil {
+				return completion{}, err
+			}
+			result := false
+			switch instr.S {
+			case "<":
+				result = cmp < 0
+			case "<=":
+				result = cmp <= 0
+			case ">":
+				result = cmp > 0
+			case ">=":
+				result = cmp >= 0
+			}
+			f.push(BoolValue(result))
+		case OpCheckType:
+			value, err := validateValue(f.pop(), instr.Type)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(value)
+		case OpConst:
+			f.push(instr.Val)
+		case OpLoadGlobal:
+			value, ok := f.module.Globals[instr.S]
+			if !ok {
+				return completion{}, fmt.Errorf("%s: unknown global %q", fn.Name, instr.S)
+			}
+			f.push(value)
+		case OpStoreGlobal:
+			f.module.Globals[instr.S] = f.pop()
+		case OpLoadLocal:
+			if f.locals[instr.A].Kind == "" {
+				return completion{}, fmt.Errorf("variable %q is not initialized", fn.LocalNames[instr.A])
+			}
+			f.push(f.locals[instr.A])
+		case OpStoreLocal:
+			f.locals[instr.A] = f.pop()
+		case OpPop:
+			_ = f.pop()
+		case OpAdd, OpSub, OpMul, OpDiv, OpFloorDiv, OpMod:
+			right := f.pop()
+			left := f.pop()
+			value, err := arithmetic(vm, instr.Op, left, right)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(value)
+		case OpEqual:
+			right := f.pop()
+			left := f.pop()
+			f.push(BoolValue(valuesEqual(left, right)))
+		case OpNotEqual:
+			right := f.pop()
+			left := f.pop()
+			f.push(BoolValue(!valuesEqual(left, right)))
+		case OpIs:
+			right := f.pop()
+			left := f.pop()
+			f.push(BoolValue(valuesIdentical(left, right)))
+		case OpIsNot:
+			right := f.pop()
+			left := f.pop()
+			f.push(BoolValue(!valuesIdentical(left, right)))
+		case OpJumpIfFalse:
+			if !truthy(f.pop()) {
+				f.pc = instr.A
+			}
+		case OpJump:
+			f.pc = instr.A
+		case OpCall:
+			totalArgs := instr.A
+			args := make([]Value, totalArgs)
+			for i := totalArgs - 1; i >= 0; i-- {
+				args[i] = f.pop()
+			}
+			keywordCount := len(instr.Keywords)
+			positionalCount := totalArgs - keywordCount
+			kwargs := map[string]Value{}
+			for i, name := range instr.Keywords {
+				kwargs[name] = args[positionalCount+i]
+			}
+			callee := f.pop()
+			result, err := vm.callValue(callee, args[:positionalCount], kwargs)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(result)
+		case OpReturn:
+			return completion{target: -1, value: f.pop(), line: instr.Line}, nil
+		case OpMakeList:
+			if err := vm.chargeBytes(int64(instr.A) * 2 * valueSlotBytes); err != nil {
+				return completion{}, err
+			}
+			items := make([]Value, instr.A)
+			for i := instr.A - 1; i >= 0; i-- {
+				items[i] = f.pop()
+			}
+			f.push(ListValue(items))
+		case OpMakeDict:
+			if instr.A > maxCollectionItems {
+				return completion{}, fmt.Errorf("dictionary size limit exceeded")
+			}
+			if err := vm.chargeBytes(int64(instr.A) * 4 * valueSlotBytes); err != nil {
+				return completion{}, err
+			}
+			entries := make([]DictEntry, instr.A)
+			for i := instr.A - 1; i >= 0; i-- {
+				entries[i].Value = f.pop()
+				entries[i].Key = f.pop()
+			}
+			dict := DictValue()
+			for _, entry := range entries {
+				if err := dict.Dict.put(entry.Key, entry.Value); err != nil {
+					return completion{}, err
+				}
+			}
+			f.push(dict)
+		case OpGetIndex:
+			key, obj := f.pop(), f.pop()
+			value, err := getIndex(obj, key)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(value)
+		case OpSetIndex:
+			key, obj, value := f.pop(), f.pop(), f.pop()
+			if obj.Kind == ValueDict {
+				if err := vm.chargeBytes(2 * valueSlotBytes); err != nil {
+					return completion{}, err
+				}
+			}
+			if err := setIndex(obj, key, value); err != nil {
+				return completion{}, err
+			}
+		case OpDelIndex:
+			key, obj := f.pop(), f.pop()
+			if obj.Kind != ValueDict || obj.Dict == nil {
+				return completion{}, fmt.Errorf("del requires a dictionary")
+			}
+			key, err := obj.Dict.checkKey(key)
+			if err != nil {
+				return completion{}, err
+			}
+			i, ok, err := obj.Dict.lookup(key)
+			if err != nil {
+				return completion{}, err
+			}
+			if !ok {
+				return completion{}, fmt.Errorf("KeyError: %s", key.String())
+			}
+			obj.Dict.remove(i)
+		case OpContains:
+			obj, key := f.pop(), f.pop()
+			ok, err := containsValue(obj, key)
+			if err != nil {
+				return completion{}, err
+			}
+			if instr.S == "not in" {
+				ok = !ok
+			}
+			f.push(BoolValue(ok))
+		case OpGetAttr:
+			value, err := vm.getAttr(f.pop(), instr.S)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(value)
+		case OpSetAttr:
+			value := f.pop()
+			object := f.pop()
+			if err := vm.setAttr(object, instr.S, value); err != nil {
+				return completion{}, err
+			}
+		case OpIter:
+			iterable := f.pop()
+			items, err := vm.collectionValues(iterable)
+			if err != nil {
+				return completion{}, err
+			}
+			f.push(Value{Kind: ValueIterator, Iterator: &Iterator{values: items}})
+		case OpIterNext:
+			iter := f.peek()
+			if iter.Kind != ValueIterator || iter.Iterator == nil {
+				return completion{}, fmt.Errorf("invalid iterator")
+			}
+			if iter.Iterator.index >= len(iter.Iterator.values) {
+				f.pc = instr.A
+				continue
+			}
+			item := iter.Iterator.values[iter.Iterator.index]
+			iter.Iterator.index++
+			f.push(item)
+		case OpUnpackStore:
+			value := f.pop()
+			items, err := unpackValues(value, len(instr.Names))
+			if err != nil {
+				return completion{}, err
+			}
+			for i, name := range instr.Names {
+				if i < len(instr.Types) {
+					items[i], err = validateValue(items[i], instr.Types[i])
+					if err != nil {
+						return completion{}, err
+					}
+				}
+				if idx, ok := f.fn.LocalIndex[name]; ok && f.fn.Name != "<module>" {
+					f.locals[idx] = items[i]
+				} else {
+					f.module.Globals[name] = items[i]
+				}
+			}
+		case OpDefineFunc:
+			fnCopy := *instr.Fn
+			fnCopy.Module = f.module
+			f.module.Globals[instr.S] = Value{Kind: ValueFunction, Function: &fnCopy}
+		case OpDefineClass:
+			class := runtimeClass(instr.Class, f.module)
+			f.module.Globals[instr.Class.Name] = Value{Kind: ValueClass, Class: class}
+		case OpImportModule, OpImportFrom:
+			module, err := vm.importModule(instr.S, filepathDir(f.module.Path))
+			if err != nil {
+				return completion{}, err
+			}
+			if instr.Op == OpImportModule {
+				f.module.Globals[instr.Names[0]] = module
+				continue
+			}
+			for i, name := range instr.Names {
+				binding := instr.Bindings[i]
+				if binding == "" {
+					continue // type-only import
+				}
+				value, err := vm.getAttr(module, name)
+				if err != nil {
+					return completion{}, err
+				}
+				f.module.Globals[binding] = value
+			}
+		case OpString:
+			value := f.pop()
+			if instr.S == ".2f" && value.Kind != ValueInt && value.Kind != ValueFloat {
+				return completion{}, fmt.Errorf(".2f format requires a number")
+			}
+			if err := vm.chargeValue(value, 0); err != nil {
+				return completion{}, err
+			}
+			f.push(StringValue(formatValue(value, instr.S)))
+		}
+	}
+	return completion{target: -1, value: NoneValue()}, nil
+}
+
+func filepathDir(path string) string {
+	idx := strings.LastIndexAny(path, `/\`)
+	if idx < 0 {
+		return "."
+	}
+	return path[:idx]
+}
+
+func (vm *VM) importModule(name, fromDir string) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
+	if module, ok := nativePythonModule(name); ok {
+		return module, nil
+	}
+	var missing error
+	if !isPythonImport(name) {
+		module, err := vm.engine.loadModuleByNameLocked(vm.context(), vm.executionBudget(), name, fromDir)
+		if err == nil {
+			return Value{Kind: ValueNativeModule, Module: &NativeModule{Name: name, Loaded: module}}, nil
+		}
+		if !errors.Is(err, ErrModuleNotFound) {
+			return NoneValue(), err
+		}
+		missing = err
+	}
+	bridge, err := vm.engine.PythonBridge()
+	if err != nil {
+		return NoneValue(), errors.Join(missing, err)
+	}
+	module, err := bridge.ImportModule(name)
+	if err != nil {
+		return NoneValue(), errors.Join(missing, err)
+	}
+	return module, nil
+}
+
+func runtimeClass(spec *ClassSpec, module *LoadedModule) *RuntimeClass {
+	fieldIndex := map[string]int{}
+	for i, field := range spec.Fields {
+		fieldIndex[field] = i
+	}
+	for _, method := range spec.Methods {
+		method.Module = module
+	}
+	return &RuntimeClass{Spec: spec, FieldIndex: fieldIndex}
+}
+
+func (vm *VM) callValue(callee Value, args []Value, kwargs map[string]Value) (Value, error) {
+	if err := vm.executionError(); err != nil {
+		return NoneValue(), err
+	}
+	switch callee.Kind {
+	case ValueFunction:
+		if len(kwargs) > 0 {
+			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Function.Name)
+		}
+		return vm.runFunction(callee.Function, args)
+	case ValueNative:
+		if vm.cleanupCtx != nil && callee.Native.Name == "python.release" {
+			return NoneValue(), errCancellationIO
+		}
+		if len(kwargs) > 0 {
+			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Native.Name)
+		}
+		if callee.Native.Signature.Kind == TypeFunc {
+			return callNativeDriver(vm, callee.Native, args)
+		}
+		return callee.Native.Fn(vm, args)
+	case ValueClass:
+		if len(kwargs) > 0 {
+			return NoneValue(), fmt.Errorf("%s does not accept keyword arguments", callee.Class.Spec.Name)
+		}
+		return vm.callClass(callee.Class, args)
+	case ValueBoundMethod:
+		if len(kwargs) > 0 {
+			return NoneValue(), fmt.Errorf("Typhon methods do not accept keyword arguments")
+		}
+		if callee.Bound.Native != nil {
+			nativeArgs := make([]Value, len(args)+1)
+			nativeArgs[0] = callee.Bound.Receiver
+			copy(nativeArgs[1:], args)
+			return callee.Bound.Native.Fn(vm, nativeArgs)
+		}
+		methodArgs := append([]Value{callee.Bound.Receiver}, args...)
+		return vm.runFunction(callee.Bound.Function, methodArgs)
+	case ValuePyObject:
+		if vm.cleanupCtx != nil {
+			return NoneValue(), errCancellationIO
+		}
+		return callee.PyObject.Bridge.Call(callee.PyObject, args, kwargs)
+	default:
+		return NoneValue(), fmt.Errorf("%s is not callable", callee.String())
+	}
+}
+
+func (vm *VM) callClass(class *RuntimeClass, args []Value) (Value, error) {
+	if err := vm.chargeBytes(int64(len(class.Spec.Fields)+1) * valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
+	fields := make([]Value, len(class.Spec.Fields))
+	object := Value{Kind: ValueObject, Object: &Object{Class: class, Fields: fields}}
+	if initFn, ok := class.Spec.Methods["__init__"]; ok {
+		_, err := vm.runFunction(initFn, append([]Value{object}, args...))
+		if err != nil {
+			return NoneValue(), err
+		}
+	}
+	return object, nil
+}
+
+func (vm *VM) getAttr(value Value, name string) (Value, error) {
+	switch value.Kind {
+	case ValueException:
+		switch name {
+		case "kind":
+			return StringValue(value.Exception.Kind()), nil
+		case "message":
+			return StringValue(value.Exception.Message()), nil
+		case "offset":
+			var syntax *JSONError
+			if errors.As(value.Exception, &syntax) && syntax.Offset > 0 {
+				return IntValue(syntax.Offset), nil
+			}
+			return NoneValue(), nil
+		case "sqlstate", "constraint", "table", "column":
+			var cause *NativeCause
+			if !errors.As(value.Exception, &cause) || cause.Driver() != "PostgreSQL" {
+				return NoneValue(), nil
+			}
+			var text string
+			switch name {
+			case "sqlstate":
+				text = cause.Code()
+			case "constraint":
+				text = cause.Constraint()
+			case "table":
+				text = cause.Table()
+			case "column":
+				text = cause.Column()
+			}
+			if text == "" {
+				return NoneValue(), nil
+			}
+			return StringValue(text), nil
+		}
+	case ValueNativeObject:
+		if err := vm.checkNativeOwner(value.NativeObject); err != nil {
+			return NoneValue(), err
+		}
+		if attr, ok := value.NativeObject.Attrs[name]; ok {
+			return attr, nil
+		}
+		return NoneValue(), fmt.Errorf("%s has no attribute %q", value.NativeObject.Type.Name, name)
+	case ValueObject:
+		if idx, ok := value.Object.Class.FieldIndex[name]; ok {
+			if value.Object.Fields[idx].Kind == "" {
+				return NoneValue(), fmt.Errorf("field %s.%s is not initialized", value.Object.Class.Spec.Name, name)
+			}
+			return value.Object.Fields[idx], nil
+		}
+		if method, ok := value.Object.Class.Spec.Methods[name]; ok {
+			return Value{Kind: ValueBoundMethod, Bound: &BoundMethod{Receiver: value, Function: method}}, nil
+		}
+		return NoneValue(), fmt.Errorf("%s has no attribute %q", value.Object.Class.Spec.Name, name)
+	case ValueString:
+		switch name {
+		case "strip":
+			return boundNative(value, "str.strip", nativeStringStrip), nil
+		case "title":
+			return boundNative(value, "str.title", nativeStringTitle), nil
+		case "upper":
+			return boundNative(value, "str.upper", nativeStringUpper), nil
+		}
+	case ValueList:
+		if name == "append" {
+			return boundNative(value, "list.append", nativeListAppend), nil
+		}
+	case ValueDict:
+		if method, ok := dictMethod(value, name); ok {
+			return method, nil
+		}
+	case ValueNativeModule:
+		if loaded := value.Module.Loaded; loaded != nil {
+			if loaded.Engine != vm.engine {
+				return NoneValue(), fmt.Errorf("module belongs to another Engine")
+			}
+			if _, exported := loaded.Info.Exports[name]; exported {
+				if attr, exists := loaded.Globals[name]; exists {
+					return attr, nil
+				}
+				return NoneValue(), fmt.Errorf("export %q of module %q is not initialized", name, value.Module.Name)
+			}
+			return NoneValue(), fmt.Errorf("module %q has no export %q", value.Module.Name, name)
+		}
+		if exported, ok := value.Module.Exports[name]; ok {
+			return exported, nil
+		}
+		return NoneValue(), fmt.Errorf("module %q has no attribute %q", value.Module.Name, name)
+	case ValuePyObject:
+		if vm.cleanupCtx != nil {
+			return NoneValue(), errCancellationIO
+		}
+		return value.PyObject.Bridge.GetAttr(value.PyObject, name)
+	}
+	return NoneValue(), fmt.Errorf("%s has no attribute %q", value.String(), name)
+}
+
+func (vm *VM) setAttr(value Value, name string, newValue Value) error {
+	if value.Kind != ValueObject {
+		return fmt.Errorf("cannot set attribute %q on %s", name, value.String())
+	}
+	idx, ok := value.Object.Class.FieldIndex[name]
+	if !ok {
+		return fmt.Errorf("%s has no field %q", value.Object.Class.Spec.Name, name)
+	}
+	if info := value.Object.Class.Spec.Info; info != nil {
+		var err error
+		newValue, err = validateValue(newValue, info.Fields[name])
+		if err != nil {
+			return fmt.Errorf("field %s: %w", name, err)
+		}
+	}
+	value.Object.Fields[idx] = newValue
+	return nil
+}
+
+func boundNative(receiver Value, name string, fn func(*VM, []Value) (Value, error)) Value {
+	native := &NativeFunc{Name: name, Receiver: &receiver, Fn: fn}
+	return Value{Kind: ValueBoundMethod, Bound: &BoundMethod{Receiver: receiver, Native: native}}
+}
+
+func nativePrint(vm *VM, args []Value) (Value, error) {
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		if err := vm.chargeValue(arg, 0); err != nil {
+			return NoneValue(), err
+		}
+		parts = append(parts, arg.String())
+	}
+	text := strings.Join(parts, " ")
+	if vm.engine != nil && vm.engine.openAPIExport {
+		return NoneValue(), openAPIPrint(text)
+	}
+	fmt.Println(text)
+	return NoneValue(), nil
+}
+
+func nativeSpawn(vm *VM, args []Value) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
+	if len(args) == 0 {
+		return NoneValue(), fmt.Errorf("spawn expected a function")
+	}
+	if len(vm.engine.tasks)+vm.engine.requestTasks >= 256 {
+		return NoneValue(), fmt.Errorf("task quota exceeded")
+	}
+	if err := vm.executionError(); err != nil {
+		return NoneValue(), err
+	}
+	if !vm.engine.beginExecution() {
+		return NoneValue(), vm.executionError()
+	}
+	callee := args[0]
+	module := vm.module
+	budget := vm.executionBudget()
+	callArgs := append([]Value(nil), args[1:]...)
+	ctx, cancel := context.WithCancel(vm.context())
+	task := &Task{done: make(chan struct{}), cancel: cancel, engine: vm.engine, request: vm.request}
+	tasks := vm.taskList()
+	*tasks = append(*tasks, task)
+	if vm.request != nil {
+		vm.engine.requestTasks++
+	}
+	go func() {
+		defer vm.engine.active.Done()
+		defer cancel()
+		vm.engine.execMu.Lock()
+		defer vm.engine.execMu.Unlock()
+		child := &VM{engine: vm.engine, module: module, depth: 1, ctx: ctx, request: vm.request, budget: budget}
+		value, err := child.callValue(callee, callArgs, nil)
+		task.result = taskResult{value: value, err: err}
+		close(task.done)
+	}()
+	return Value{Kind: ValueTask, Task: task}, nil
+}
+
+func nativeJoin(vm *VM, args []Value) (Value, error) {
+	if vm.cleanupCtx != nil {
+		return NoneValue(), errCancellationIO
+	}
+	if len(args) < 1 || len(args) > 2 || args[0].Kind != ValueTask || args[0].Task == nil {
+		return NoneValue(), fmt.Errorf("join expected a task")
+	}
+	task := args[0].Task
+	if task.engine != vm.engine || task.request != vm.request {
+		return NoneValue(), &Exception{kind: validationKind, message: "task belongs to another execution scope"}
+	}
+	timeout := 30 * time.Second
+	if len(args) == 2 {
+		if args[1].Kind != ValueInt && args[1].Kind != ValueFloat {
+			return NoneValue(), fmt.Errorf("join timeout must be a positive number of seconds")
+		}
+		seconds := numberValue(args[1])
+		if seconds <= 0 || math.IsInf(seconds, 0) || math.IsNaN(seconds) || seconds > 86400 {
+			return NoneValue(), fmt.Errorf("join timeout must be between 0 and 86400 seconds")
+		}
+		timeout = time.Duration(seconds * float64(time.Second))
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	vm.engine.execMu.Unlock()
+	var waitErr error
+	select {
+	case <-task.done:
+	case <-vm.context().Done():
+		waitErr = vm.executionError()
+	case <-timer.C:
+		if vm.request != nil {
+			waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s: %w", timeout, context.DeadlineExceeded), cancelled: true}
+			vm.request.cancel()
+		} else {
+			waitErr = &executionStop{cause: fmt.Errorf("join timed out after %s; execution cancelled: %w", timeout, context.Canceled), cancelled: true}
+			vm.engine.cancel()
+			vm.engine.bridgeMu.Lock()
+			bridge := vm.engine.bridge
+			vm.engine.bridgeMu.Unlock()
+			if bridge != nil {
+				reportCleanupError("Python bridge close", bridge.Close())
+			}
+		}
+	}
+	vm.engine.execMu.Lock()
+	if waitErr != nil {
+		return NoneValue(), waitErr
+	}
+	task.observed = true
+	result := task.result
+	return result.value, result.err
+}
+
+func (vm *VM) context() context.Context {
+	if vm.cleanupCtx != nil {
+		return vm.cleanupCtx
+	}
+	if vm.ctx != nil {
+		return vm.ctx
+	}
+	return vm.engine.ctx
+}
+
+func nativeCancel(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 || args[0].Kind != ValueTask || args[0].Task == nil {
+		return NoneValue(), fmt.Errorf("cancel expected a task")
+	}
+	task := args[0].Task
+	if task.engine != vm.engine || task.request != vm.request {
+		return NoneValue(), &Exception{kind: validationKind, message: "task belongs to another execution scope"}
+	}
+	task.cancelled = true
+	if task.cancel != nil {
+		task.cancel()
+	}
+	return NoneValue(), nil
+}
+
+func nativeEnumerate(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("enumerate expected 1 argument")
+	}
+	values, err := vm.collectionValues(args[0])
+	if err != nil {
+		return NoneValue(), err
+	}
+	if err := vm.chargeBytes(int64(len(values)) * 4 * valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
+	items := make([]Value, 0, len(values))
+	for index, item := range values {
+		items = append(items, ListValue([]Value{IntValue(int64(index)), item}))
+	}
+	return ListValue(items), nil
+}
+
+func nativeRange(vm *VM, args []Value) (Value, error) {
+	if len(args) < 1 || len(args) > 3 {
+		return NoneValue(), fmt.Errorf("range expected 1 to 3 arguments, got %d", len(args))
+	}
+	for _, arg := range args {
+		if arg.Kind != ValueInt {
+			return NoneValue(), fmt.Errorf("range expected int arguments")
+		}
+	}
+
+	start := int64(0)
+	stop := args[0].Int
+	step := int64(1)
+	if len(args) >= 2 {
+		start = args[0].Int
+		stop = args[1].Int
+	}
+	if len(args) == 3 {
+		step = args[2].Int
+	}
+	if step == 0 {
+		return NoneValue(), fmt.Errorf("range step must not be zero")
+	}
+
+	items := []Value{}
+	if step > 0 {
+		for value := start; value < stop; value += step {
+			if err := vm.executionError(); err != nil {
+				return NoneValue(), err
+			}
+			if err := vm.chargeWork(); err != nil {
+				return NoneValue(), err
+			}
+			if len(items) >= maxCollectionItems {
+				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
+			if err := vm.chargeBytes(valueSlotBytes); err != nil {
+				return NoneValue(), err
+			}
+			items = append(items, IntValue(value))
+			if value > math.MaxInt64-step {
+				break
+			}
+		}
+	} else {
+		for value := start; value > stop; value += step {
+			if err := vm.executionError(); err != nil {
+				return NoneValue(), err
+			}
+			if err := vm.chargeWork(); err != nil {
+				return NoneValue(), err
+			}
+			if len(items) >= maxCollectionItems {
+				return NoneValue(), fmt.Errorf("range collection size limit exceeded")
+			}
+			if err := vm.chargeBytes(valueSlotBytes); err != nil {
+				return NoneValue(), err
+			}
+			items = append(items, IntValue(value))
+			if value < math.MinInt64-step {
+				break
+			}
+		}
+	}
+	return ListValue(items), nil
+}
+
+func nativeStringStrip(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.strip expected no arguments")
+	}
+	receiver := vmReceiver(args)
+	return StringValue(strings.TrimSpace(receiver.Str)), nil
+}
+
+func nativeStringTitle(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.title expected no arguments")
+	}
+	receiver := vmReceiver(args)
+	return StringValue(titleString(receiver.Str)), nil
+}
+
+func nativeStringUpper(vm *VM, args []Value) (Value, error) {
+	if len(args) != 1 {
+		return NoneValue(), fmt.Errorf("str.upper expected no arguments")
+	}
+	receiver := vmReceiver(args)
+	return StringValue(strings.ToUpper(receiver.Str)), nil
+}
+
+func nativeListAppend(vm *VM, args []Value) (Value, error) {
+	if len(args) != 2 {
+		return NoneValue(), fmt.Errorf("list.append expected 1 argument, got %d", len(args)-1)
+	}
+	receiver := vmReceiver(args)
+	if receiver.List == nil {
+		return NoneValue(), fmt.Errorf("list.append receiver is nil")
+	}
+	if len(*receiver.List) >= maxCollectionItems {
+		return NoneValue(), fmt.Errorf("list size limit exceeded")
+	}
+	item := args[1]
+	if receiver.ListGuard != nil && receiver.ListGuard.elem != nil {
+		var err error
+		item, err = validateValue(item, *receiver.ListGuard.elem)
+		if err != nil {
+			return NoneValue(), err
+		}
+	}
+	if err := vm.chargeBytes(valueSlotBytes); err != nil {
+		return NoneValue(), err
+	}
+	*receiver.List = append(*receiver.List, item)
+	return NoneValue(), nil
+}
+
+func vmReceiver(args []Value) Value {
+	if len(args) > 0 {
+		return args[0]
+	}
+	return Value{}
+}
+
+func titleString(value string) string {
+	words := strings.Fields(value)
+	for i, word := range words {
+		if word == "" {
+			continue
+		}
+		runes := []rune(strings.ToLower(word))
+		runes[0] = []rune(strings.ToUpper(string(runes[0])))[0]
+		words[i] = string(runes)
+	}
+	return strings.Join(words, " ")
+}
+
+func numberValue(value Value) float64 {
+	if value.Kind == ValueFloat {
+		return value.Float
+	}
+	return float64(value.Int)
+}
+
+func unpackValues(value Value, expected int) ([]Value, error) {
+	if value.Kind != ValueList || value.List == nil {
+		return nil, fmt.Errorf("cannot unpack %s", value.String())
+	}
+	if len(*value.List) != expected {
+		return nil, fmt.Errorf("unpack expected %d values, got %d", expected, len(*value.List))
+	}
+	return *value.List, nil
+}
+
+func formatValue(value Value, format string) string {
+	if format == ".2f" {
+		return fmt.Sprintf("%.2f", numberValue(value))
+	}
+	return value.String()
+}
+
+func (f *frame) push(value Value) {
+	f.stack = append(f.stack, value)
+}
+
+func (f *frame) pop() Value {
+	if len(f.stack) == 0 {
+		return NoneValue()
+	}
+	value := f.stack[len(f.stack)-1]
+	f.stack = f.stack[:len(f.stack)-1]
+	return value
+}
+
+func (f *frame) peek() Value {
+	if len(f.stack) == 0 {
+		return NoneValue()
+	}
+	return f.stack[len(f.stack)-1]
+}

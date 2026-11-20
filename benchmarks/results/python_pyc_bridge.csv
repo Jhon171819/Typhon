@@ -1,0 +1,2 @@
+modules,compiled_files,before_ms,after_ms,after_div_before
+requests urllib3 certifi charset_normalizer idna,80,981.116,1023.789,1.043

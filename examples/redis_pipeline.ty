@@ -1,0 +1,14 @@
+import typhon.redis as redis
+
+cache: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 8, 2, 1, 1, 1)
+results: list[redis.Result] = cache.pipeline([
+    ['SET', 'example:native:visits', '0', 'EX', '60'],
+    ['INCR', 'example:native:visits'],
+    ['GET', 'example:native:visits']
+])
+for reply: redis.Result in results:
+    if reply.ok:
+        print(reply.value)
+    else:
+        print(reply.error)
+print(cache.stats())

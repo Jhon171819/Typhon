@@ -1,0 +1,15 @@
+import typhon.http as http
+import typhon.web as web
+
+routes: web.Router = web.router()
+routes.use_errors()
+routes.use_cors(['http://localhost:8081'], ['POST'], ['Content-Type'])
+routes.use_security_headers("default-src 'none'; frame-ancestors 'none'")
+
+def echo(req: http.Request) -> http.Response:
+    return http.json(200, req.json())
+
+routes.add('POST', '/v1/echo', echo)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)

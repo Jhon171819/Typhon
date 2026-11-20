@@ -1,0 +1,64 @@
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.redis as redis
+import typhon.validation as v
+import typhon.web as web
+
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), {'share': 'records', 'max_connections': 4, 'lazy': True, 'connect_seconds': 0.5, 'acquire_seconds': 1, 'query_seconds': 2})
+cache: redis.Connection = redis.connect_with_pool(redis.env('REDIS_URL'), 2, 0, 0.5, 0.5, 0.5, False)
+routes: web.Router = web.router()
+routes.use_errors()
+record: v.Schema = v.object({'name': v.text(1, 120)})
+
+def create(req: http.Request) -> http.Response:
+    value: Any = req.json()
+    problem: http.Response | None = web.validate(req, record, value)
+    if problem is not None:
+        return problem
+    fields: dict[str, str] = value
+    key: str = req.param('id')
+    if len(key) > 80:
+        return web.problem(req, 422)
+    count: int = db.exec('INSERT INTO compose_records (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING', [key, fields['name']])
+    if count == 0:
+        return web.problem(req, 409)
+    return http.json(201, {'id': key, 'name': fields['name']})
+
+def get(req: http.Request) -> http.Response:
+    rows: pg.Rows = db.query('SELECT id, name FROM compose_records WHERE id = $1', [req.param('id')])
+    if rows.count == 0:
+        return web.problem(req, 404)
+    return http.json(200, {'id': rows.get(0, 'id'), 'name': rows.get(0, 'name')})
+
+def update(req: http.Request) -> http.Response:
+    value: Any = req.json()
+    problem: http.Response | None = web.validate(req, record, value)
+    if problem is not None:
+        return problem
+    fields: dict[str, str] = value
+    count: int = db.exec('UPDATE compose_records SET name = $2 WHERE id = $1', [req.param('id'), fields['name']])
+    if count == 0:
+        return web.problem(req, 404)
+    return http.response(204, '')
+
+def remove(req: http.Request) -> http.Response:
+    count: int = db.exec('DELETE FROM compose_records WHERE id = $1', [req.param('id')])
+    if count == 0:
+        return web.problem(req, 404)
+    return http.response(204, '')
+
+def cache_status(req: http.Request) -> http.Response:
+    return http.json(200, {'redis': cache.ping()})
+
+def sample(req: http.Request) -> http.Response:
+    return http.json(200, {'items': [{'id': 'one', 'name': 'Ada'}, {'id': 'two', 'name': 'Grace'}]})
+
+routes.add('POST', '/records/{id}', create)
+routes.add('GET', '/records/{id}', get)
+routes.add('PUT', '/records/{id}', update)
+routes.add('DELETE', '/records/{id}', remove)
+routes.add('GET', '/cache', cache_status)
+routes.add('GET', '/sample', sample)
+
+if __name__ == '__main__':
+    http.serve('0.0.0.0:8080', routes, 2, 16)

@@ -1,0 +1,20 @@
+import typhon.postgres as pg
+import typhon.scalars as s
+
+db: pg.Connection = pg.connect_typed(pg.env('DATABASE_URL'))
+names: pg.Parameter = pg.array('text', ['Ada', 'Lin'])
+metadata: pg.Parameter = pg.jsonb({'team': 'platform', 'members': [9007199254740993]})
+where_result: pg.Rows = db.query(
+    "SELECT name FROM (VALUES ('Ada'), ('Pat')) AS names(name) WHERE name = ANY($1)",
+    [names]
+)
+print(where_result.get(0, 'name'))
+
+sample: pg.Rows = db.query(
+    'SELECT $1::jsonb AS metadata, $2::int[] AS ids, $3::bytea AS binary, $4::uuid AS optional_id, $5::numeric AS amount',
+    [metadata, pg.array('int4', [7, None, 9]), s.bytes_hex('610062'), pg.null('uuid'), s.decimal('100.0100')]
+)
+amount: s.Decimal = sample.get(0, 'amount')
+binary: s.Bytes = sample.get(0, 'binary')
+print(sample.get(0, 'metadata'), sample.get(0, 'ids'))
+print(binary.hex(), sample.get(0, 'optional_id'), amount.text)

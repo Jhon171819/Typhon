@@ -1,0 +1,91 @@
+x-typhon: &typhon
+  build: .
+  image: typhon-local:dev
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  mem_limit: 192m
+
+x-database: &database
+  DATABASE_URL: postgres://typhon@db:5432/typhon?sslmode=disable
+  PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+
+services:
+  api:
+    <<: *typhon
+    environment:
+      <<: *database
+      REDIS_URL: redis://redis:6379/0
+      TYPHON_LIVENESS_PATH: /health/live
+      TYPHON_READINESS_PATH: /health/ready
+      TYPHON_HEALTH_POSTGRES_URL: postgres://typhon@db:5432/typhon?sslmode=disable
+      TYPHON_HEALTH_REDIS_URL: redis://redis:6379/0
+      TYPHON_HTTP_SHUTDOWN_GRACE: ${TYPHON_HTTP_SHUTDOWN_GRACE:-3s}
+    ports:
+      - "127.0.0.1:${TYPHON_PORT:-8080}:8080"
+    networks: [frontend, backend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
+      interval: 5s
+      timeout: 2s
+      retries: 4
+      start_period: 5s
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  migrate:
+    <<: *typhon
+    command: ["migrate", "up", "/app/migrations"]
+    environment: *database
+    networks: [backend]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: typhon
+      POSTGRES_USER: typhon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "typhon", "-d", "typhon"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    mem_limit: 384m
+    shm_size: 64m
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    networks: [backend]
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    mem_limit: 128m
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  postgres-data:

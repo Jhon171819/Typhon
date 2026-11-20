@@ -1,0 +1,30 @@
+import typhon.http as http
+import typhon.validation as v
+
+registration: v.Schema = v.object({
+    'name': v.text(1, 80),
+    'role': v.enumeration(['reader', 'editor']),
+    'items': v.array(v.object({'quantity': v.integer(1, 100)}), 1, 10),
+}, {'nickname': v.nullable(v.text(1, 40))})
+
+def handle(req: http.Request) -> http.Response:
+    if req.method != 'POST':
+        return http.response(405, 'method not allowed', [['Allow', 'POST']])
+    payload: Any
+    try:
+        payload = req.json()
+    except ValidationError:
+        return http.json(400, {'error': 'invalid_json'})
+    issues: list[dict[str, str]]
+    try:
+        issues = v.check(registration, payload)
+    except ValidationError:
+        return http.json(422, {'error': 'validation_limit'})
+    if len(issues) > 0:
+        return http.json(422, {'errors': issues})
+    dto: dict[str, Any] = payload
+    name: str = dto['name']
+    return http.json(201, {'name': name})
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', handle)

@@ -1,0 +1,26 @@
+import json
+import typhon.postgres as pg
+import typhon.scalars as s
+
+db: pg.Connection = pg.connect_typed(pg.env('DATABASE_URL'))
+try:
+    tx: pg.Transaction = db.begin()
+    try:
+        tx.exec('CREATE TEMP TABLE scalar_example (id uuid, amount numeric, body bytea, day date, instant timestamptz, civil timestamp, metadata jsonb) ON COMMIT DROP')
+        id: s.UUID = s.uuid('A0B1C2D3-0000-4000-8000-000000000001')
+        amount: s.Decimal = s.decimal('12345678901234567890.12345678901234567890')
+        body: s.Bytes = s.bytes_hex('610062')
+        instant: s.Timestamp = s.timestamp('2026-01-02T03:04:05.123456-03:00')
+        civil: s.LocalTimestamp = s.local_timestamp('2026-01-02T03:04:05.123456')
+        day: s.Date = s.date('2026-01-02')
+        metadata: str = json.dumps({'amount': amount, 'id': 9007199254740993})
+        tx.exec('INSERT INTO scalar_example VALUES ($1, $2, $3, $4, $5, $6, $7)', [id, amount, body, day, instant, civil, metadata])
+        rows: pg.Rows = tx.query('SELECT id, amount, body, day, instant, civil, metadata FROM scalar_example')
+        paid: s.Decimal = rows.get(0, 'amount')
+        data: s.Bytes = rows.get(0, 'body')
+        print(paid.compare(amount), data.hex())
+        print(json.dumps(rows.row(0)))
+    finally:
+        tx.rollback()
+finally:
+    db.close()

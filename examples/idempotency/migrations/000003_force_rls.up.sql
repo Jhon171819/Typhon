@@ -1,0 +1,1 @@
+ALTER TABLE idempotent_orders FORCE ROW LEVEL SECURITY;

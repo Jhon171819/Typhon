@@ -1,0 +1,6 @@
+from config import fallback
+
+def normalize(name: str) -> str:
+    if name == '':
+        return fallback
+    return name.strip()

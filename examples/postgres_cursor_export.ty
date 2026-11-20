@@ -1,0 +1,30 @@
+import json
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.scalars as s
+import typhon.web as web
+
+options: dict[str, Any] = {'share': 'reporting', 'max_connections': 4, 'query_seconds': 30}
+db: pg.Connection = pg.connect_pooled(pg.env('DATABASE_URL'), options)
+routes: web.Router = web.router()
+routes.use_errors()
+
+def line(state: Any) -> s.Bytes | None:
+    cursor: pg.Cursor = state
+    row: list[Any] | None = cursor.next()
+    if row is None:
+        return None
+    return s.bytes_utf8(json.dumps(row) + '\n')
+
+def export(req: http.Request) -> http.Response:
+    tx: pg.Transaction = db.begin('repeatable_read', True)
+    cursor: pg.Cursor = tx.cursor('SELECT id FROM generate_series(1,100000) AS id', [], 128)
+    return http.stream(200, line, cursor, [
+        ['Content-Type', 'application/x-ndjson'],
+        ['Content-Disposition', 'attachment; filename="report.jsonl"']
+    ])
+
+routes.add('GET', '/v1/report', export)
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes, 2, 8, 30)

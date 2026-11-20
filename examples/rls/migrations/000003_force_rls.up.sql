@@ -1,0 +1,1 @@
+ALTER TABLE tenant_records FORCE ROW LEVEL SECURITY;

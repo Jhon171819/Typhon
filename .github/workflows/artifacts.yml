@@ -1,0 +1,125 @@
+name: Binary and release artifacts
+on:
+  pull_request:
+    paths: ['cmd/**', 'internal/**', 'go.*', 'Dockerfile', 'examples/compose/**', '.github/workflows/artifacts.yml']
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  binary:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-amd64, linux-arm64, windows-amd64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+        with:
+          syft-version: v1.57.2
+      - name: Build the CLI and generate an SPDX SBOM
+        env:
+          TARGET: ${{ matrix.target }}
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+          CGO_ENABLED: 0
+        run: |
+          export GOOS="${TARGET%-*}" GOARCH="${TARGET#*-}"
+          binary="typhon-$TARGET"
+          if [[ "$GOOS" == windows ]]; then binary+=".exe"; fi
+          mkdir -p dist
+          go build -mod=readonly -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o "dist/$binary" ./cmd/typhon
+          go version -m "dist/$binary" > "dist/$binary.buildinfo"
+          "$SYFT_CMD" scan "file:dist/$binary" -o "spdx-json=dist/$binary.spdx.json"
+          jq -e '.packages | length > 1' "dist/$binary.spdx.json"
+          if [[ "$TARGET" == linux-amd64 ]]; then "dist/$binary" version; fi
+          (cd dist && sha256sum "$binary" "$binary.spdx.json" "$binary.buildinfo" > "$binary.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: typhon-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+  release-binaries:
+    if: github.event_name == 'release'
+    needs: binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            file: typhon-linux-amd64
+          - target: linux-arm64
+            file: typhon-linux-arm64
+          - target: windows-amd64
+            file: typhon-windows-amd64.exe
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: typhon-${{ matrix.target }}
+          path: dist
+      - name: Verify SHA-256 manifest
+        env:
+          CLI_FILE: ${{ matrix.file }}
+        run: cd dist && sha256sum --check "$CLI_FILE.sha256"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ matrix.file }}
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/${{ matrix.file }}
+          sbom-path: dist/${{ matrix.file }}.spdx.json
+      - name: Attach verified binary and inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload --repo "$GITHUB_REPOSITORY" -- "$GITHUB_REF_NAME" dist/*
+  release-image:
+    if: github.event_name == 'release'
+    needs: binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        id: syft
+        with:
+          syft-version: v1.57.2
+      - name: Build and inventory the Docker image
+        env:
+          SYFT_CMD: ${{ steps.syft.outputs.cmd }}
+        run: |
+          mkdir -p dist
+          docker build -t typhon-linux-amd64:release .
+          "$SYFT_CMD" scan docker:typhon-linux-amd64:release -o spdx-json=dist/typhon-linux-amd64-image.spdx.json
+          jq -e '.packages | length > 1' dist/typhon-linux-amd64-image.spdx.json
+          docker save -o dist/typhon-linux-amd64-image.tar typhon-linux-amd64:release
+          (cd dist && sha256sum ./*.tar ./*.spdx.json > typhon-linux-amd64-image.sha256)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/typhon-linux-amd64-image.tar
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/typhon-linux-amd64-image.tar
+          sbom-path: dist/typhon-linux-amd64-image.spdx.json
+      - name: Attach the image and its inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload --repo "$GITHUB_REPOSITORY" -- "$GITHUB_REF_NAME" dist/*

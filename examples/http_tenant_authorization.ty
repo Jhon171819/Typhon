@@ -1,0 +1,56 @@
+import typhon.auth as auth
+import typhon.http as http
+import typhon.postgres as pg
+import typhon.web as web
+
+db: pg.Connection = pg.connect(pg.env('DATABASE_URL'))
+verifier: auth.Authenticator = auth.jwt(
+    http.env('AUTH_ISSUER'), http.env('AUTH_AUDIENCE'), http.env('AUTH_JWKS_URL')
+)
+policy: auth.Policy = auth.policy({
+    'admin': ['records:read', 'records:create', 'records:delete'],
+    'professional': ['records:read', 'records:create'],
+    'user': ['records:read']
+}, {'records:delete': 'records:write'})
+routes: web.Router = web.router()
+routes.use_errors()
+
+def read_record(req: http.Request) -> http.Response:
+    records: pg.Rows = db.query(
+        'SELECT content FROM records WHERE tenant_id = $1 AND id = $2 AND owner_id = $3',
+        [req.tenant, req.param('id'), req.identity]
+    )
+    if records.count == 0:
+        return web.problem(req, 404)
+    return http.json(200, {'content': records.get(0, 'content')})
+
+def create_record(req: http.Request) -> http.Response:
+    db.exec(
+        'INSERT INTO records (tenant_id, id, owner_id, content) VALUES ($1, $2, $3, $4)',
+        [req.tenant, req.param('id'), req.identity, req.body]
+    )
+    return http.response(201, 'created')
+
+def delete_record(req: http.Request) -> http.Response:
+    changed: int = db.exec(
+        'DELETE FROM records WHERE tenant_id = $1 AND id = $2 AND owner_id = $3',
+        [req.tenant, req.param('id'), req.identity]
+    )
+    if changed == 0:
+        return web.problem(req, 404)
+    return http.response(204, '')
+
+routes.add('GET', '/records/{id}', read_record)
+routes.require_auth('GET', '/records/{id}', verifier)
+routes.authorize('GET', '/records/{id}', policy, 'records:read')
+
+routes.add('POST', '/records/{id}', create_record)
+routes.require_auth('POST', '/records/{id}', verifier)
+routes.authorize('POST', '/records/{id}', policy, 'records:create')
+
+routes.add('DELETE', '/records/{id}', delete_record)
+routes.require_auth('DELETE', '/records/{id}', verifier)
+routes.authorize('DELETE', '/records/{id}', policy, 'records:delete')
+
+if __name__ == '__main__':
+    http.serve('127.0.0.1:8080', routes)
